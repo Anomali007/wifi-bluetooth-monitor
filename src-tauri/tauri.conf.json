@@ -19,10 +19,12 @@
         "fullscreen": false
       }
     ],
+    "macOSPrivateApi": true,
     "security": {
       "csp": null
     }
   },
+
   "bundle": {
     "active": true,
     "targets": "all",
@@ -32,6 +34,31 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "dmg": {
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        },
+        "windowSize": {
+          "height": 400,
+          "width": 660
+        }
+      },
+      "files": {},
+      "hardenedRuntime": true,
+      "minimumSystemVersion": "10.13",
+      "entitlements": {
+        "com.apple.security.device.bluetooth": true
+      },
+      "info": {
+        "NSBluetoothAlwaysUsageDescription": "This app requires access to Bluetooth to detect nearby devices for security monitoring."
+      }
+    }
   }
 }
