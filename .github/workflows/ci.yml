@@ -29,6 +29,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: npx tsc --noEmit
+      - run: pnpm lint
+      - name: vitest (must run at least one test)
+        run: pnpm test 2>&1 | scripts/assert-vitest-ran.sh
+        shell: bash -o pipefail {0}
+      - name: public-repo safety check
+        run: scripts/check-public-safety.sh
       - run: cargo fmt --check
         working-directory: src-tauri
       - run: cargo clippy --all-targets -- -D warnings
