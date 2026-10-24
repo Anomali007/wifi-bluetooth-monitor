@@ -1,12 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { scanNow } from "@/lib/api";
 import {
   BarChart,
   Bar,
   Cell,
   XAxis,
+  YAxis,
   Tooltip as RechartsTooltip,
   CartesianGrid,
 } from "recharts";
@@ -17,41 +16,13 @@ import {
   ChartLegendContent,
 } from "@/components/ui/chart";
 
-interface ChartRow {
+export interface ChartRow {
   name: string;
   signal_strength: number | null;
   device_type: "Wi-Fi" | "Bluetooth";
 }
 
-export default function DeviceChart() {
-  const [data, setData] = useState<ChartRow[]>([]);
-
-  useEffect(() => {
-    async function fetchDevices() {
-      try {
-        const result = await scanNow();
-        setData([
-          ...result.wifi.map((w) => ({
-            name: w.ssid ?? "(hidden)",
-            signal_strength: w.rssi,
-            device_type: "Wi-Fi" as const,
-          })),
-          ...result.ble.map((b) => ({
-            name: b.name ?? "Unknown device",
-            signal_strength: b.rssi,
-            device_type: "Bluetooth" as const,
-          })),
-        ]);
-      } catch (error) {
-        console.error("Error fetching devices:", error);
-      }
-    }
-
-    fetchDevices();
-    const interval = setInterval(fetchDevices, 60000); // Refresh every minute
-    return () => clearInterval(interval);
-  }, []);
-
+export default function DeviceChart({ data }: { data: ChartRow[] }) {
   // Prepare data for the chart
   const chartData = data.map((device) => ({
     name: device.name,
@@ -72,7 +43,7 @@ export default function DeviceChart() {
   } as const;
 
   return (
-    <ChartContainer config={chartConfig} className="min-h-[400px] w-full">
+    <ChartContainer config={chartConfig} className="min-h-[320px] w-full">
       <BarChart
         data={chartData}
         width={600}
@@ -86,9 +57,10 @@ export default function DeviceChart() {
           tickMargin={10}
           axisLine={false}
         />
+        <YAxis domain={[0, 100]} tickLine={false} axisLine={false} width={32} />
         <RechartsTooltip content={<ChartTooltipContent />} />
         <ChartLegend content={<ChartLegendContent nameKey="device_type" />} />
-        <Bar dataKey="signal_strength" name="Signal Strength" radius={4}>
+        <Bar dataKey="signal_strength" name="Signal Strength" radius={4} isAnimationActive={false}>
           {chartData.map((row, i) => (
             <Cell
               key={i}
