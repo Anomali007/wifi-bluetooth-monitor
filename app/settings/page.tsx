@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMonitor } from "@/components/monitor-provider";
 import { SECURITY_LABEL, securityStrength } from "@/lib/format";
 import type { AlertToggles, Settings, TrustedNetwork } from "@/lib/types";
@@ -40,12 +40,10 @@ function NumberField({
 
 export default function SettingsPage() {
   const { settings, saveSettings, scan } = useMonitor();
-  const [draft, setDraft] = useState<Settings | null>(null);
+  // Local edits start from the loaded settings; derived at render time instead of copied in an effect.
+  const [edits, setDraft] = useState<Settings | null>(null);
+  const draft = edits ?? settings;
   const [status, setStatus] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (settings && !draft) setDraft(settings);
-  }, [settings, draft]);
 
   if (!draft) return <p className="text-sm text-muted-foreground">Loading settings...</p>;
 

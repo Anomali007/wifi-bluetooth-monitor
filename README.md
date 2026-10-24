@@ -4,7 +4,7 @@ A listen-only desktop app for macOS that watches the Wi-Fi networks and Bluetoot
 
 It never transmits, probes, connects to, or pairs with anything it finds. Everything stays on your Mac.
 
-Built with Tauri 2 (Rust backend in `src-tauri/`) and a Next.js 14 static-export frontend (`app/`). macOS only.
+Built with Tauri 2 (Rust backend in `src-tauri/`) and a Next.js 16 (React 19) static-export frontend (`app/`). macOS only.
 
 > **Verified on:** macOS 27.0.1 (26A434), Apple silicon, signed debug build, 2026-10-24. A 10-minute live run stored 10 scans: 85 distinct Wi-Fi networks (92.1% of sightings with a readable name, Location granted), 124 distinct BLE devices, 1 separated Find My advertiser, 0 alerts, 0 scan errors. Counts only; no scan data is published.
 
