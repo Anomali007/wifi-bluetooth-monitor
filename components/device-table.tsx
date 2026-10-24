@@ -36,7 +36,11 @@ export function rowsFrom(
       type: "Bluetooth" as const,
       name: b.name ?? "Unnamed device",
       detail:
-        b.manufacturerId !== null ? `Manufacturer ${b.manufacturerId}` : "",
+        b.ownerState === "nearOwner"
+          ? "Find My signal, owner nearby (not flagged)"
+          : b.manufacturerId !== null
+            ? `Manufacturer ${b.manufacturerId}`
+            : "",
       rssi: b.rssi,
       tracker: b.tracker ? TRACKER_LABEL[b.tracker] : null,
       lastSeen: b.seenAt,

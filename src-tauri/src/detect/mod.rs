@@ -522,8 +522,10 @@ fn persistent_tracker(history: &History, settings: &Settings, now: Millis, out: 
         );
     }
 
-    // Per tracker family: survives identifier rotation (Find My changes its ID about every
-    // 15 minutes) by requiring near-continuous presence of the family instead.
+    // Per tracker family: survives identifier rotation by requiring near-continuous
+    // presence of the family instead. DULT draft 01 section 3.5: an accessory rotates its
+    // address every 15 minutes near its owner and every 24 hours when separated; vendors
+    // other than Apple may differ, so this stays a Low-severity best guess.
     let kinds: BTreeSet<TrackerKindKey> = devices
         .values()
         .copied()
@@ -673,6 +675,7 @@ mod tests {
             peripheral_hash: dev(d),
             rssi: Some(-70),
             tracker,
+            owner_state: None,
             manufacturer_id: None,
             seen_at: T0,
         }

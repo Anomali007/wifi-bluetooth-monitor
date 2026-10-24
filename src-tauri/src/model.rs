@@ -129,6 +129,18 @@ pub enum TrackerKind {
     UnknownTracker,
 }
 
+/// Whether a Find My style advertisement says its owner is nearby.
+///
+/// DULT draft section 3.8 (near-owner bit) and AirGuard `AppleFindMy.getConnectionState`.
+/// Only `Separated` adverts may raise a tracker alert; a `NearOwner` advert is an owner's own
+/// accessory (or an Apple device acting as one) and is expected to be near its owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OwnerState {
+    Separated,
+    NearOwner,
+}
+
 /// One BLE peripheral seen in one scan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -139,8 +151,13 @@ pub struct BleObservation {
     pub peripheral_hash: String,
     /// Signal strength in dBm, if reported.
     pub rssi: Option<i16>,
-    /// `Some` only when the advertisement matches a known tracker signature.
+    /// `Some` only when the advertisement matches a known tracker signature AND, for Find My
+    /// style adverts, is in the separated state. Nearby-owner Find My adverts are `None` here.
     pub tracker: Option<TrackerKind>,
+    /// Find My style adverts only: separated vs near-owner. `None` for everything else
+    /// (and for rows stored before this field existed).
+    #[serde(default)]
+    pub owner_state: Option<OwnerState>,
     /// First manufacturer-data company identifier, if any (e.g. 0x004C Apple).
     pub manufacturer_id: Option<u16>,
     pub seen_at: Millis,
@@ -422,6 +439,7 @@ mod tests {
             peripheral_hash: "cd".repeat(32),
             rssi: Some(-71),
             tracker: Some(TrackerKind::AppleFindMy),
+            owner_state: Some(OwnerState::Separated),
             manufacturer_id: Some(0x004C),
             seen_at: 5,
         };

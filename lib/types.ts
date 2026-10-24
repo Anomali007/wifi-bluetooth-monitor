@@ -32,6 +32,12 @@ export type TrackerKind =
   | "googleFindMy"
   | "unknownTracker";
 
+/**
+ * Find My style adverts only. "separated" may alert; "nearOwner" is an owner's own accessory
+ * (or an Apple device) and never does. Mirror of `OwnerState` in model.rs.
+ */
+export type OwnerState = "separated" | "nearOwner";
+
 export interface WifiObservation {
   /** null when macOS withholds it (no Location permission) or the network is hidden. */
   ssid: string | null;
@@ -50,7 +56,10 @@ export interface BleObservation {
   peripheralHash: string;
   /** dBm */
   rssi: number | null;
+  /** Non-null only for an alertable signature; nearby-owner Find My adverts are null. */
   tracker: TrackerKind | null;
+  /** Find My style adverts only; null otherwise and for rows stored before this existed. */
+  ownerState: OwnerState | null;
   /** Manufacturer company identifier, e.g. 0x004C = 76 (Apple). */
   manufacturerId: number | null;
   seenAt: Millis;

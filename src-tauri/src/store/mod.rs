@@ -28,7 +28,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SALT_LEN: usize = 32;
 const DB_FILE: &str = "store.sqlite3";
 /// The salt lives in its own 0600 file, NOT in the database: a copy, backup or export of the
@@ -132,6 +132,18 @@ fn load_or_create_salt(dir: &Path) -> StoreResult<Salt> {
     Ok(Salt::from_bytes(buf))
 }
 
+fn add_owner_state_column(tx: &rusqlite::Transaction<'_>) -> StoreResult<()> {
+    let has: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ble_sightings') WHERE name = 'owner_state')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        tx.execute("ALTER TABLE ble_sightings ADD COLUMN owner_state TEXT", [])?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open (creating if needed) the store in directory `path` (the integrator passes the
     /// Tauri app-data dir): `store.sqlite3` plus `salt.key`. Runs [`Store::migrate`] and loads
@@ -193,15 +205,29 @@ impl Store {
              CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_id ON alerts(id);
              CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
-        let has_version: bool =
-            tx.query_row("SELECT EXISTS(SELECT 1 FROM schema_version)", [], |r| {
-                r.get(0)
-            })?;
-        if !has_version {
-            tx.execute(
-                "INSERT INTO schema_version (version) VALUES (?1)",
-                [SCHEMA_VERSION],
-            )?;
+        let version: Option<i64> =
+            tx.query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))?;
+        match version {
+            None => {
+                // Fresh database: the v1 CREATE above has no owner_state column yet.
+                add_owner_state_column(&tx)?;
+                tx.execute(
+                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    [SCHEMA_VERSION],
+                )?;
+            }
+            Some(v) if v < 2 => {
+                // v1 -> v2: owner_state column. v1 rows classified every Apple type 0x12
+                // advert as a tracker, including nearby-owner ones, and cannot be told apart
+                // now, so they stop counting as trackers rather than keep feeding alerts.
+                add_owner_state_column(&tx)?;
+                tx.execute(
+                    "UPDATE ble_sightings SET tracker = NULL WHERE tracker = '\"appleFindMy\"'",
+                    [],
+                )?;
+                tx.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])?;
+            }
+            Some(_) => {}
         }
         tx.commit()?;
         Ok(())
@@ -239,11 +265,12 @@ impl Store {
                 ])?;
             }
             let mut b = tx.prepare(
-                "INSERT INTO ble_sightings (scan_at, name, peripheral_hash, rssi, tracker, manufacturer_id, seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO ble_sightings (scan_at, name, peripheral_hash, rssi, tracker, manufacturer_id, seen_at, owner_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for o in &scan.ble {
                 let tracker = o.tracker.as_ref().map(to_json).transpose()?;
+                let owner_state = o.owner_state.as_ref().map(to_json).transpose()?;
                 b.execute(params![
                     scan.scanned_at,
                     o.name,
@@ -251,7 +278,8 @@ impl Store {
                     o.rssi,
                     tracker,
                     o.manufacturer_id,
-                    o.seen_at
+                    o.seen_at,
+                    owner_state
                 ])?;
             }
         }
@@ -312,7 +340,7 @@ impl Store {
                 .push(obs);
         }
         let mut q = self.conn.prepare(
-            "SELECT scan_at, name, peripheral_hash, rssi, tracker, manufacturer_id, seen_at
+            "SELECT scan_at, name, peripheral_hash, rssi, tracker, manufacturer_id, seen_at, owner_state
              FROM ble_sightings WHERE scan_at >= ?1 ORDER BY id",
         )?;
         let rows = q.query_map([since], |r| {
@@ -324,15 +352,18 @@ impl Store {
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<u16>>(5)?,
                 r.get::<_, Millis>(6)?,
+                r.get::<_, Option<String>>(7)?,
             ))
         })?;
         for row in rows {
-            let (scan_at, name, peripheral_hash, rssi, tracker, manufacturer_id, seen_at) = row?;
+            let (scan_at, name, peripheral_hash, rssi, tracker, manufacturer_id, seen_at, owner) =
+                row?;
             let obs = BleObservation {
                 name,
                 peripheral_hash,
                 rssi,
                 tracker: tracker.as_deref().map(from_json).transpose()?,
+                owner_state: owner.as_deref().map(from_json).transpose()?,
                 manufacturer_id,
                 seen_at,
             };
@@ -513,6 +544,7 @@ mod tests {
             peripheral_hash: format!("{n:02x}").repeat(32),
             rssi: Some(-70),
             tracker: Some(TrackerKind::Tile),
+            owner_state: None,
             manufacturer_id: Some(0x004C),
             seen_at: at,
         }
@@ -540,6 +572,50 @@ mod tests {
             subject_hash: subj.into(),
             dismissed: false,
         }
+    }
+
+    #[test]
+    fn v1_database_migrates_and_drops_old_find_my_trackers() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // Hand-built v1 schema (no owner_state column) with two stored tracker rows.
+            let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES (1);
+                 CREATE TABLE ble_sightings (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, scan_at INTEGER NOT NULL, name TEXT,
+                   peripheral_hash TEXT NOT NULL, rssi INTEGER, tracker TEXT,
+                   manufacturer_id INTEGER, seen_at INTEGER NOT NULL);
+                 INSERT INTO ble_sightings (scan_at, peripheral_hash, tracker, seen_at)
+                   VALUES (9999999999999, 'aa', '\"appleFindMy\"', 1),
+                          (9999999999999, 'bb', '\"tile\"', 1);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(dir.path()).unwrap();
+        let v: i64 = s
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2);
+        let h = s.get_history(0).unwrap();
+        let ble = &h.scans[0].ble;
+        assert_eq!(ble.len(), 2);
+        assert_eq!(ble[0].tracker, None, "old Find My row stops counting");
+        assert_eq!(ble[1].tracker, Some(TrackerKind::Tile));
+        assert_eq!(ble[0].owner_state, None);
+    }
+
+    #[test]
+    fn owner_state_round_trips_through_the_store() {
+        let (_d, mut s) = open();
+        let mut sc = scan(1000, 0, 1);
+        sc.ble[0].owner_state = Some(crate::model::OwnerState::NearOwner);
+        sc.ble[0].tracker = None;
+        s.insert_scan(&sc).unwrap();
+        let got = &s.get_history(0).unwrap().scans[0].ble[0];
+        assert_eq!(got.owner_state, Some(crate::model::OwnerState::NearOwner));
     }
 
     #[test]

@@ -100,7 +100,7 @@ pub async fn scan(salt: &Salt, window: Duration) -> Result<Vec<BleObservation>, 
             .iter()
             .map(|(u, d)| (u.as_u128(), d.clone()))
             .collect();
-        let tracker = classify::classify(&props.manufacturer_data, &service_uuids, &service_data);
+        let class = classify::classify(&props.manufacturer_data, &service_uuids, &service_data);
         // Lowest company id for a stable choice when several are present.
         let manufacturer_id = props.manufacturer_data.keys().copied().min();
         // Raw peripheral UUID is hashed here and never leaves this function.
@@ -111,7 +111,8 @@ pub async fn scan(salt: &Salt, window: Duration) -> Result<Vec<BleObservation>, 
                 name: props.local_name.or(props.advertisement_name),
                 peripheral_hash,
                 rssi: props.rssi,
-                tracker,
+                tracker: class.tracker,
+                owner_state: class.owner_state,
                 manufacturer_id,
                 seen_at,
             },

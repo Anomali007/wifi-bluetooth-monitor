@@ -29,6 +29,7 @@ fn tracker(at: Millis) -> BleObservation {
         peripheral_hash: hash_identifier(&salt(), "synthetic-peripheral-1"),
         rssi: Some(-70),
         tracker: Some(TrackerKind::Tile),
+        owner_state: None,
         manufacturer_id: None,
         seen_at: at,
     }
