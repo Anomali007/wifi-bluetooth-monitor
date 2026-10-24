@@ -14,12 +14,12 @@ Everything in this list exists in the code and has tests; see [Limitations](#lim
 
 - **Wi-Fi scan** through CoreWLAN, every 60 seconds by default. Records signal, channel and security mode for each access point. SSIDs are only readable once Location access is granted (see [Permissions](#permissions)).
 - **Bluetooth LE scan** through CoreBluetooth (10-second listen window per cycle). Passive: advertisements are read, nothing is connected to.
-- **Tracker signatures**: an advertisement is matched against documented signatures for Apple Find My, Tile, Samsung SmartTag, Chipolo, Pebblebee and Google Find My Device, plus the generic DULT (Detecting Unwanted Location Trackers) advertisement. Constants are taken from the open-source [AirGuard](https://github.com/seemoo-lab/AirGuard) app and the IETF DULT draft.
+- **Tracker signatures**: an advertisement is matched against documented signatures for Apple Find My, Tile, Samsung SmartTag, Chipolo, Pebblebee and Google Find My Device, plus the generic DULT (Detecting Unwanted Location Trackers) advertisement. Constants are taken from the open-source [AirGuard](https://github.com/seemoo-lab/AirGuard) app and the IETF DULT draft. Find My style advertisements only count as trackers when they say they are **separated from their owner** (see [Limitations](#limitations)); an owner-nearby Find My signal is shown as such and never alerts.
 - **Five alert rules**, each switchable in Settings:
   - **Evil twin**: the same network name from two or more access points with different security modes (for example one open, one WPA2).
   - **Open lookalike**: an open network whose name matches or nearly matches a network you trust (case, whitespace, look-alike characters, small edit distance).
   - **Trusted network changed**: a trusted name seen from an access point you have not marked as yours, or with weaker security than you expect.
-  - **Persistent tracker**: a tracker-signature device present across at least 5 scans spanning at least 20 minutes (both adjustable). Because Find My devices rotate their identifier about every 15 minutes when away from their owner, a rotating tracker *family* that stays continuously present is also reported, at lower severity.
+  - **Persistent tracker**: a tracker-signature device present across at least 5 scans spanning at least 20 minutes (both adjustable). A tracker *family* that stays continuously present while its identifiers change is also reported, at lower severity.
   - **New device**: first sighting of a non-tracker Bluetooth device (off by default; noisy).
 - **Notifications**: one system notification per newly created alert (repeat sightings of the same condition do not notify again). Notification text names the kind of finding ("possible tracker", ...) and never contains a network name, device name, or identifier.
 - **UI pages**: Dashboard (permission banner, scan problems, device table, signal chart, Scan now), Alerts (with dismiss), History (sightings over the retention window, filter by Wi-Fi or Bluetooth), Settings (trusted networks, intervals, retention, alert toggles, notifications).
@@ -75,11 +75,12 @@ Without Location the Wi-Fi scan still runs but the networks have no names; the d
 ## Limitations
 
 - **CoreBluetooth hides MAC addresses.** macOS gives each Bluetooth device a per-Mac identifier, not its hardware address. The app hashes that identifier. It cannot match a device to anything outside this Mac.
-- **Find My / AirTag identifiers rotate (about every 15 minutes) when separated from their owner**, so one physical tag appears as several devices over time. The persistent-tracker rule compensates by grouping a tracker family that stays present, which is a heuristic.
+- **Find My identifiers rotate**: per the DULT draft an accessory changes its address about every 15 minutes near its owner and about every 24 hours when separated, so one physical tag can appear as several devices over time. The persistent-tracker rule also groups a tracker family that stays present, which is a heuristic.
 - **Tracker alerts are "possible", a best guess.** A signature match means "an advertisement of this type", not "this device is following you". Apple's Find My advertisement is also sent by other Find My accessories and by some Apple devices; crowded places can look the same. A tracker not heard for more than 10 minutes stops alerting.
 - **The Apple Find My signature is broad.** Any Apple device or accessory advertising in the Find My network matches it, and many do. On a first live run in a normal home or street setting, dozens of distinct Find My identifiers appeared within minutes. Expect false positives from the persistent-tracker rule around many Apple devices; the alerts are hints to check, not findings.
 - **Tracker detection is unit-tested on synthetic advertisements but NOT field-verified with a real AirTag, Tile or other tracker. None was available during development.** Treat the tracker feature as unproven against real hardware.
 - Wi-Fi alert titles include the network name (SSID); device identifiers are never shown, only short hash fragments in tables.
+- Network names (SSIDs) and Bluetooth advertised names are stored as plain text in the local database until the retention window expires. Only addresses and identifiers are hashed.
 - WPA2/WPA3 transition networks are reported as WPA3. OWE ("enhanced open") networks are reported as OWE (encrypted), not as open.
 - macOS only (13 or newer). Linux and Windows are not supported.
 - Not notarized and not distributed as a download; build it yourself.
@@ -87,7 +88,7 @@ Without Location the Wi-Fi scan still runs but the networks have no names; the d
 ## Privacy
 
 - **Local only.** Scan history lives in an SQLite database in the app's data folder (`~/Library/Application Support/com.anomali007.wifibtmonitor/`). Nothing is uploaded, and there is no export feature.
-- **Salted hashes.** Access-point addresses and Bluetooth identifiers are hashed (SHA-256) with a random per-install salt before they leave the scanning code. Raw identifiers are never stored or logged.
+- **Salted hashes.** Access-point addresses and Bluetooth identifiers are hashed (SHA-256) with a random per-install salt before they leave the scanning code. Raw addresses and identifiers are never stored or logged (names are, see Limitations).
 - **The salt** is 32 random bytes in `salt.key` next to the database, mode `0600`, kept separate from the database so a copied database cannot be brute-forced back to addresses.
 - **Retention.** History is deleted automatically after 24 hours by default (configurable in Settings).
 - **No logging of scan data.** Release builds print nothing about scans; debug builds log counts only.

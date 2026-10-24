@@ -5,7 +5,7 @@ Only what is **not** built yet. What exists is described in the [README](README.
 ## Verification gaps
 
 - **Field-verify tracker detection with real hardware** (an AirTag, a Tile, a SmartTag). Today it is unit-tested on synthetic advertisements only; thresholds (5 scans / 20 minutes, 10-minute staleness) were tuned on synthetic data.
-- Confirm the Find My "separated from owner" bit (`apple_find_my_separated`, already in `ble::classify`) improves precision on real adverts. It is not wired into the alert rules because carrying it would need a new field on `BleObservation` and a store migration.
+- Confirm on real adverts that the separated-only Find My rule (length byte 0x19 plus AirTag/Find My status type, DULT near-owner bit) neither misses a real separated AirTag nor still flags ordinary Apple devices. It follows AirGuard source and is tested on synthetic bytes only.
 - Verify the Location prompt and grant flow across rebuilds on more than one macOS version.
 
 ## Dependencies
