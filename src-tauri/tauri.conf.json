@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "wifi-bluetooth-monitor",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.anomali007.wifibtmonitor",
   "build": {
     "frontendDist": "../out",
     "devUrl": "http://localhost:3000",
@@ -12,19 +12,18 @@
   "app": {
     "windows": [
       {
-        "title": "wifi-bluetooth-monitor",
+        "title": "Wi-Fi + Bluetooth Monitor",
         "width": 800,
         "height": 600,
         "resizable": true,
         "fullscreen": false
       }
     ],
-    "macOSPrivateApi": true,
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
+      "devCsp": "default-src 'self' http://localhost:3000; script-src 'self' 'unsafe-eval' 'unsafe-inline' http://localhost:3000; style-src 'self' 'unsafe-inline' http://localhost:3000; img-src 'self' data: http://localhost:3000; connect-src 'self' ipc: http://ipc.localhost ws://localhost:3000 http://localhost:3000"
     }
   },
-
   "bundle": {
     "active": true,
     "targets": "all",
@@ -52,13 +51,8 @@
       },
       "files": {},
       "hardenedRuntime": true,
-      "minimumSystemVersion": "10.13",
-      "entitlements": {
-        "com.apple.security.device.bluetooth": true
-      },
-      "info": {
-        "NSBluetoothAlwaysUsageDescription": "This app requires access to Bluetooth to detect nearby devices for security monitoring."
-      }
+      "minimumSystemVersion": "13.0",
+      "entitlements": "Entitlements.plist"
     }
   }
 }
