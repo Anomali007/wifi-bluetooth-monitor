@@ -1,12 +1,12 @@
 [package]
-name = "app"
+name = "wifi-bluetooth-monitor"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
-license = ""
-repository = ""
+description = "Listen-only Wi-Fi and Bluetooth environment monitor for macOS: flags evil-twin access points and possible persistent trackers."
+authors = ["Mali Franzese"]
+license = "MIT"
+repository = "https://github.com/Anomali007/wifi-bluetooth-monitor"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.85"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -15,16 +15,29 @@ name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.0.1", features = [] }
+tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.0.6", features = [] }
-tauri-plugin-log = "2.0.0-rc"
-tokio = { version = "1", features = ["macros", "rt"] }
-tokio-wifiscanner = "0.2"
-sha2 = "0.10" # For hashing identifiers
-btleplug = { version = "0.9", features = ["macos-integration"] } # For Bluetooth scanning
-chrono = { version = "0.4", features = ["serde"] } # For timestamps
+tauri = { version = "2.12", features = [] }
+tauri-plugin-log = "2.10"
+tauri-plugin-notification = "2.7"
+# Scan loop needs: spawn, sleep/interval, channels. Tauri brings its own runtime; these are for library code.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+futures = "0.3" # btleplug event streams
+sha2 = "0.11" # identifier hashing (model::hash_identifier)
+hex = "0.4"
+rand = "0.10" # salt generation (store)
+btleplug = "0.13" # BLE scanning (receive-only)
+rusqlite = { version = "0.40", features = ["bundled"] } # local store
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-wlan = "0.3"
+objc2-core-location = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

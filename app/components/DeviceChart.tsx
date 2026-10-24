@@ -1,49 +1,28 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import {
   BarChart,
   Bar,
+  Cell,
   XAxis,
+  YAxis,
   Tooltip as RechartsTooltip,
   CartesianGrid,
-  Legend,
 } from "recharts";
 import {
   ChartContainer,
-  ChartTooltip,
   ChartTooltipContent,
   ChartLegend,
   ChartLegendContent,
 } from "@/components/ui/chart";
 
-interface NetworkDevice {
+export interface ChartRow {
   name: string;
-  identifier: string;
   signal_strength: number | null;
-  timestamp: string;
-  device_type: string;
+  device_type: "Wi-Fi" | "Bluetooth";
 }
 
-export default function DeviceChart() {
-  const [data, setData] = useState<NetworkDevice[]>([]);
-
-  useEffect(() => {
-    async function fetchDevices() {
-      try {
-        const result: NetworkDevice[] = await invoke("scan_networks");
-        setData(result);
-      } catch (error) {
-        console.error("Error fetching devices:", error);
-      }
-    }
-
-    fetchDevices();
-    const interval = setInterval(fetchDevices, 60000); // Refresh every minute
-    return () => clearInterval(interval);
-  }, []);
-
+export default function DeviceChart({ data }: { data: ChartRow[] }) {
   // Prepare data for the chart
   const chartData = data.map((device) => ({
     name: device.name,
@@ -55,16 +34,16 @@ export default function DeviceChart() {
   const chartConfig = {
     WiFi: {
       label: "Wi-Fi",
-      color: "hsl(var(--chart-WiFi))",
+      color: "hsl(var(--chart-1))",
     },
     Bluetooth: {
       label: "Bluetooth",
-      color: "hsl(var(--chart-Bluetooth))",
+      color: "hsl(var(--chart-2))",
     },
   } as const;
 
   return (
-    <ChartContainer config={chartConfig} className="min-h-[400px] w-full">
+    <ChartContainer config={chartConfig} className="min-h-[320px] w-full">
       <BarChart
         data={chartData}
         width={600}
@@ -78,18 +57,21 @@ export default function DeviceChart() {
           tickMargin={10}
           axisLine={false}
         />
+        <YAxis domain={[0, 100]} tickLine={false} axisLine={false} width={32} />
         <RechartsTooltip content={<ChartTooltipContent />} />
         <ChartLegend content={<ChartLegendContent nameKey="device_type" />} />
-        <Bar
-          dataKey="signal_strength"
-          name="Signal Strength"
-          fill={({ payload }) =>
-            payload.device_type === "Wi-Fi"
-              ? "var(--color-WiFi)"
-              : "var(--color-Bluetooth)"
-          }
-          radius={4}
-        />
+        <Bar dataKey="signal_strength" name="Signal Strength" radius={4} isAnimationActive={false}>
+          {chartData.map((row, i) => (
+            <Cell
+              key={i}
+              fill={
+                row.device_type === "Wi-Fi"
+                  ? "var(--color-WiFi)"
+                  : "var(--color-Bluetooth)"
+              }
+            />
+          ))}
+        </Bar>
       </BarChart>
     </ChartContainer>
   );
