@@ -1,0 +1,90 @@
+"use client";
+
+import type { BleObservation, WifiObservation } from "@/lib/types";
+import {
+  SECURITY_LABEL,
+  TRACKER_LABEL,
+  formatTime,
+} from "@/lib/format";
+
+export interface DeviceRow {
+  key: string;
+  type: "Wi-Fi" | "Bluetooth";
+  name: string;
+  detail: string;
+  rssi: number | null;
+  tracker: string | null;
+  lastSeen: number;
+}
+
+export function rowsFrom(
+  wifi: WifiObservation[],
+  ble: BleObservation[],
+): DeviceRow[] {
+  return [
+    ...wifi.map((w, i) => ({
+      key: `w-${w.bssidHash ?? "x"}-${i}`,
+      type: "Wi-Fi" as const,
+      name: w.ssid ?? "(hidden or withheld)",
+      detail: `${SECURITY_LABEL[w.security]}${w.channel ? `, ch ${w.channel}` : ""}`,
+      rssi: w.rssi,
+      tracker: null,
+      lastSeen: w.seenAt,
+    })),
+    ...ble.map((b) => ({
+      key: `b-${b.peripheralHash}`,
+      type: "Bluetooth" as const,
+      name: b.name ?? "Unnamed device",
+      detail:
+        b.manufacturerId !== null ? `Manufacturer ${b.manufacturerId}` : "",
+      rssi: b.rssi,
+      tracker: b.tracker ? TRACKER_LABEL[b.tracker] : null,
+      lastSeen: b.seenAt,
+    })),
+  ];
+}
+
+export default function DeviceTable({ rows }: { rows: DeviceRow[] }) {
+  if (rows.length === 0) {
+    return (
+      <p className="p-4 text-sm text-muted-foreground">
+        No devices seen yet.
+      </p>
+    );
+  }
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b text-left text-muted-foreground">
+            <th className="p-2 font-medium">Type</th>
+            <th className="p-2 font-medium">Name / SSID</th>
+            <th className="p-2 font-medium">Details</th>
+            <th className="p-2 font-medium">Signal</th>
+            <th className="p-2 font-medium">Last seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.key} className="border-b last:border-0">
+              <td className="p-2">{r.type}</td>
+              <td className="p-2">
+                {r.name}
+                {r.tracker && (
+                  <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900">
+                    {r.tracker}
+                  </span>
+                )}
+              </td>
+              <td className="p-2 text-muted-foreground">{r.detail}</td>
+              <td className="p-2 tabular-nums">
+                {r.rssi === null ? "n/a" : `${r.rssi} dBm`}
+              </td>
+              <td className="p-2 tabular-nums">{formatTime(r.lastSeen)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
