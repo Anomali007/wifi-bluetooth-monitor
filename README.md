@@ -6,7 +6,7 @@ It never transmits, probes, connects to, or pairs with anything it finds. Everyt
 
 Built with Tauri 2 (Rust backend in `src-tauri/`) and a Next.js 14 static-export frontend (`app/`). macOS only.
 
-> **Verified on:** `{{VERIFIED_ON}}` (placeholder: macOS version, build, and live-run counts are filled in after a real run: Wi-Fi networks seen, share with a readable name, BLE devices, trackers, alerts, scans stored)
+> **Verified on:** macOS 27.0.1 (26A434), Apple silicon, signed debug build, 2026-10-24. A 10-minute live run stored 10 scans: 85 distinct Wi-Fi networks (92.1% of sightings with a readable name, Location granted), 124 distinct BLE devices, 1 separated Find My advertiser, 0 alerts, 0 scan errors. Counts only; no scan data is published.
 
 ## Features
 
@@ -77,7 +77,7 @@ Without Location the Wi-Fi scan still runs but the networks have no names; the d
 - **CoreBluetooth hides MAC addresses.** macOS gives each Bluetooth device a per-Mac identifier, not its hardware address. The app hashes that identifier. It cannot match a device to anything outside this Mac.
 - **Find My identifiers rotate**: per the DULT draft an accessory changes its address about every 15 minutes near its owner and about every 24 hours when separated, so one physical tag can appear as several devices over time. The persistent-tracker rule also groups a tracker family that stays present, which is a heuristic.
 - **Tracker alerts are "possible", a best guess.** A signature match means "an advertisement of this type", not "this device is following you". Apple's Find My advertisement is also sent by other Find My accessories and by some Apple devices; crowded places can look the same. A tracker not heard for more than 10 minutes stops alerting.
-- **The Apple Find My signature is broad.** Any Apple device or accessory advertising in the Find My network matches it, and many do. On a first live run in a normal home or street setting, dozens of distinct Find My identifiers appeared within minutes. Expect false positives from the persistent-tracker rule around many Apple devices; the alerts are hints to check, not findings.
+- **Only separated Find My adverts count.** Apple's Find My advertisement is also sent by AirTags and accessories near their owner, and by iPhones, Macs and AirPods. Following AirGuard, the app treats an Apple advert as a tracker only when it is in separated mode and its status says AirTag or Find My accessory. Before this rule, a 3-minute run at home matched 28 distinct identifiers. With it, a 10-minute run matched 1. The trade-off: a tracker still near its owner, or one using a status type the app does not know, is not flagged.
 - **Tracker detection is unit-tested on synthetic advertisements but NOT field-verified with a real AirTag, Tile or other tracker. None was available during development.** Treat the tracker feature as unproven against real hardware.
 - Wi-Fi alert titles include the network name (SSID); device identifiers are never shown, only short hash fragments in tables.
 - Network names (SSIDs) and Bluetooth advertised names are stored as plain text in the local database until the retention window expires. Only addresses and identifiers are hashed.
