@@ -421,6 +421,8 @@ fn tracker_label(k: TrackerKind) -> &'static str {
         TrackerKind::Tile => "Tile",
         TrackerKind::SamsungSmartTag => "Samsung SmartTag",
         TrackerKind::Chipolo => "Chipolo",
+        TrackerKind::Pebblebee => "Pebblebee",
+        TrackerKind::GoogleFindMy => "Google Find My Device",
         TrackerKind::UnknownTracker => "unidentified",
     }
 }
@@ -876,6 +878,7 @@ mod tests {
             (ap("Net-A", 1, Wep), Some(Severity::High)),
             (ap("Net-A", 7, Open), Some(Severity::High)), // both
             (ap("Net-A", 1, Unknown), None),              // cannot compare
+            (ap("Net-A", 1, Owe), Some(Severity::High)),  // encrypted but no password: weaker
             (ap("Net-B", 7, Open), None),                 // not trusted
         ];
         for (i, (o, exp)) in cases.into_iter().enumerate() {
@@ -911,7 +914,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wpa2_wpa3_transition_network_is_not_a_downgrade_against_trusted_wpa2() {
+        // WP1 maps a WPA2/WPA3 transition network to Wpa3Personal. A trusted Wpa2Personal
+        // network seen that way (known BSSID) must stay silent.
+        let tr = vec![trusted("Net-A", &[1], Security::Wpa2Personal)];
+        let h = hist(vec![scan(
+            0,
+            vec![ap("Net-A", 1, Security::Wpa3Personal)],
+            vec![],
+        )]);
+        let a = evaluate(&h, &settings_with(tr), at(0));
+        assert!(only_kind(&a, AlertKind::TrustedNetworkChanged).is_empty());
+        assert!(only_kind(&a, AlertKind::EvilTwin).is_empty());
+    }
+
+    #[test]
+    fn owe_is_never_treated_as_open() {
+        // An OWE AP next to a secured AP with the same name is a security-mode mismatch,
+        // but OWE must not be reported as an "open" network.
+        let h = hist(vec![scan(
+            0,
+            vec![
+                ap("Net-A", 1, Security::Owe),
+                ap("Net-A", 2, Security::Wpa2Personal),
+            ],
+            vec![],
+        )]);
+        let a = evaluate(&h, &settings_with(vec![]), at(0));
+        assert!(!a.iter().any(|x| x.detail.contains("one is open")));
+        let h2 = hist(vec![scan(0, vec![ap("Net-A", 1, Security::Owe)], vec![])]);
+        let s = settings_with(vec![trusted("Net-A", &[], Security::Wpa2Personal)]);
+        assert!(only_kind(&evaluate(&h2, &s, at(0)), AlertKind::OpenLookalike).is_empty());
+    }
+
     // ---- PersistentTracker -----------------------------------------------
+
+    #[test]
+    fn pebblebee_and_google_trackers_are_labelled() {
+        for (kind, label) in [
+            (TrackerKind::Pebblebee, "Pebblebee"),
+            (TrackerKind::GoogleFindMy, "Google Find My Device"),
+        ] {
+            let a = evaluate(
+                &tracker_hist(5, 5, kind, |_| 1),
+                &Settings::default(),
+                at(20),
+            );
+            let got = only_kind(&a, AlertKind::PersistentTracker);
+            assert_eq!(got.len(), 1);
+            assert!(got[0].title.contains(label) && got[0].title.contains("Possible"));
+        }
+    }
 
     fn tracker_hist(n_scans: i64, step: i64, kind: TrackerKind, id: impl Fn(i64) -> u8) -> History {
         hist(

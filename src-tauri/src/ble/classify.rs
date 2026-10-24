@@ -13,8 +13,8 @@
 //! - Apple type 0x12 is the Find My (offline finding) advertisement used by AirTags,
 //!   third-party Find My accessories and some AirPods/iPhones in lost mode. AirGuard's
 //!   `AppleDevice` filter matches any 0x4C payload whose first byte is 0x12.
-//! - Pebblebee and Google Find My Device Network (FMDN) have no dedicated `TrackerKind`
-//!   in the frozen contract, so they map to `UnknownTracker`.
+//! - Pebblebee and Google Find My Device Network (FMDN) map to their own `TrackerKind`s.
+//!   A DULT advertisement from a non-Apple network maps to `UnknownTracker`.
 //! - NOT included because no primary source was verified: Tile 0xFEEC, Google FMDN frame
 //!   type 0x41 (AirGuard's FEAA filter carries 0x40 with an all-zero mask, which does not
 //!   constrain; we require 0x40), Samsung "Find My Mobile" phones/tablets.
@@ -122,11 +122,11 @@ pub fn classify(
         return Some(TrackerKind::Chipolo);
     }
     if has_svc(SVC_PEBBLEBEE) {
-        return Some(TrackerKind::UnknownTracker);
+        return Some(TrackerKind::Pebblebee);
     }
     if let Some(d) = service_data.get(&SVC_GOOGLE_FMDN) {
         if d.first() == Some(&GOOGLE_FMDN_FRAME_TYPE) {
-            return Some(TrackerKind::UnknownTracker);
+            return Some(TrackerKind::GoogleFindMy);
         }
     }
     None
@@ -244,15 +244,15 @@ mod tests {
     }
 
     #[test]
-    fn positive_pebblebee_and_google_are_unknown_tracker() {
+    fn positive_pebblebee_and_google_have_their_own_kinds() {
         assert_eq!(
             classify(&none_m(), &[SVC_PEBBLEBEE], &none_s()),
-            Some(TrackerKind::UnknownTracker)
+            Some(TrackerKind::Pebblebee)
         );
         let s = sd(SVC_GOOGLE_FMDN, &[0x40, 0x01]);
         assert_eq!(
             classify(&none_m(), &[], &s),
-            Some(TrackerKind::UnknownTracker)
+            Some(TrackerKind::GoogleFindMy)
         );
     }
 

@@ -40,7 +40,7 @@ pub(super) struct RawNetwork {
 /// strongest mode the network advertises (a WPA2/WPA3 transition network reports WPA3).
 ///
 /// `Open` only when `None` is supported and nothing stronger is. OWE (encrypted, no
-/// password) is not "open" for alerting purposes, so it maps to `Unknown`.
+/// password) maps to `Owe`, which is never treated as open.
 pub(super) fn map_security(supported: &[isize]) -> Security {
     use cw_security::*;
     let has = |v: isize| supported.contains(&v);
@@ -59,7 +59,7 @@ pub(super) fn map_security(supported: &[isize]) -> Security {
     } else if has(WEP) || has(DYNAMIC_WEP) {
         Security::Wep
     } else if has(OWE) || has(OWE_TRANSITION) {
-        Security::Unknown
+        Security::Owe
     } else if has(NONE) {
         Security::Open
     } else {
@@ -131,7 +131,7 @@ mod tests {
             (&[WPA_ENTERPRISE], Security::WpaEnterprise),
             (&[WPA2_ENTERPRISE], Security::Wpa2Enterprise),
             (&[WPA3_ENTERPRISE], Security::Wpa3Enterprise),
-            (&[OWE], Security::Unknown),
+            (&[OWE], Security::Owe),
             (&[], Security::Unknown),
         ];
         for (input, want) in cases {
@@ -150,7 +150,7 @@ mod tests {
             Security::Wpa2Enterprise
         );
         // `None` alongside OWE transition must not read as open.
-        assert_eq!(map_security(&[NONE, OWE_TRANSITION]), Security::Unknown);
+        assert_eq!(map_security(&[NONE, OWE_TRANSITION]), Security::Owe);
     }
 
     #[test]

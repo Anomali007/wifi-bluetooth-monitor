@@ -78,17 +78,20 @@ pub enum Security {
     WpaEnterprise,
     Wpa2Enterprise,
     Wpa3Enterprise,
+    /// Opportunistic Wireless Encryption (and OWE transition): encrypted, no password.
+    /// Not "open" for alerting purposes.
+    Owe,
     Unknown,
 }
 
 impl Security {
-    /// Coarse strength rank used to detect downgrades: Open 0 < Wep 1 < Wpa 2 < Wpa2 3 < Wpa3 4.
+    /// Coarse strength rank used to detect downgrades: Open 0 < Owe/Wep 1 < Wpa 2 < Wpa2 3 < Wpa3 4.
     /// Personal and Enterprise of the same generation rank equal. `Unknown` ranks 0 but must
     /// be treated as "cannot compare" by detection rules.
     pub fn strength(self) -> u8 {
         match self {
             Security::Open | Security::Unknown => 0,
-            Security::Wep => 1,
+            Security::Wep | Security::Owe => 1,
             Security::WpaPersonal | Security::WpaEnterprise => 2,
             Security::Wpa2Personal | Security::Wpa2Enterprise => 3,
             Security::Wpa3Personal | Security::Wpa3Enterprise => 4,
@@ -121,6 +124,8 @@ pub enum TrackerKind {
     Tile,
     SamsungSmartTag,
     Chipolo,
+    Pebblebee,
+    GoogleFindMy,
     UnknownTracker,
 }
 
@@ -478,6 +483,9 @@ mod tests {
         assert!(Security::Wpa3Personal.strength() > Security::Wpa2Personal.strength());
         assert!(Security::Wpa2Personal.strength() > Security::Open.strength());
         assert!(Security::Open.is_open() && !Security::Wep.is_open());
+        // OWE is encrypted: stronger than open, never counted as open.
+        assert!(Security::Owe.strength() > Security::Open.strength());
+        assert!(!Security::Owe.is_open());
     }
 
     #[test]
