@@ -10,7 +10,6 @@ Only what is **not** built yet. What exists is described in the [README](README.
 
 ## Dependencies
 
-- **Upgrade to Next 15** to clear the remaining advisories that `pnpm audit` reports against Next 14.2. None are reachable in a static export, but they should not linger.
 - Track the expired DULT draft the Network ID table comes from, and update when a final spec is published.
 
 ## Distribution
