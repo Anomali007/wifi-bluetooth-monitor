@@ -141,8 +141,8 @@ function bleAt(now: Millis, step: number, withNew: boolean): BleObservation[] {
       name: null,
       peripheralHash: H_TAG,
       rssi: jitter(-58, 7, step),
-      tracker: "unknownTracker",
-      manufacturerId: 76,
+      tracker: "tile",
+      manufacturerId: null,
       seenAt: now,
     },
     {
@@ -271,7 +271,7 @@ function buildAlerts(): Alert[] {
       id: "mock-tracker",
       kind: "persistentTracker",
       severity: "high",
-      title: "Possible tracker following you",
+      title: "Possible tracker nearby",
       detail:
         "A tracker-type Bluetooth device has been nearby across 9 scans over 4 hours. This may be a possible tracker, or someone's own tag nearby.",
       firstSeen: now - 4 * 60 * MIN,

@@ -20,6 +20,7 @@ export type Security =
   | "wpaEnterprise"
   | "wpa2Enterprise"
   | "wpa3Enterprise"
+  | "owe"
   | "unknown";
 
 export type TrackerKind =
@@ -27,6 +28,8 @@ export type TrackerKind =
   | "tile"
   | "samsungSmartTag"
   | "chipolo"
+  | "pebblebee"
+  | "googleFindMy"
   | "unknownTracker";
 
 export interface WifiObservation {

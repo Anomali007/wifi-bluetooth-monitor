@@ -2,14 +2,14 @@
 
 import { useEffect, useState } from "react";
 import { useMonitor } from "@/components/monitor-provider";
-import { SECURITY_LABEL } from "@/lib/format";
+import { SECURITY_LABEL, securityStrength } from "@/lib/format";
 import type { AlertToggles, Settings, TrustedNetwork } from "@/lib/types";
 
 const TOGGLE_LABEL: Record<keyof AlertToggles, string> = {
   evilTwin: "Evil twin (same name, different hardware)",
   openLookalike: "Open lookalike of a secured network",
   trustedNetworkChanged: "Trusted network changed",
-  persistentTracker: "Possible tracker following you",
+  persistentTracker: "Possible tracker nearby (persistent)",
   newDevice: "New device nearby (noisy)",
 };
 
@@ -60,6 +60,10 @@ export default function SettingsPage() {
       knownBssidHashes: [],
       expectedSecurity: w.security,
     };
+    // Expect the strongest mode seen for this name, so a stray weaker AP cannot lower the bar.
+    if (securityStrength(w.security) > securityStrength(cur.expectedSecurity)) {
+      cur.expectedSecurity = w.security;
+    }
     if (w.bssidHash && !cur.knownBssidHashes.includes(w.bssidHash)) {
       cur.knownBssidHashes.push(w.bssidHash);
     }
