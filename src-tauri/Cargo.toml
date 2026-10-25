@@ -32,6 +32,10 @@ hex = "0.4"
 rand = "0.10" # salt generation (store)
 btleplug = "0.13" # BLE scanning (receive-only)
 rusqlite = { version = "0.40", features = ["bundled"] } # local store
+# LAN module (WP-D): sysctl ARP table, getifaddrs, receive-only mDNS socket options. Declared
+# here by the Foundation pass so no work package has to touch Cargo.toml / Cargo.lock.
+libc = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

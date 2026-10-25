@@ -1,6 +1,7 @@
 "use client";
 
 import type { BleObservation, WifiObservation } from "@/lib/types";
+import MineButton, { type MineTarget } from "./mine-button";
 import {
   SECURITY_LABEL,
   TRACKER_LABEL,
@@ -15,6 +16,11 @@ export interface DeviceRow {
   rssi: number | null;
   tracker: string | null;
   lastSeen: number;
+  /** Wi-Fi only: vendor from the OUI and the multi-radio group (WP-C renders them). */
+  vendor: string | null;
+  groupId: string | null;
+  /** What "Mark as mine" would mark; null when the identifier is withheld. */
+  mine: MineTarget | null;
 }
 
 export function rowsFrom(
@@ -30,6 +36,13 @@ export function rowsFrom(
       rssi: w.rssi,
       tracker: null,
       lastSeen: w.seenAt,
+      vendor: w.vendor,
+      groupId: w.groupId,
+      mine: w.groupId
+        ? { kind: "wifiGroup" as const, idHash: w.groupId, rotatingAddress: false }
+        : w.bssidHash
+          ? { kind: "wifiAp" as const, idHash: w.bssidHash, rotatingAddress: false }
+          : null,
     })),
     ...ble.map((b) => ({
       key: `b-${b.peripheralHash}`,
@@ -44,6 +57,13 @@ export function rowsFrom(
       rssi: b.rssi,
       tracker: b.tracker ? TRACKER_LABEL[b.tracker] : null,
       lastSeen: b.seenAt,
+      vendor: null,
+      groupId: null,
+      mine: {
+        kind: "ble" as const,
+        idHash: b.peripheralHash,
+        rotatingAddress: b.manufacturerId === 0x004c, // Apple rotates every few minutes
+      },
     })),
   ];
 }
@@ -66,6 +86,7 @@ export default function DeviceTable({ rows }: { rows: DeviceRow[] }) {
             <th className="p-2 font-medium">Details</th>
             <th className="p-2 font-medium">Signal</th>
             <th className="p-2 font-medium">Last seen</th>
+            <th className="p-2 font-medium">Mine</th>
           </tr>
         </thead>
         <tbody>
@@ -85,6 +106,7 @@ export default function DeviceTable({ rows }: { rows: DeviceRow[] }) {
                 {r.rssi === null ? "n/a" : `${r.rssi} dBm`}
               </td>
               <td className="p-2 tabular-nums">{formatTime(r.lastSeen)}</td>
+              <td className="p-2">{r.mine && <MineButton target={r.mine} />}</td>
             </tr>
           ))}
         </tbody>

@@ -9,15 +9,21 @@
 //! - [`ble`]      btleplug scan + tracker classification -> `BleObservation`
 //! - [`detect`]   pure detection rules over a `History`
 //! - [`store`]    SQLite persistence, retention purge, per-install salt
+//! - [`vendor`]   OUI vendor lookup and multi-radio grouping (raw address in, plain/hashed out)
+//! - [`places`]   Wi-Fi-fingerprint place memory and dwell tracking
+//! - [`lan`]      local-network discovery (ARP, receive-only mDNS, opt-in sweep)
 //! - [`pipeline`] one scan cycle without Tauri: assemble -> store -> detect -> upsert
 //! - [`commands`] the Tauri command surface and the background scan loop
 
 pub mod ble;
 pub mod commands;
 pub mod detect;
+pub mod lan;
 pub mod model;
 pub mod pipeline;
+pub mod places;
 pub mod store;
+pub mod vendor;
 pub mod wifi;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -34,6 +40,18 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::get_permissions,
+            commands::list_places,
+            commands::rename_place,
+            commands::forget_place,
+            commands::list_mine,
+            commands::add_mine,
+            commands::remove_mine,
+            commands::list_watchlist,
+            commands::add_watchlist,
+            commands::remove_watchlist,
+            commands::list_lan_devices,
+            commands::get_current_network,
+            commands::sweep_now,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {

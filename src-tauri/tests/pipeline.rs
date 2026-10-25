@@ -20,6 +20,8 @@ fn ap(ssid: &str, n: u8, security: Security, at: Millis) -> WifiObservation {
         channel: Some(6),
         security,
         seen_at: at,
+        vendor: None,
+        group_id: None,
     }
 }
 
@@ -134,6 +136,8 @@ fn location_withheld_ssids_surface_as_an_error() {
         channel: None,
         security: Security::Unknown,
         seen_at: 1,
+        vendor: None,
+        group_id: None,
     };
     let denied = PermissionState {
         bluetooth: PermissionStatus::Granted,
@@ -151,4 +155,61 @@ fn location_withheld_ssids_surface_as_an_error() {
     };
     let r = assemble(1, Ok(vec![nameless]), Ok(vec![]), granted);
     assert!(r.errors.is_empty());
+}
+
+#[test]
+fn ingest_with_lan_outcome_and_v2_state_runs_and_stays_quiet() {
+    use app_lib::lan::LanScanOutcome;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    store
+        .add_mine(&MineEntry {
+            kind: MineKind::WifiAp,
+            id_hash: hash_identifier(&salt(), "02:00:00:00:00:01"),
+            label: Some("Router-A".into()),
+            added_at: 1,
+        })
+        .unwrap();
+    store
+        .add_watchlist(WatchKind::Ssid, "Net-A", WatchMatch::Exact, 1)
+        .unwrap();
+    let outcome = LanScanOutcome::default();
+    let end = app_lib::pipeline::now_ms();
+    // Stubbed v2 rules produce nothing; the pass must succeed and v1 rules still work.
+    let alerts =
+        app_lib::pipeline::ingest_with(&mut store, &scan_at(end), Some(&outcome), end).unwrap();
+    assert!(alerts.iter().all(|a| !matches!(
+        a.kind,
+        AlertKind::FollowedAcrossPlaces | AlertKind::Watchlist | AlertKind::NewLanDevice
+    )));
+    assert!(store.list_places().unwrap().is_empty());
+}
+
+#[test]
+fn every_alert_kind_has_generic_notification_text() {
+    for kind in [
+        AlertKind::EvilTwin,
+        AlertKind::OpenLookalike,
+        AlertKind::TrustedNetworkChanged,
+        AlertKind::PersistentTracker,
+        AlertKind::NewDevice,
+        AlertKind::FollowedAcrossPlaces,
+        AlertKind::Watchlist,
+        AlertKind::NewLanDevice,
+    ] {
+        let a = Alert {
+            id: "x".into(),
+            kind,
+            severity: Severity::Low,
+            title: "Net-A".into(),
+            detail: "Net-A at Place-A".into(),
+            first_seen: 1,
+            last_seen: 1,
+            subject_hash: "ab".repeat(32),
+            dismissed: false,
+        };
+        let (t, b) = notification_text(&a);
+        assert!(!t.is_empty() && !b.is_empty());
+        assert!(!format!("{t} {b}").contains("Net-A"), "{kind:?}");
+    }
 }

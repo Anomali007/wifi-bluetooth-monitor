@@ -3,19 +3,25 @@
 //! Errors cross the IPC boundary as `String`. JS argument names are camelCase
 //! (`includeDismissed`).
 //!
+//! v2 commands (places, Mine, watchlist, LAN) are thin wrappers over `Store` CRUD and `lan`;
+//! rule logic lives elsewhere.
+//!
 //! Push events (see `model`): `EVENT_SCAN` (`wbm://scan`) carries a `ScanResult` after every
 //! scan cycle, `EVENT_ALERT` (`wbm://alert`) carries an `Alert` when one is first created.
 //!
 //! Logging here is counts only, and only in debug builds. Scan data is never printed.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_notification::NotificationExt;
 
+use crate::lan::{self, LanInputs, LanScanOutcome, LanState};
+use crate::model::PermissionState;
 use crate::model::{
-    Alert, History, Millis, PermissionState, ScanResult, Settings, EVENT_ALERT, EVENT_SCAN,
+    Alert, History, LanDevice, Millis, MineEntry, MineKind, NetworkInfo, Place, ScanResult,
+    Settings, WatchKind, WatchMatch, WatchlistEntry, EVENT_ALERT, EVENT_SCAN,
 };
 use crate::pipeline;
 use crate::store::Store;
@@ -26,6 +32,8 @@ use crate::{ble, wifi};
 pub struct AppState {
     pub store: Mutex<Store>,
     pub cycle: tokio::sync::Mutex<()>,
+    /// Sweep cadence state, shared with the blocking LAN thread.
+    pub lan: Arc<Mutex<LanState>>,
 }
 
 impl AppState {
@@ -33,6 +41,7 @@ impl AppState {
         AppState {
             store: Mutex::new(store),
             cycle: tokio::sync::Mutex::new(()),
+            lan: Arc::new(Mutex::new(LanState::default())),
         }
     }
 }
@@ -46,6 +55,33 @@ fn permissions() -> PermissionState {
         bluetooth: ble::bluetooth_permission(),
         location: wifi::location_permission(),
     }
+}
+
+/// Observe the LAN on a blocking thread. A failure becomes `None` (counts only in debug logs):
+/// the LAN is an extra, never a reason to lose a Wi-Fi/BLE cycle.
+async fn run_lan(app: &AppHandle, force_sweep: bool) -> Option<LanScanOutcome> {
+    let state = app.state::<AppState>();
+    let (salt, settings, mine) = {
+        let store = state.store.lock().ok()?;
+        (
+            store.salt().clone(),
+            store.get_settings().ok()?,
+            store.list_mine().ok()?,
+        )
+    };
+    let inputs = LanInputs {
+        salt,
+        settings,
+        mine,
+        force_sweep,
+    };
+    let lan_state = Arc::clone(&state.lan);
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = lan_state.lock().ok()?;
+        lan::scan(&inputs, &mut guard).ok()
+    })
+    .await;
+    joined.ok().flatten()
 }
 
 /// One full cycle: scan Wi-Fi and BLE concurrently, store, detect, emit, notify.
@@ -66,9 +102,17 @@ pub async fn run_cycle(app: &AppHandle) -> Result<ScanResult, String> {
     let (wifi_res, ble_res) = tokio::join!(wifi::scan(&salt), ble::scan(&salt, window));
     let result = pipeline::assemble(scanned_at, wifi_res, ble_res, permissions());
 
+    let lan_outcome = run_lan(app, false).await;
+
     let new_alerts = {
         let mut store = state.store.lock().map_err(lock_err)?;
-        pipeline::ingest(&mut store, &result, pipeline::now_ms()).map_err(|e| e.to_string())?
+        pipeline::ingest_with(
+            &mut store,
+            &result,
+            lan_outcome.as_ref(),
+            pipeline::now_ms(),
+        )
+        .map_err(|e| e.to_string())?
     };
 
     if cfg!(debug_assertions) {
@@ -182,4 +226,156 @@ pub async fn set_settings(
 #[tauri::command]
 pub async fn get_permissions() -> Result<PermissionState, String> {
     Ok(permissions())
+}
+
+// ---------------------------------------------------------------------------
+// v2: places, Mine, watchlist, LAN
+// ---------------------------------------------------------------------------
+
+/// All remembered places, oldest first.
+#[tauri::command]
+pub async fn list_places(state: State<'_, AppState>) -> Result<Vec<Place>, String> {
+    let store = state.store.lock().map_err(lock_err)?;
+    store.list_places().map_err(|e| e.to_string())
+}
+
+/// Set (or clear, with `None`/blank) a place's label; returns the place.
+#[tauri::command]
+pub async fn rename_place(
+    state: State<'_, AppState>,
+    id: i64,
+    label: Option<String>,
+) -> Result<Place, String> {
+    let mut store = state.store.lock().map_err(lock_err)?;
+    store
+        .rename_place(id, label.as_deref())
+        .map_err(|e| e.to_string())?;
+    store
+        .list_places()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| "no such place".to_string())
+}
+
+/// Forget a place and everything recorded there.
+#[tauri::command]
+pub async fn forget_place(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let mut store = state.store.lock().map_err(lock_err)?;
+    store.forget_place(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_mine(state: State<'_, AppState>) -> Result<Vec<MineEntry>, String> {
+    let store = state.store.lock().map_err(lock_err)?;
+    store.list_mine().map_err(|e| e.to_string())
+}
+
+/// Mark an access point, radio group, BLE device or LAN device as mine (by hash).
+#[tauri::command]
+pub async fn add_mine(
+    state: State<'_, AppState>,
+    kind: MineKind,
+    id_hash: String,
+    label: Option<String>,
+) -> Result<MineEntry, String> {
+    let mut store = state.store.lock().map_err(lock_err)?;
+    let entry = MineEntry {
+        kind,
+        id_hash,
+        label: label
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty()),
+        added_at: pipeline::now_ms(),
+    };
+    store.add_mine(&entry).map_err(|e| e.to_string())?;
+    Ok(entry)
+}
+
+#[tauri::command]
+pub async fn remove_mine(
+    state: State<'_, AppState>,
+    kind: MineKind,
+    id_hash: String,
+) -> Result<(), String> {
+    let mut store = state.store.lock().map_err(lock_err)?;
+    store.remove_mine(kind, &id_hash).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_watchlist(state: State<'_, AppState>) -> Result<Vec<WatchlistEntry>, String> {
+    let store = state.store.lock().map_err(lock_err)?;
+    store.list_watchlist().map_err(|e| e.to_string())
+}
+
+/// JS argument is `matchMode`.
+#[tauri::command]
+pub async fn add_watchlist(
+    state: State<'_, AppState>,
+    kind: WatchKind,
+    pattern: String,
+    match_mode: WatchMatch,
+) -> Result<WatchlistEntry, String> {
+    let mut store = state.store.lock().map_err(lock_err)?;
+    store
+        .add_watchlist(kind, &pattern, match_mode, pipeline::now_ms())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn remove_watchlist(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let mut store = state.store.lock().map_err(lock_err)?;
+    store.remove_watchlist(id).map_err(|e| e.to_string())
+}
+
+/// Stored LAN devices, all networks or one `network_key`, newest first. IPs are not stored.
+#[tauri::command]
+pub async fn list_lan_devices(
+    state: State<'_, AppState>,
+    network_key: Option<String>,
+) -> Result<Vec<LanDevice>, String> {
+    let store = state.store.lock().map_err(lock_err)?;
+    store
+        .list_lan_devices(network_key.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+/// The joined network and whether a sweep is currently allowed on it.
+#[tauri::command]
+pub async fn get_current_network(state: State<'_, AppState>) -> Result<NetworkInfo, String> {
+    let (salt, settings, mine) = {
+        let store = state.store.lock().map_err(lock_err)?;
+        (
+            store.salt().clone(),
+            store.get_settings().map_err(|e| e.to_string())?,
+            store.list_mine().map_err(|e| e.to_string())?,
+        )
+    };
+    let inputs = LanInputs {
+        salt,
+        settings,
+        mine,
+        force_sweep: false,
+    };
+    let lan_state = state
+        .lan
+        .lock()
+        .map_err(|_| "lan lock poisoned".to_string())?;
+    Ok(lan::current_network(&inputs, &lan_state))
+}
+
+/// "Sweep now": observe the LAN immediately (the sweep gate still applies), record it, and
+/// return the stored devices for the joined network.
+#[tauri::command]
+pub async fn sweep_now(app: AppHandle) -> Result<Vec<LanDevice>, String> {
+    let state = app.state::<AppState>();
+    let _cycle = state.cycle.lock().await;
+    let Some(outcome) = run_lan(&app, true).await else {
+        return Ok(Vec::new());
+    };
+    let mut store = state.store.lock().map_err(lock_err)?;
+    lan::record(&mut store, &outcome, pipeline::now_ms()).map_err(|e| e.to_string())?;
+    store
+        .list_lan_devices(outcome.network.network_key.as_deref())
+        .map_err(|e| e.to_string())
 }

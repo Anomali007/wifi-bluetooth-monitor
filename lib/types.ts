@@ -48,6 +48,10 @@ export interface WifiObservation {
   channel: number | null;
   security: Security;
   seenAt: Millis;
+  /** Short vendor from the BSSID's OUI; "Private address" when locally administered; null if unknown. */
+  vendor: string | null;
+  /** Salted hash shared by the radios of one physical access point in one scan; null if withheld. */
+  groupId: string | null;
 }
 
 export interface BleObservation {
@@ -114,7 +118,10 @@ export type AlertKind =
   | "openLookalike"
   | "trustedNetworkChanged"
   | "persistentTracker"
-  | "newDevice";
+  | "newDevice"
+  | "followedAcrossPlaces"
+  | "watchlist"
+  | "newLanDevice";
 
 export type Severity = "info" | "low" | "medium" | "high";
 
@@ -143,6 +150,12 @@ export interface AlertToggles {
   trustedNetworkChanged: boolean;
   persistentTracker: boolean;
   newDevice: boolean;
+  /** default true */
+  followedAcrossPlaces: boolean;
+  /** default true; does nothing until the watchlist has entries */
+  watchlist: boolean;
+  /** default true; only fires on networks whose access point is marked mine */
+  newLanDevice: boolean;
 }
 
 export interface Settings {
@@ -160,6 +173,86 @@ export interface Settings {
   trackerMinScans: number;
   /** default 20 */
   trackerMinMinutes: number;
+  /** Days places, place sightings and LAN devices are kept. default 14 */
+  placeRetentionDays: number;
+  /** Opt-in LAN sweep (one zero-byte UDP datagram per host), only while the joined access point is mine. default false */
+  lanActiveSweep: boolean;
+}
+
+// ---- Places, Mine, watchlist, LAN (mirror of the v2 section of model.rs) ----
+
+export interface Place {
+  id: number;
+  /** null shows as "Place N" */
+  label: string | null;
+  /** Member BSSID hashes. */
+  members: string[];
+  firstSeen: Millis;
+  lastSeen: Millis;
+}
+
+export type SightingKind = "wifi" | "ble" | "lan";
+
+export interface PlaceSighting {
+  kind: SightingKind;
+  idHash: string;
+  placeId: number;
+  firstSeen: Millis;
+  lastSeen: Millis;
+  scans: number;
+}
+
+export type MineKind = "wifiAp" | "wifiGroup" | "ble" | "lan";
+
+export interface MineEntry {
+  kind: MineKind;
+  idHash: string;
+  label: string | null;
+  addedAt: Millis;
+}
+
+export type WatchKind = "ssid" | "vendor";
+export type WatchMatch = "exact" | "contains";
+
+export interface WatchlistEntry {
+  id: number;
+  kind: WatchKind;
+  pattern: string;
+  /** Serialised as `match` (Rust field `match_mode`). */
+  match: WatchMatch;
+  addedAt: Millis;
+}
+
+export interface LanDevice {
+  networkKey: string;
+  macHash: string;
+  vendor: string | null;
+  /** mDNS hostname, if announced. */
+  hostname: string | null;
+  /** mDNS service types, e.g. "_http._tcp". */
+  services: string[];
+  firstSeen: Millis;
+  lastSeen: Millis;
+  /** Live only, from the current ARP table; never persisted. */
+  ip: string | null;
+  mine: boolean;
+}
+
+export type LanMode = "passive" | "sweep";
+
+export interface NetworkInfo {
+  networkKey: string | null;
+  ssid: string | null;
+  bssidHash: string | null;
+  groupId: string | null;
+  /** CIDR, e.g. "192.0.2.0/24" */
+  subnet: string | null;
+  /** The joined access point (or its radio group) is in Mine. */
+  isMine: boolean;
+  /** lanActiveSweep is on AND isMine: a sweep may run. */
+  sweepEnabled: boolean;
+  mode: LanMode;
+  lastSweepAt: Millis | null;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -174,7 +267,12 @@ export const DEFAULT_SETTINGS: Settings = {
     trustedNetworkChanged: true,
     persistentTracker: true,
     newDevice: false,
+    followedAcrossPlaces: true,
+    watchlist: true,
+    newLanDevice: true,
   },
   trackerMinScans: 5,
   trackerMinMinutes: 20,
+  placeRetentionDays: 14,
+  lanActiveSweep: false,
 };

@@ -3,11 +3,13 @@
 //! Kept free of Tauri types so the whole path can be exercised with synthetic observations
 //! (`tests/pipeline.rs`). The Tauri-facing loop lives in [`crate::commands`].
 
-use crate::detect;
+use crate::detect::{self, DetectContext};
+use crate::lan::{self, LanScanOutcome};
 use crate::model::{
     Alert, AlertKind, BleObservation, Millis, PermissionState, PermissionStatus, ScanError,
     ScanErrorCode, ScanResult, ScanSource, WifiObservation,
 };
+use crate::places;
 use crate::store::{Store, StoreResult};
 
 /// Current Unix time in milliseconds.
@@ -63,11 +65,36 @@ pub fn assemble(
 /// created by this call: those drive events and notifications, so a repeat sighting of the
 /// same condition returns nothing.
 pub fn ingest(store: &mut Store, scan: &ScanResult, now: Millis) -> StoreResult<Vec<Alert>> {
+    ingest_with(store, scan, None, now)
+}
+
+/// [`ingest`] plus this cycle's LAN observation: store the scan, record LAN devices, update
+/// place memory, purge place data by `place_retention_days`, then evaluate with a
+/// [`DetectContext`] built from the store.
+pub fn ingest_with(
+    store: &mut Store,
+    scan: &ScanResult,
+    lan_outcome: Option<&LanScanOutcome>,
+    now: Millis,
+) -> StoreResult<Vec<Alert>> {
     store.insert_scan(scan)?;
     let settings = store.get_settings()?;
+    if let Some(outcome) = lan_outcome {
+        lan::record(store, outcome, now)?;
+    }
+    places::update(store, scan, &settings, now)?;
+    store.purge_places(settings.place_retention_days, now)?;
     let since = now - Millis::from(settings.retention_hours) * 3_600_000;
     let history = store.get_history(since)?;
-    let alerts = detect::evaluate(&history, &settings, now);
+    let ctx = DetectContext {
+        mine: store.list_mine()?,
+        watchlist: store.list_watchlist()?,
+        places: store.list_places()?,
+        place_sightings: store.list_place_sightings()?,
+        lan_devices: store.list_lan_devices(None)?,
+        current_network: lan_outcome.map(|o| o.network.clone()),
+    };
+    let alerts = detect::evaluate_with(&history, &settings, &ctx, now);
     store.upsert_alerts(&alerts)
 }
 
@@ -94,6 +121,18 @@ pub fn notification_text(alert: &Alert) -> (&'static str, &'static str) {
         AlertKind::NewDevice => (
             "New Bluetooth device",
             "A device you have not seen before appeared nearby. Open the app for details.",
+        ),
+        AlertKind::FollowedAcrossPlaces => (
+            "Possible device following you",
+            "Something has shown up at more than one of your places. Open the app for details.",
+        ),
+        AlertKind::Watchlist => (
+            "Watchlist match",
+            "Something on your watchlist is nearby. Open the app for details.",
+        ),
+        AlertKind::NewLanDevice => (
+            "New device on your network",
+            "A device you have not seen before joined a network you marked as yours. Open the app for details.",
         ),
     }
 }

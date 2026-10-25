@@ -4,6 +4,9 @@
 //! - [`evaluate`] is pure: no I/O, no clock, no randomness. `now` is passed in.
 //! - Rules (each gated by `settings.alert_toggles`): EvilTwin, OpenLookalike,
 //!   TrustedNetworkChanged, PersistentTracker, NewDevice. See the roadmap for definitions.
+//!   v2 adds FollowedAcrossPlaces (`follow`), Watchlist (`watchlist`) and NewLanDevice (`lan`),
+//!   which read the extra state in [`DetectContext`]. [`evaluate`] is the context-free form
+//!   (empty context); the pipeline calls [`evaluate_with`].
 //! - Returned alerts are deduplicated by `(kind, subject_hash)` within the call, with
 //!   `first_seen`/`last_seen` taken from the history. `id` is a stable function of
 //!   `(kind, subject_hash)`, and `dismissed` is always `false`; the store merges repeats
@@ -11,12 +14,40 @@
 //! - PersistentTracker alerts say "possible" and never claim certainty (IDs rotate).
 //! - Subjects are hashes only; no raw identifier appears in `title` or `detail`.
 
+mod follow;
+mod lan;
+mod watchlist;
+
 use crate::model::{
-    Alert, AlertKind, History, Millis, ScanSnapshot, Security, Settings, Severity, TrackerKind,
-    TrustedNetwork, WifiObservation,
+    Alert, AlertKind, History, LanDevice, Millis, MineEntry, MineKind, NetworkInfo, Place,
+    PlaceSighting, ScanSnapshot, Security, Settings, Severity, TrackerKind, TrustedNetwork,
+    WatchlistEntry, WifiObservation,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// State beyond the scan history that the v2 rules read. Built by the pipeline from the store
+/// (and the live LAN outcome); `Default` is "nothing known", under which v2 rules stay silent
+/// and the v1 rules behave exactly as before.
+#[derive(Debug, Clone, Default)]
+pub struct DetectContext {
+    pub mine: Vec<MineEntry>,
+    pub watchlist: Vec<WatchlistEntry>,
+    pub places: Vec<Place>,
+    pub place_sightings: Vec<PlaceSighting>,
+    pub lan_devices: Vec<LanDevice>,
+    /// The joined network right now, if a LAN observation ran this cycle.
+    pub current_network: Option<NetworkInfo>,
+}
+
+impl DetectContext {
+    /// Whether `id_hash` is marked mine under any of `kinds`.
+    pub fn is_mine(&self, kinds: &[MineKind], id_hash: &str) -> bool {
+        self.mine
+            .iter()
+            .any(|m| m.id_hash == id_hash && kinds.contains(&m.kind))
+    }
+}
 
 /// A tracker not seen for this long is no longer "following" the user.
 const TRACKER_STALE_MS: Millis = 10 * 60 * 1000;
@@ -25,8 +56,18 @@ const KIND_MAX_CONSECUTIVE_MISSES: usize = 1;
 /// SSIDs shorter than this (after folding) must match exactly to count as a lookalike.
 const MIN_FUZZY_LEN: usize = 4;
 
-/// Evaluate every enabled rule over `history` as of `now` (Unix ms).
+/// Evaluate every enabled rule over `history` as of `now` (Unix ms), with no v2 context.
 pub fn evaluate(history: &History, settings: &Settings, now: Millis) -> Vec<Alert> {
+    evaluate_with(history, settings, &DetectContext::default(), now)
+}
+
+/// [`evaluate`] plus the extra state the v2 rules read.
+pub fn evaluate_with(
+    history: &History,
+    settings: &Settings,
+    ctx: &DetectContext,
+    now: Millis,
+) -> Vec<Alert> {
     let mut out = Collector::default();
     let t = &settings.alert_toggles;
     if t.evil_twin {
@@ -36,13 +77,22 @@ pub fn evaluate(history: &History, settings: &Settings, now: Millis) -> Vec<Aler
         open_lookalike(history, settings, &mut out);
     }
     if t.trusted_network_changed {
-        trusted_network_changed(history, settings, &mut out);
+        trusted_network_changed(history, settings, ctx, &mut out);
     }
     if t.persistent_tracker {
         persistent_tracker(history, settings, now, &mut out);
     }
     if t.new_device {
         new_device(history, &mut out);
+    }
+    if t.followed_across_places {
+        follow::followed_across_places(history, settings, ctx, now, &mut out);
+    }
+    if t.watchlist {
+        watchlist::watchlist(history, settings, ctx, now, &mut out);
+    }
+    if t.new_lan_device {
+        lan::new_lan_device(history, settings, ctx, now, &mut out);
     }
     out.finish()
 }
@@ -58,6 +108,9 @@ fn kind_tag(kind: AlertKind) -> &'static str {
         AlertKind::TrustedNetworkChanged => "trustedNetworkChanged",
         AlertKind::PersistentTracker => "persistentTracker",
         AlertKind::NewDevice => "newDevice",
+        AlertKind::FollowedAcrossPlaces => "followedAcrossPlaces",
+        AlertKind::Watchlist => "watchlist",
+        AlertKind::NewLanDevice => "newLanDevice",
     }
 }
 
@@ -354,7 +407,12 @@ fn open_lookalike(history: &History, settings: &Settings, out: &mut Collector) {
     }
 }
 
-fn trusted_network_changed(history: &History, settings: &Settings, out: &mut Collector) {
+fn trusted_network_changed(
+    history: &History,
+    settings: &Settings,
+    ctx: &DetectContext,
+    out: &mut Collector,
+) {
     if settings.trusted_networks.is_empty() {
         return;
     }
@@ -363,9 +421,22 @@ fn trusted_network_changed(history: &History, settings: &Settings, out: &mut Col
             let Some(t) = named(o).and_then(|s| trusted_for(settings, s)) else {
                 continue;
             };
+            // An access point (or its whole radio group) marked mine counts as known, the same
+            // as one listed on the trusted network itself: one concept, two ways to record it.
+            let marked_mine = o
+                .bssid_hash
+                .as_deref()
+                .is_some_and(|b| ctx.is_mine(&[MineKind::WifiAp], b))
+                || o.group_id
+                    .as_deref()
+                    .is_some_and(|g| ctx.is_mine(&[MineKind::WifiGroup], g));
             let unknown_bssid = match o.bssid_hash.as_ref() {
                 // With no known BSSIDs on file there is nothing to compare against.
-                Some(b) => !t.known_bssid_hashes.is_empty() && !t.known_bssid_hashes.contains(b),
+                Some(b) => {
+                    !marked_mine
+                        && !t.known_bssid_hashes.is_empty()
+                        && !t.known_bssid_hashes.contains(b)
+                }
                 None => false,
             };
             let downgrade = o.security != Security::Unknown
@@ -667,6 +738,8 @@ mod tests {
             channel: Some(36),
             security: sec,
             seen_at: T0,
+            vendor: None,
+            group_id: None,
         }
     }
     fn ble(d: u8, tracker: Option<TrackerKind>) -> BleObservation {
@@ -1198,8 +1271,93 @@ mod tests {
             trusted_network_changed: false,
             persistent_tracker: false,
             new_device: false,
+            followed_across_places: false,
+            watchlist: false,
+            new_lan_device: false,
         };
         assert!(evaluate(&h, &all_off, at(25)).is_empty());
+    }
+
+    // ---- v2 context --------------------------------------------------------
+
+    fn mine_entry(kind: MineKind, id_hash: String) -> MineEntry {
+        MineEntry {
+            kind,
+            id_hash,
+            label: None,
+            added_at: T0,
+        }
+    }
+
+    #[test]
+    fn v2_rules_are_silent_stubs_and_empty_context_equals_evaluate() {
+        let (h, s) = busy_history();
+        assert_eq!(
+            evaluate(&h, &s, at(25)),
+            evaluate_with(&h, &s, &DetectContext::default(), at(25))
+        );
+        // Even a populated context yields nothing until the work packages land.
+        let ctx = DetectContext {
+            mine: vec![mine_entry(MineKind::Lan, "aa".into())],
+            watchlist: vec![WatchlistEntry {
+                id: 1,
+                kind: crate::model::WatchKind::Ssid,
+                pattern: "Net-A".into(),
+                match_mode: crate::model::WatchMatch::Contains,
+                added_at: T0,
+            }],
+            current_network: Some(NetworkInfo::default()),
+            ..DetectContext::default()
+        };
+        let a = evaluate_with(&h, &s, &ctx, at(25));
+        for k in [
+            AlertKind::FollowedAcrossPlaces,
+            AlertKind::Watchlist,
+            AlertKind::NewLanDevice,
+        ] {
+            assert!(only_kind(&a, k).is_empty(), "{k:?} fired from a stub");
+        }
+    }
+
+    #[test]
+    fn mine_access_point_counts_as_known_for_trusted_network_changed() {
+        // Net-A trusts access point 1 only; access point 2 is the unfamiliar one.
+        let s = settings_with(vec![trusted("Net-A", &[1], Security::Wpa2Personal)]);
+        let h = hist(vec![scan(
+            0,
+            vec![ap("Net-A", 2, Security::Wpa2Personal)],
+            vec![],
+        )]);
+        let fires = |ctx: &DetectContext| {
+            !only_kind(
+                &evaluate_with(&h, &s, ctx, at(1)),
+                AlertKind::TrustedNetworkChanged,
+            )
+            .is_empty()
+        };
+        assert!(
+            fires(&DetectContext::default()),
+            "negative control: unknown AP alerts"
+        );
+        let mine = |kind, id: String| DetectContext {
+            mine: vec![mine_entry(kind, id)],
+            ..DetectContext::default()
+        };
+        assert!(
+            !fires(&mine(MineKind::WifiAp, bssid(2))),
+            "marked mine => known"
+        );
+        // Wrong kind or wrong hash must not silence it.
+        assert!(fires(&mine(MineKind::Ble, bssid(2))));
+        assert!(fires(&mine(MineKind::WifiAp, bssid(3))));
+        // A radio group marked mine covers an observation that carries that group id.
+        let mut grouped = ap("Net-A", 2, Security::Wpa2Personal);
+        grouped.group_id = Some("group-1".into());
+        let hg = hist(vec![scan(0, vec![grouped], vec![])]);
+        let ctx = mine(MineKind::WifiGroup, "group-1".into());
+        assert!(evaluate_with(&hg, &s, &ctx, at(1))
+            .iter()
+            .all(|a| a.kind != AlertKind::TrustedNetworkChanged));
     }
 
     #[test]
