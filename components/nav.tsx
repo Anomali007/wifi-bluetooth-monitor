@@ -40,7 +40,7 @@ export default function Nav() {
           </Link>
         ))}
         <span className="ml-auto text-xs text-muted-foreground">
-          Listen-only: nothing is transmitted
+          Listen-only unless you turn on the sweep
         </span>
       </div>
     </nav>

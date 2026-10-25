@@ -1,7 +1,8 @@
 //! Wi-Fi + Bluetooth Monitor backend.
 //!
 //! Listen-only: every scan API used here is receive-only. Nothing in this crate
-//! transmits, probes, connects to or pairs with a discovered device.
+//! transmits, probes, connects to or pairs with a discovered device, with one gated
+//! exception: the opt-in network sweep in `lan/sweep.rs` (see `lan/gate.rs`).
 //!
 //! Module map (file ownership is defined in the build roadmap):
 //! - [`model`]    shared, frozen types and the identifier-hashing helper

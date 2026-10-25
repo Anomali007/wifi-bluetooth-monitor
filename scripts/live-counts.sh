@@ -20,3 +20,16 @@ if [ -n "$rows" ]; then printf '%s\n' "$rows" | sed 's/^/  /'; else echo "  none
 echo "alerts by kind:"
 rows=$(q "SELECT REPLACE(kind, '\"', ''), COUNT(*) FROM alerts GROUP BY kind ORDER BY 1;" | tr '|' ' ')
 if [ -n "$rows" ]; then printf '%s\n' "$rows" | sed 's/^/  /'; else echo "  none"; fi
+echo "--- v2 (counts only) ---"
+echo "wifi sightings with a vendor:        $(q "SELECT COUNT(*) FROM wifi_sightings WHERE vendor IS NOT NULL;")"
+echo "  of which 'Private address':        $(q "SELECT COUNT(*) FROM wifi_sightings WHERE vendor = 'Private address';")"
+echo "radio groups with more than 1 radio: $(q "SELECT COUNT(*) FROM (SELECT group_id FROM wifi_sightings WHERE group_id IS NOT NULL GROUP BY scan_at, group_id HAVING COUNT(DISTINCT bssid_hash) > 1 ) ;")  (group-in-scan instances)"
+echo "distinct radio groups (any size):    $(q "SELECT COUNT(DISTINCT group_id) FROM wifi_sightings WHERE group_id IS NOT NULL;")"
+echo "places:                              $(q 'SELECT COUNT(*) FROM places;')"
+echo "place sightings (wifi/ble/lan):      $(q "SELECT COALESCE(SUM(kind LIKE '%wifi%'),0) || '/' || COALESCE(SUM(kind LIKE '%ble%'),0) || '/' || COALESCE(SUM(kind LIKE '%lan%'),0) FROM place_sightings;")"
+echo "mine entries:                        $(q 'SELECT COUNT(*) FROM mine;')"
+echo "watchlist entries:                   $(q 'SELECT COUNT(*) FROM watchlist;')"
+echo "LAN devices (all):                   $(q 'SELECT COUNT(*) FROM lan_devices;')"
+echo "LAN devices with an mDNS hostname:   $(q "SELECT COUNT(*) FROM lan_devices WHERE hostname IS NOT NULL AND hostname <> '';")"
+echo "LAN devices with a vendor:           $(q "SELECT COUNT(*) FROM lan_devices WHERE vendor IS NOT NULL;")"
+echo "distinct LAN networks:               $(q 'SELECT COUNT(DISTINCT network_key) FROM lan_devices;')"

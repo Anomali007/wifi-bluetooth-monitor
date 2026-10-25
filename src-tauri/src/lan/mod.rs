@@ -185,15 +185,30 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
     }
 
     let network = build_info(&link, inputs, state);
+    let mut arp_rows = 0usize;
     let devices = match key.as_deref() {
         Some(k) => {
             let entries = arp::read_arp_table().unwrap_or_default();
+            arp_rows = entries.len();
             devices_from_arp(&entries, &link, k, &inputs.salt, now_ms(), |ip| {
                 mdns.lookup(ip)
             })
         }
         None => Vec::new(),
     };
+    let mdns_counts = mdns::listener_counts();
+    // Counts only: never a name, address or hash.
+    log::info!(
+        "lan: network identified={}, subnet known={}, arp rows={}, devices={}, mdns sources={}, mdns socket bound={}, bind failures={}, datagrams={}",
+        key.is_some(),
+        link.subnet.is_some(),
+        arp_rows,
+        devices.len(),
+        mdns.announced_sources(),
+        mdns_counts.0,
+        mdns_counts.1,
+        mdns_counts.2
+    );
     Ok(LanScanOutcome { network, devices })
 }
 

@@ -153,7 +153,8 @@ fn mdns_listener_exposes_no_send_surface() {
             "fn lookup(",
             "fn get(",
             "fn len(",
-            "fn is_empty("
+            "fn is_empty(",
+            "fn announced_sources("
         ]
         .iter()
         .any(|ok| m.contains(ok))),

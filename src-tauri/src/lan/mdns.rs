@@ -11,6 +11,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -344,6 +345,11 @@ pub struct MdnsHandle {
 }
 
 impl MdnsHandle {
+    /// How many sources have announced (a count for the log; no content).
+    pub fn announced_sources(&self) -> usize {
+        self.cache.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
     /// Look up what `ip` announced.
     pub fn lookup(&self, ip: Ipv4Addr) -> Option<Announcement> {
         self.cache.lock().ok()?.get(ip).cloned()
@@ -351,6 +357,20 @@ impl MdnsHandle {
 }
 
 static HANDLE: OnceLock<MdnsHandle> = OnceLock::new();
+
+// Counters for the diagnostic log line (counts only).
+static BOUND: AtomicBool = AtomicBool::new(false);
+static BIND_FAILURES: AtomicU64 = AtomicU64::new(0);
+static PACKETS: AtomicU64 = AtomicU64::new(0);
+
+/// `(listener bound now, bind failures so far, datagrams received so far)`.
+pub fn listener_counts() -> (bool, u64, u64) {
+    (
+        BOUND.load(Ordering::Relaxed),
+        BIND_FAILURES.load(Ordering::Relaxed),
+        PACKETS.load(Ordering::Relaxed),
+    )
+}
 
 /// Start the background listener once and return its handle. If the socket cannot be bound
 /// (or the permission is denied) the thread keeps retrying every 30 s; lookups just come back
@@ -371,12 +391,15 @@ fn listen_forever(cache: &Mutex<MdnsCache>) {
     let mut buf = vec![0u8; MAX_PACKET];
     loop {
         let Ok(listener) = MdnsListener::bind() else {
+            BIND_FAILURES.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_secs(30));
             continue;
         };
+        BOUND.store(true, Ordering::Relaxed);
         loop {
             match listener.recv(&mut buf) {
                 Ok(Some((n, from))) => {
+                    PACKETS.fetch_add(1, Ordering::Relaxed);
                     let a = parse_announcement(&buf[..n], from);
                     if let Ok(mut c) = cache.lock() {
                         c.observe(from, a, super::now_ms());
@@ -384,6 +407,7 @@ fn listen_forever(cache: &Mutex<MdnsCache>) {
                 }
                 Ok(None) => {}
                 Err(_) => {
+                    BOUND.store(false, Ordering::Relaxed);
                     std::thread::sleep(Duration::from_secs(1));
                     break; // rebind
                 }
