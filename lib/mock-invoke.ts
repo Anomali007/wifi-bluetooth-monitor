@@ -539,8 +539,16 @@ export async function mockInvoke<T>(
       return lanDevices(args?.networkKey as string | null | undefined) as T;
     case "get_current_network":
       return currentNetwork() as T;
-    case "sweep_now":
+    case "sweep_now": {
+      // Same strings as the Rust gate (lan/gate.rs SweepRefusal::message).
+      if (!settings.lanActiveSweep)
+        return Promise.reject("The active sweep is switched off in Settings.");
+      if (!currentNetwork().isMine)
+        return Promise.reject(
+          "This access point is not marked as yours. Mark it as mine first.",
+        );
       return lanDevices(currentNetwork().networkKey) as T;
+    }
   }
 }
 

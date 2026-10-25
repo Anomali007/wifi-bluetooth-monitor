@@ -357,11 +357,13 @@ pub async fn get_current_network(state: State<'_, AppState>) -> Result<NetworkIn
         mine,
         force_sweep: false,
     };
-    let lan_state = state
-        .lan
-        .lock()
-        .map_err(|_| "lan lock poisoned".to_string())?;
-    Ok(lan::current_network(&inputs, &lan_state))
+    // try_lock: a sweep holds this lock for ~12 s and the Network page polls this command, so
+    // never queue behind it; a default state only loses the "last sweep" timestamp.
+    let snapshot = match state.lan.try_lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => LanState::default(),
+    };
+    Ok(lan::current_network(&inputs, &snapshot))
 }
 
 /// "Sweep now": observe the LAN immediately (the sweep gate still applies), record it, and
@@ -369,6 +371,32 @@ pub async fn get_current_network(state: State<'_, AppState>) -> Result<NetworkIn
 #[tauri::command]
 pub async fn sweep_now(app: AppHandle) -> Result<Vec<LanDevice>, String> {
     let state = app.state::<AppState>();
+    let (salt, settings, mine) = {
+        let store = state.store.lock().map_err(lock_err)?;
+        (
+            store.salt().clone(),
+            store.get_settings().map_err(|e| e.to_string())?,
+            store.list_mine().map_err(|e| e.to_string())?,
+        )
+    };
+    let inputs = LanInputs {
+        salt,
+        settings,
+        mine,
+        force_sweep: true,
+    };
+    let lan_state = Arc::clone(&state.lan);
+    let refusal = tauri::async_runtime::spawn_blocking(move || {
+        let guard = lan_state
+            .lock()
+            .map_err(|_| "lan lock poisoned".to_string())?;
+        Ok::<_, String>(lan::sweep_refusal(&inputs, &guard))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if let Some(msg) = refusal {
+        return Err(msg.to_string());
+    }
     let _cycle = state.cycle.lock().await;
     let Some(outcome) = run_lan(&app, true).await else {
         return Ok(Vec::new());

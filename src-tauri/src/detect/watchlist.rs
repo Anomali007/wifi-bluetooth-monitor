@@ -8,14 +8,15 @@
 //! may carry the SSID like the other Wi-Fi alerts; `detail` stays generic and no raw
 //! identifier appears in either.
 
-use super::{fold_ssid, is_lookalike, named, subject_key, Collector, DetectContext};
+use super::{fold_ssid, named, subject_key, Collector, DetectContext};
 use crate::model::{
     AlertKind, History, Millis, MineKind, Settings, Severity, WatchKind, WatchMatch,
     WatchlistEntry, WifiObservation,
 };
 
-/// SSID entries: exact (or look-alike) for `Exact`; substring, on raw lowercase or folded
-/// text, for `Contains`. A blank pattern never matches (an empty substring matches everything).
+/// SSID entries: `Exact` is equality after folding (case, whitespace, look-alike characters),
+/// never edit distance, so "King" does not match "Kind", "Ring" or "Kong". `Contains` is a
+/// substring on raw lowercase or folded text. A blank pattern never matches (an empty substring matches everything).
 fn ssid_matches(entry: &WatchlistEntry, ssid: &str) -> bool {
     let pat = entry.pattern.trim();
     if pat.is_empty() {
@@ -23,7 +24,8 @@ fn ssid_matches(entry: &WatchlistEntry, ssid: &str) -> bool {
     }
     match entry.match_mode {
         WatchMatch::Exact => {
-            ssid.trim().to_lowercase() == pat.to_lowercase() || is_lookalike(ssid, pat)
+            let (f, p) = (fold_ssid(ssid), fold_ssid(pat));
+            !p.is_empty() && f == p
         }
         WatchMatch::Contains => {
             ssid.to_lowercase().contains(&pat.to_lowercase()) || {
@@ -195,17 +197,34 @@ mod tests {
                 1,
             ),
             (
-                "look-alike (digit swap)",
-                "Ne1-A",
+                "look-alike (Cyrillic e)",
+                "N\u{435}t-A",
                 entry(1, Ssid, "Net-A", Exact),
                 1,
             ),
             (
-                "look-alike (one edit)",
+                "NEG one extra character is not a match",
                 "Net-AA",
                 entry(1, Ssid, "Net-A", Exact),
+                0,
+            ),
+            (
+                "NEG digit swap is only an edit-distance near-miss",
+                "Ne1-A",
+                entry(1, Ssid, "Net-A", Exact),
+                0,
+            ),
+            ("king upper", "KING", entry(1, Ssid, "King", Exact), 1),
+            ("king padded", " king ", entry(1, Ssid, "King", Exact), 1),
+            (
+                "king homoglyph (Cyrillic k, i)",
+                "\u{43a}\u{456}ng",
+                entry(1, Ssid, "King", Exact),
                 1,
             ),
+            ("NEG king vs Kind", "Kind", entry(1, Ssid, "King", Exact), 0),
+            ("NEG king vs Ring", "Ring", entry(1, Ssid, "King", Exact), 0),
+            ("NEG king vs Kong", "Kong", entry(1, Ssid, "King", Exact), 0),
             (
                 "look-alike under contains",
                 "Guest N3t-A",

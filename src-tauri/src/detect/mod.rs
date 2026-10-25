@@ -1310,11 +1310,7 @@ mod tests {
             ..DetectContext::default()
         };
         let a = evaluate_with(&h, &s, &ctx, at(25));
-        for k in [
-            AlertKind::FollowedAcrossPlaces,
-            AlertKind::Watchlist,
-            AlertKind::NewLanDevice,
-        ] {
+        for k in [AlertKind::FollowedAcrossPlaces, AlertKind::NewLanDevice] {
             assert!(only_kind(&a, k).is_empty(), "{k:?} fired from a stub");
         }
     }

@@ -89,8 +89,34 @@ try {
   const v = await page.getByLabel("Scan interval (seconds)").inputValue();
   check(`settings persisted across navigation (interval=${v})`, v === "120");
 
+  // Network page: devices listed, sweep gated while the setting is off
+  await page.goto(`${base}/network`);
+  await page.getByRole("heading", { name: "Network", exact: true }).waitFor();
+  await page.getByText("Vendor-A").first().waitFor();
+  check("network page lists devices with vendors", (await page.getByText("Vendor-A").count()) > 0);
+  const sweepBtn = page.getByRole("button", { name: /Sweep now/ });
+  check("sweep now is disabled while the sweep setting is off", await sweepBtn.isDisabled());
+  check(
+    "sweep refusal reason is shown",
+    (await page.getByText("The active sweep is switched off in Settings.").count()) > 0,
+  );
+  await shot(page, "network");
+
+  // Settings: new sections render; turn the sweep on and the button enables
+  await page.goto(`${base}/settings`);
+  for (const h of ["Mine", "Places", "Watchlist", "Network devices"]) {
+    await page.getByRole("heading", { name: h, exact: true }).waitFor();
+    check(`settings section "${h}" renders`, true);
+  }
+  await shot(page, "settings-v2");
+  // Watchlist: add an entry and see it listed
+  await page.getByLabel("Pattern").fill("Net-Z");
+  await page.locator("form", { has: page.getByLabel("Pattern") }).getByRole("button", { name: "Add", exact: true }).click();
+  await page.getByText(/Net-Z/).first().waitFor();
+  check("watchlist: entry added and listed", true);
+
   // Routes resolve
-  for (const r of ["/alerts", "/history", "/settings"]) {
+  for (const r of ["/alerts", "/history", "/settings", "/network"]) {
     const resp = await page.goto(`${base}${r}`);
     check(`route ${r} resolves`, resp?.status() === 200);
   }

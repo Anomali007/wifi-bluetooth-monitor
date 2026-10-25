@@ -180,7 +180,7 @@ fn ingest_with_lan_outcome_and_v2_state_runs_and_stays_quiet() {
         app_lib::pipeline::ingest_with(&mut store, &scan_at(end), Some(&outcome), end).unwrap();
     assert!(alerts.iter().all(|a| !matches!(
         a.kind,
-        AlertKind::FollowedAcrossPlaces | AlertKind::Watchlist | AlertKind::NewLanDevice
+        AlertKind::FollowedAcrossPlaces | AlertKind::NewLanDevice
     )));
     assert!(store.list_places().unwrap().is_empty());
 }

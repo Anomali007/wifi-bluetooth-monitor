@@ -61,7 +61,7 @@ export default function WatchlistSection() {
       <h2 className="font-semibold">Watchlist</h2>
       <p className="text-sm text-muted-foreground">
         Get an alert when a network name or hardware vendor you list shows up.
-        Matching ignores case, and network names also match look-alikes.
+        Matching ignores case, spacing and look-alike characters. Exact means the same name, not a similar one.
         Entries stay on this Mac.
       </p>
       {entries === null ? (

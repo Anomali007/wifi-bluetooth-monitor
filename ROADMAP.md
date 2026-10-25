@@ -6,6 +6,7 @@ Only what is **not** built yet. What exists is described in the [README](README.
 
 - **Field-verify tracker detection with real hardware** (an AirTag, a Tile, a SmartTag). Today it is unit-tested on synthetic advertisements only; thresholds (5 scans / 20 minutes, 10-minute staleness) were tuned on synthetic data.
 - Confirm on real adverts that the separated-only Find My rule (length byte 0x19 plus AirTag/Find My status type, DULT near-owner bit) neither misses a real separated AirTag nor still flags ordinary Apple devices. It follows AirGuard source and is tested on synthetic bytes only.
+- Verify the network sweep on a real network (unit-tested gate only; never run live) and the Local Network prompt on more than one macOS version.
 - Verify the Location prompt and grant flow across rebuilds on more than one macOS version.
 
 ## Dependencies

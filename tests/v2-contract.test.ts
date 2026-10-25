@@ -124,7 +124,22 @@ describe("LAN", () => {
     expect(all.length).toBeGreaterThan(0);
     expect((await listLanDevices(net.networkKey!)).length).toBe(all.length);
     expect(await listLanDevices("no-such-network")).toEqual([]);
+    // The gate: refused (with the Rust gate's wording) while the setting is off...
+    await expect(sweepNow()).rejects.toBe(
+      "The active sweep is switched off in Settings.",
+    );
+    const s = await getSettings();
+    await setSettings({ ...s, lanActiveSweep: true });
     expect((await sweepNow()).length).toBe(all.length);
+    // ...and when the joined access point is not Mine.
+    const mineList = await listMine();
+    const group = mineList.find((m) => m.kind === "wifiGroup")!;
+    await removeMine(group.kind, group.idHash);
+    await expect(sweepNow()).rejects.toBe(
+      "This access point is not marked as yours. Mark it as mine first.",
+    );
+    await addMine(group.kind, group.idHash, group.label ?? null);
+    await setSettings({ ...s, lanActiveSweep: false });
   });
 });
 
