@@ -1,23 +1,10 @@
 import type { LanDevice, NetworkInfo, Settings } from "@/lib/types";
 
-/** Widest subnet the sweep runs on (a /23 is 512 addresses). Mirrors `lan::gate::MIN_PREFIX`. */
-export const MIN_SWEEP_PREFIX = 23;
-/** Narrowest subnet with another host to sweep. Mirrors `lan::gate::MAX_PREFIX`. */
-export const MAX_SWEEP_PREFIX = 30;
-
-/** Prefix length from CIDR text (`192.0.2.0/24` -> 24), or null if it does not parse. */
-export function subnetPrefix(cidr: string | null): number | null {
-  if (!cidr) return null;
-  const m = /^\d{1,3}(?:\.\d{1,3}){3}\/(\d{1,2})$/.exec(cidr);
-  if (!m) return null;
-  const n = Number(m[1]);
-  return n >= 0 && n <= 32 ? n : null;
-}
-
 /**
  * Why "Sweep now" would be refused, or null when it may run. Same order and wording as the
  * backend gate (`lan::gate::sweep_gate`), so the page can explain before the user clicks.
- * The backend remains the authority; this only explains.
+ * The backend remains the authority; this only explains. The sweep is one IPv6 packet on the
+ * link, so the network's IPv4 size no longer matters.
  */
 export function sweepBlockedReason(
   network: NetworkInfo | null,
@@ -32,18 +19,26 @@ export function sweepBlockedReason(
   if (!network.isMine) {
     return "This access point is not marked as yours. Mark it as mine first.";
   }
-  const prefix = subnetPrefix(network.subnet);
-  if (prefix === null) return "The Wi-Fi interface has no IPv4 address yet.";
-  if (prefix < MIN_SWEEP_PREFIX) {
-    return "This network is larger than a /23 (512 addresses); the sweep only runs on small networks.";
-  }
-  if (prefix > MAX_SWEEP_PREFIX) return "This network has no other addresses to sweep.";
   return null;
 }
 
 /** Badge text for how the list was gathered. */
 export function modeLabel(network: NetworkInfo | null): string {
   return network?.mode === "sweep" ? "Passive + sweep" : "Passive";
+}
+
+/** Where a device came from, in words. */
+export function sourceLabel(d: Pick<LanDevice, "source">): string {
+  switch (d.source) {
+    case "neighbor":
+      return "Neighbor table";
+    case "announced":
+      return "Announced";
+    case "both":
+      return "Both";
+    default:
+      return "Earlier version";
+  }
 }
 
 /** Display name for a LAN device: its announced hostname, else a vendor-based fallback. */

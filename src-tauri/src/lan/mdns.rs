@@ -3,14 +3,16 @@
 //! exposes no send method, and `tests/lan_listen_only.rs` fails if a send call appears in this
 //! file.
 //!
-//! What it keeps, per source IPv4 address: a `.local` hostname and the service types the device
-//! announces (`_http._tcp`). TXT record contents, instance names and addresses are discarded.
+//! What it keeps, per source address (IPv4 or IPv6, each on its own receive-only socket): a
+//! `.local` hostname, the addresses (A/AAAA) that hostname owns in the same packet, and the
+//! service types the device announces (`_http._tcp`). TXT record contents and instance names
+//! are discarded. Addresses stay in memory only, to join a host to a neighbor-table entry.
 //! Everything on the wire is attacker-controlled, so the parser bounds every read, caps name
 //! length, pointer hops and record counts, and treats any malformed packet as "nothing learned".
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -21,6 +23,7 @@ use crate::model::Millis;
 
 pub const MDNS_PORT: u16 = 5353;
 pub const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+pub const MDNS_GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 
 /// Largest datagram read (anything longer is truncated and then fails to parse cleanly).
 const MAX_PACKET: usize = 9000;
@@ -36,6 +39,8 @@ const MAX_HOSTNAME_LEN: usize = 80;
 const MAX_SERVICE_LABEL: usize = 16;
 /// Service types remembered per device.
 const MAX_SERVICES_PER_DEVICE: usize = 24;
+/// Addresses remembered per announced hostname.
+const MAX_ADDRS_PER_DEVICE: usize = 8;
 /// Devices remembered.
 const MAX_CACHE_ENTRIES: usize = 512;
 /// An entry nobody refreshed for this long is dropped when the cache is full.
@@ -47,6 +52,10 @@ pub struct Announcement {
     /// Best hostname candidate (`my-device.local`), if any.
     pub hostname: Option<String>,
     pub services: BTreeSet<String>,
+    /// Addresses the sender is known by: A/AAAA records owned by `hostname` in the same
+    /// packet, plus the source address when the hostname is verified. In memory
+    /// only; used to join the host to a neighbor-table entry.
+    pub addrs: BTreeSet<IpAddr>,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,11 +153,20 @@ fn hostname(labels: &[String]) -> Option<String> {
     ok.then(|| format!("{host}.local"))
 }
 
+/// Addresses worth remembering for a host.
+fn usable_addr(a: IpAddr) -> bool {
+    !(a.is_unspecified() || a.is_multicast() || a.is_loopback())
+}
+
 /// Parse an mDNS packet sent from `src`. Only responses (QR bit set) are read. A hostname is
-/// attributed to the sender only when an A record for it carries the sender's own address;
-/// SRV targets and AAAA owners are a weaker fallback. Never panics; garbage returns the empty
-/// announcement.
-pub fn parse_announcement(pkt: &[u8], src: Ipv4Addr) -> Announcement {
+/// attributed to the sender only when an A (or AAAA) record for it carries the sender's own
+/// address; SRV targets and other AAAA owners are a weaker fallback. Never panics; garbage
+/// returns the empty announcement.
+pub fn parse_announcement(pkt: &[u8], src: IpAddr) -> Announcement {
+    let src = match src {
+        IpAddr::V6(a) => IpAddr::V6(super::nd6::normalize_v6(a)),
+        v4 => v4,
+    };
     let mut out = Announcement::default();
     let (Some(flags), Some(qd), Some(an), Some(ns), Some(ar)) = (
         be16(pkt, 2),
@@ -173,6 +191,8 @@ pub fn parse_announcement(pkt: &[u8], src: Ipv4Addr) -> Announcement {
         }
     }
     let (mut verified, mut fallback): (Option<String>, Option<String>) = (None, None);
+    // (owner hostname, address) for every A/AAAA record seen; filtered to the chosen host below.
+    let mut addr_records: Vec<(Option<String>, IpAddr)> = Vec::new();
     let records = (usize::from(an) + usize::from(ns) + usize::from(ar)).min(MAX_RECORDS);
     for _ in 0..records {
         let Some((owner, next)) = read_name(pkt, pos) else {
@@ -196,14 +216,29 @@ pub fn parse_announcement(pkt: &[u8], src: Ipv4Addr) -> Announcement {
         match rtype {
             // A
             1 => {
-                if rdata == src.octets() && verified.is_none() {
-                    verified = hostname(&owner);
+                if let Ok(o) = <[u8; 4]>::try_from(rdata) {
+                    let a = IpAddr::V4(Ipv4Addr::from(o));
+                    if usable_addr(a) {
+                        addr_records.push((hostname(&owner), a));
+                    }
+                    if a == src && verified.is_none() {
+                        verified = hostname(&owner);
+                    }
                 }
             }
-            // AAAA: the address cannot be checked against an IPv4 source.
+            // AAAA: verified when it carries the sender's own IPv6 address; otherwise the
+            // owner is only a fallback (an IPv4 sender cannot be checked against it).
             28 => {
-                if rdata.len() == 16 && fallback.is_none() {
-                    fallback = hostname(&owner);
+                if let Ok(o) = <[u8; 16]>::try_from(rdata) {
+                    let a = IpAddr::V6(super::nd6::normalize_v6(Ipv6Addr::from(o)));
+                    if usable_addr(a) {
+                        addr_records.push((hostname(&owner), a));
+                    }
+                    if a == src && verified.is_none() {
+                        verified = hostname(&owner);
+                    } else if fallback.is_none() {
+                        fallback = hostname(&owner);
+                    }
                 }
             }
             // PTR: a service type directly, or the service-type enumeration's answers.
@@ -241,7 +276,20 @@ pub fn parse_announcement(pkt: &[u8], src: Ipv4Addr) -> Announcement {
             _ => {}
         }
     }
+    let was_verified = verified.is_some();
     out.hostname = verified.or(fallback);
+    if let Some(host) = &out.hostname {
+        for (owner, a) in &addr_records {
+            if owner.as_deref() == Some(host.as_str()) && out.addrs.len() < MAX_ADDRS_PER_DEVICE {
+                out.addrs.insert(*a);
+            }
+        }
+    }
+    // The sender is the host itself only when its own address vouched for the name; a proxy
+    // announcing someone else's records must not donate its address to a stranger's hostname.
+    if was_verified {
+        out.addrs.insert(src);
+    }
     out
 }
 
@@ -253,17 +301,28 @@ pub fn parse_announcement(pkt: &[u8], src: Ipv4Addr) -> Announcement {
 struct CacheEntry {
     info: Announcement,
     last_seen: Millis,
+    /// Interface scope the datagram arrived on (IPv6 only; 0 for IPv4 or unknown).
+    scope: u32,
+}
+
+/// One cached source, as handed to the device builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heard {
+    pub from: IpAddr,
+    pub scope: u32,
+    pub info: Announcement,
 }
 
 /// Bounded per-source memory of what was announced.
 #[derive(Debug, Default)]
 pub struct MdnsCache {
-    by_ip: HashMap<Ipv4Addr, CacheEntry>,
+    by_ip: HashMap<IpAddr, CacheEntry>,
 }
 
 impl MdnsCache {
-    pub fn observe(&mut self, ip: Ipv4Addr, a: Announcement, now: Millis) {
-        if a == Announcement::default() {
+    pub fn observe(&mut self, ip: IpAddr, scope: u32, a: Announcement, now: Millis) {
+        // An announcement that is only the sender's own address teaches nothing.
+        if a.hostname.is_none() && a.services.is_empty() {
             return;
         }
         if !self.by_ip.contains_key(&ip) && self.by_ip.len() >= MAX_CACHE_ENTRIES {
@@ -274,8 +333,14 @@ impl MdnsCache {
         }
         let e = self.by_ip.entry(ip).or_default();
         e.last_seen = now;
+        e.scope = scope;
         if a.hostname.is_some() {
             e.info.hostname = a.hostname;
+        }
+        for addr in a.addrs {
+            if e.info.addrs.len() < MAX_ADDRS_PER_DEVICE {
+                e.info.addrs.insert(addr);
+            }
         }
         for s in a.services {
             if e.info.services.len() < MAX_SERVICES_PER_DEVICE {
@@ -284,8 +349,23 @@ impl MdnsCache {
         }
     }
 
-    pub fn get(&self, ip: Ipv4Addr) -> Option<&Announcement> {
+    pub fn get(&self, ip: IpAddr) -> Option<&Announcement> {
         self.by_ip.get(&ip).map(|e| &e.info)
+    }
+
+    /// Every cached source, in a stable order.
+    pub fn heard(&self) -> Vec<Heard> {
+        let mut v: Vec<Heard> = self
+            .by_ip
+            .iter()
+            .map(|(ip, e)| Heard {
+                from: *ip,
+                scope: e.scope,
+                info: e.info.clone(),
+            })
+            .collect();
+        v.sort_by_key(|h| h.from);
+        v
     }
 
     pub fn len(&self) -> usize {
@@ -321,11 +401,25 @@ impl MdnsListener {
         })
     }
 
-    /// Read one datagram. `Ok(None)` on timeout or when the sender is not IPv4.
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<Option<(usize, Ipv4Addr)>> {
+    /// Bind `[::]:5353` (IPv6 only) and join ff02::fb on every interface.
+    pub fn bind_v6() -> io::Result<MdnsListener> {
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_only_v6(true)?;
+        socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
+        socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, MDNS_PORT)).into())?;
+        socket.join_multicast_v6(&MDNS_GROUP_V6, 0)?;
+        socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+        Ok(MdnsListener {
+            socket: socket.into(),
+        })
+    }
+
+    /// Read one datagram: `(length, sender, interface scope)`. `Ok(None)` on timeout.
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<Option<(usize, IpAddr, u32)>> {
         match self.socket.recv_from(buf) {
-            Ok((n, SocketAddr::V4(from))) => Ok(Some((n, *from.ip()))),
-            Ok(_) => Ok(None),
+            Ok((n, SocketAddr::V4(from))) => Ok(Some((n, IpAddr::V4(*from.ip()), 0))),
+            Ok((n, SocketAddr::V6(from))) => Ok(Some((n, IpAddr::V6(*from.ip()), from.scope_id()))),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -339,7 +433,7 @@ impl MdnsListener {
     }
 }
 
-/// Handle to the process-wide listener thread and its cache.
+/// Handle to the process-wide listener threads and their shared cache.
 pub struct MdnsHandle {
     cache: Arc<Mutex<MdnsCache>>,
 }
@@ -350,64 +444,86 @@ impl MdnsHandle {
         self.cache.lock().map(|c| c.len()).unwrap_or(0)
     }
 
-    /// Look up what `ip` announced.
-    pub fn lookup(&self, ip: Ipv4Addr) -> Option<Announcement> {
-        self.cache.lock().ok()?.get(ip).cloned()
+    /// Everything heard so far, per source.
+    pub fn snapshot(&self) -> Vec<Heard> {
+        self.cache.lock().map(|c| c.heard()).unwrap_or_default()
     }
 }
 
 static HANDLE: OnceLock<MdnsHandle> = OnceLock::new();
 
 // Counters for the diagnostic log line (counts only).
-static BOUND: AtomicBool = AtomicBool::new(false);
+static BOUND_V4: AtomicBool = AtomicBool::new(false);
+static BOUND_V6: AtomicBool = AtomicBool::new(false);
 static BIND_FAILURES: AtomicU64 = AtomicU64::new(0);
 static PACKETS: AtomicU64 = AtomicU64::new(0);
 
-/// `(listener bound now, bind failures so far, datagrams received so far)`.
-pub fn listener_counts() -> (bool, u64, u64) {
-    (
-        BOUND.load(Ordering::Relaxed),
-        BIND_FAILURES.load(Ordering::Relaxed),
-        PACKETS.load(Ordering::Relaxed),
-    )
+/// Listener health for the log: counts and booleans only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListenerCounts {
+    pub bound_v4: bool,
+    pub bound_v6: bool,
+    pub bind_failures: u64,
+    pub datagrams: u64,
 }
 
-/// Start the background listener once and return its handle. If the socket cannot be bound
-/// (or the permission is denied) the thread keeps retrying every 30 s; lookups just come back
-/// empty meanwhile.
+pub fn listener_counts() -> ListenerCounts {
+    ListenerCounts {
+        bound_v4: BOUND_V4.load(Ordering::Relaxed),
+        bound_v6: BOUND_V6.load(Ordering::Relaxed),
+        bind_failures: BIND_FAILURES.load(Ordering::Relaxed),
+        datagrams: PACKETS.load(Ordering::Relaxed),
+    }
+}
+
+/// Start the background listeners once (one thread per address family) and return the shared
+/// handle. If a socket cannot be bound (or the permission is denied) its thread keeps retrying
+/// every 30 s; the snapshot is just emptier meanwhile.
 pub fn ensure_listener() -> &'static MdnsHandle {
     HANDLE.get_or_init(|| {
         let cache = Arc::new(Mutex::new(MdnsCache::default()));
-        let thread_cache = Arc::clone(&cache);
-        let spawned = std::thread::Builder::new()
-            .name("wbm-mdns".into())
-            .spawn(move || listen_forever(&thread_cache));
-        drop(spawned); // no thread = no mDNS names; the ARP table still works
+        for v6 in [false, true] {
+            let thread_cache = Arc::clone(&cache);
+            let spawned = std::thread::Builder::new()
+                .name(if v6 { "wbm-mdns6" } else { "wbm-mdns4" }.into())
+                .spawn(move || listen_forever(&thread_cache, v6));
+            drop(spawned); // no thread = no mDNS names; the neighbor table still works
+        }
         MdnsHandle { cache }
     })
 }
 
-fn listen_forever(cache: &Mutex<MdnsCache>) {
+fn listen_forever(cache: &Mutex<MdnsCache>, v6: bool) {
+    let flag = if v6 { &BOUND_V6 } else { &BOUND_V4 };
     let mut buf = vec![0u8; MAX_PACKET];
     loop {
-        let Ok(listener) = MdnsListener::bind() else {
+        let bound = if v6 {
+            MdnsListener::bind_v6()
+        } else {
+            MdnsListener::bind()
+        };
+        let Ok(listener) = bound else {
             BIND_FAILURES.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_secs(30));
             continue;
         };
-        BOUND.store(true, Ordering::Relaxed);
+        flag.store(true, Ordering::Relaxed);
         loop {
             match listener.recv(&mut buf) {
-                Ok(Some((n, from))) => {
+                Ok(Some((n, from, scope))) => {
                     PACKETS.fetch_add(1, Ordering::Relaxed);
                     let a = parse_announcement(&buf[..n], from);
                     if let Ok(mut c) = cache.lock() {
-                        c.observe(from, a, super::now_ms());
+                        let from = match from {
+                            IpAddr::V6(a) => IpAddr::V6(super::nd6::normalize_v6(a)),
+                            v4 => v4,
+                        };
+                        c.observe(from, scope, a, super::now_ms());
                     }
                 }
                 Ok(None) => {}
                 Err(_) => {
-                    BOUND.store(false, Ordering::Relaxed);
+                    flag.store(false, Ordering::Relaxed);
                     std::thread::sleep(Duration::from_secs(1));
                     break; // rebind
                 }
@@ -420,7 +536,8 @@ fn listen_forever(cache: &Mutex<MdnsCache>) {
 mod tests {
     use super::*;
 
-    const SRC: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
+    const SRC4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
+    const SRC: IpAddr = IpAddr::V4(SRC4);
 
     fn name(labels: &[&str]) -> Vec<u8> {
         let mut v = Vec::new();
@@ -462,7 +579,7 @@ mod tests {
         packet(
             0x8400,
             &[
-                record(&host, 1, 0x8001, &SRC.octets()),
+                record(&host, 1, 0x8001, &SRC4.octets()),
                 record(&name(&["_http", "_tcp", "local"]), 12, 1, &svc_owner),
                 record(&svc_owner, 33, 0x8001, &srv),
                 record(&svc_owner, 16, 0x8001, &[3, b'a', b'=', b'b']),
@@ -507,7 +624,7 @@ mod tests {
             0x8400,
             &[
                 record(&aaaa_host, 28, 1, &[0u8; 16]),
-                record(&host, 1, 1, &SRC.octets()),
+                record(&host, 1, 1, &SRC4.octets()),
             ],
         );
         assert_eq!(
@@ -522,6 +639,128 @@ mod tests {
         );
     }
 
+    fn v6(s: &str) -> Ipv6Addr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn aaaa_from_an_ipv6_sender_verifies_the_hostname_and_collects_addresses() {
+        let src = IpAddr::V6(v6("fe80::10"));
+        let host = name(&["device-a", "local"]);
+        let other = name(&["device-b", "local"]);
+        let pkt = packet(
+            0x8400,
+            &[
+                record(&other, 28, 1, &v6("2001:db8::bb").octets()),
+                record(&host, 28, 0x8001, &v6("2001:db8::10").octets()),
+                record(&host, 28, 0x8001, &v6("fe80::10").octets()),
+                record(&host, 1, 0x8001, &[192, 0, 2, 10]),
+            ],
+        );
+        let a = parse_announcement(&pkt, src);
+        assert_eq!(a.hostname.as_deref(), Some("device-a.local"));
+        let want: BTreeSet<IpAddr> = [
+            IpAddr::V6(v6("2001:db8::10")),
+            IpAddr::V6(v6("fe80::10")),
+            IpAddr::V4(SRC4),
+            src,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            a.addrs, want,
+            "only the chosen host's addresses, plus the verified sender"
+        );
+        assert!(!a.addrs.contains(&IpAddr::V6(v6("2001:db8::bb"))));
+    }
+
+    #[test]
+    fn kame_scope_in_a_link_local_sender_is_normalised() {
+        // The kernel may hand back fe80:4::10 for fe80::10; both must verify the same name.
+        let host = name(&["device-a", "local"]);
+        let pkt = packet(0x8400, &[record(&host, 28, 1, &v6("fe80::10").octets())]);
+        let a = parse_announcement(&pkt, IpAddr::V6(v6("fe80:4::10")));
+        assert_eq!(a.hostname.as_deref(), Some("device-a.local"));
+        assert!(a.addrs.contains(&IpAddr::V6(v6("fe80::10"))));
+    }
+
+    #[test]
+    fn a_sender_that_is_not_the_host_does_not_donate_its_address() {
+        // An IPv4 sender announcing someone else's AAAA: the name is only a fallback, and the
+        // sender's address must not be filed under it.
+        let host = name(&["device-a", "local"]);
+        let pkt = packet(
+            0x8400,
+            &[record(&host, 28, 1, &v6("2001:db8::10").octets())],
+        );
+        let a = parse_announcement(&pkt, SRC);
+        assert_eq!(a.hostname.as_deref(), Some("device-a.local"));
+        assert_eq!(
+            a.addrs.into_iter().collect::<Vec<_>>(),
+            vec![IpAddr::V6(v6("2001:db8::10"))]
+        );
+    }
+
+    #[test]
+    fn unspecified_loopback_and_multicast_addresses_are_not_kept() {
+        let host = name(&["device-a", "local"]);
+        let pkt = packet(
+            0x8400,
+            &[
+                record(&host, 1, 1, &[0, 0, 0, 0]),
+                record(&host, 1, 1, &[127, 0, 0, 1]),
+                record(&host, 1, 1, &[224, 0, 0, 251]),
+                record(&host, 28, 1, &v6("::1").octets()),
+                record(&host, 28, 1, &v6("ff02::fb").octets()),
+                record(&host, 1, 1, &SRC4.octets()),
+            ],
+        );
+        let a = parse_announcement(&pkt, SRC);
+        assert_eq!(a.addrs.into_iter().collect::<Vec<_>>(), vec![SRC]);
+    }
+
+    #[test]
+    fn address_lists_are_capped() {
+        let host = name(&["device-a", "local"]);
+        let recs: Vec<Vec<u8>> = (1..=40u16)
+            .map(|i| {
+                record(
+                    &host,
+                    28,
+                    1,
+                    &Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i).octets(),
+                )
+            })
+            .collect();
+        let a = parse_announcement(&packet(0x8400, &recs), SRC);
+        assert!(a.addrs.len() <= MAX_ADDRS_PER_DEVICE);
+        assert!(!a.addrs.is_empty());
+    }
+
+    #[test]
+    fn cache_keeps_ipv6_sources_with_their_scope_and_lists_them_in_order() {
+        let mut c = MdnsCache::default();
+        let a6 = IpAddr::V6(v6("fe80::10"));
+        let mut a = Announcement {
+            hostname: Some("a.local".into()),
+            ..Default::default()
+        };
+        a.addrs.insert(a6);
+        c.observe(a6, 11, a.clone(), 5);
+        c.observe(SRC, 0, a, 6);
+        let h = c.heard();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].from, SRC, "IPv4 sorts before IPv6");
+        assert_eq!(h[1].scope, 11);
+        assert!(h[1].info.addrs.contains(&a6));
+        // An announcement that is only an address teaches nothing.
+        let mut only_addr = Announcement::default();
+        only_addr.addrs.insert(a6);
+        let mut c2 = MdnsCache::default();
+        c2.observe(a6, 11, only_addr, 5);
+        assert!(c2.is_empty());
+    }
+
     #[test]
     fn queries_are_ignored() {
         let mut pkt = announcement_packet();
@@ -534,8 +773,8 @@ mod tests {
     fn follows_compression_pointers() {
         // Owner of record 2 is a pointer to the name bytes at offset 12.
         let host = name(&["device-a", "local"]);
-        let mut pkt = packet(0x8400, &[record(&host, 1, 1, &SRC.octets())]);
-        let second = record(&[0xC0, 12], 1, 1, &SRC.octets());
+        let mut pkt = packet(0x8400, &[record(&host, 1, 1, &SRC4.octets())]);
+        let second = record(&[0xC0, 12], 1, 1, &SRC4.octets());
         pkt.extend(second);
         pkt[7] = 2; // ancount = 2
         let a = parse_announcement(&pkt, SRC);
@@ -601,7 +840,7 @@ mod tests {
         let long_label = "a".repeat(63);
         let labels: Vec<&str> = vec![long_label.as_str(); 5];
         let owner = name(&labels);
-        let pkt = packet(0x8400, &[record(&owner, 1, 1, &SRC.octets())]);
+        let pkt = packet(0x8400, &[record(&owner, 1, 1, &SRC4.octets())]);
         assert_eq!(parse_announcement(&pkt, SRC), Announcement::default());
         // Reserved label type 0x40.
         let mut pkt = packet(0x8400, &[]);
@@ -610,14 +849,14 @@ mod tests {
         assert_eq!(parse_announcement(&pkt, SRC), Announcement::default());
         // Control character inside a label.
         let owner = name(&["bad\u{7}name", "local"]);
-        let pkt = packet(0x8400, &[record(&owner, 1, 1, &SRC.octets())]);
+        let pkt = packet(0x8400, &[record(&owner, 1, 1, &SRC4.octets())]);
         assert_eq!(parse_announcement(&pkt, SRC), Announcement::default());
     }
 
     #[test]
     fn rdata_length_past_the_packet_ends_the_walk() {
         let host = name(&["device-a", "local"]);
-        let mut pkt = packet(0x8400, &[record(&host, 1, 1, &SRC.octets())]);
+        let mut pkt = packet(0x8400, &[record(&host, 1, 1, &SRC4.octets())]);
         let n = pkt.len();
         pkt[n - 5] = 0xFF; // rdlength high byte
         assert_eq!(parse_announcement(&pkt, SRC), Announcement::default());
@@ -636,7 +875,7 @@ mod tests {
         }
         // Dotted instance name is not a hostname; spaces are not allowed.
         for bad in [name(&["a", "b", "local"]), name(&["has space", "local"])] {
-            let pkt = packet(0x8400, &[record(&bad, 1, 1, &SRC.octets())]);
+            let pkt = packet(0x8400, &[record(&bad, 1, 1, &SRC4.octets())]);
             assert_eq!(parse_announcement(&pkt, SRC).hostname, None);
         }
     }
@@ -645,17 +884,17 @@ mod tests {
     fn cache_is_bounded_merges_and_ignores_empty() {
         let mut c = MdnsCache::default();
         let now = 1_000_000;
-        c.observe(SRC, Announcement::default(), now);
+        c.observe(SRC, 0, Announcement::default(), now);
         assert!(c.is_empty());
         let mut a = Announcement {
             hostname: Some("a.local".into()),
             ..Default::default()
         };
         a.services.insert("_http._tcp".into());
-        c.observe(SRC, a, now);
+        c.observe(SRC, 0, a, now);
         let mut b = Announcement::default();
         b.services.insert("_ipp._tcp".into());
-        c.observe(SRC, b, now + 1);
+        c.observe(SRC, 0, b, now + 1);
         let got = c.get(SRC).unwrap();
         assert_eq!(got.hostname.as_deref(), Some("a.local"));
         assert_eq!(got.services.len(), 2);
@@ -663,7 +902,7 @@ mod tests {
         for i in 0..(MAX_CACHE_ENTRIES as u32 + 100) {
             let mut x = Announcement::default();
             x.services.insert("_x._tcp".into());
-            c.observe(Ipv4Addr::from(0xC000_0300 + i), x, now);
+            c.observe(IpAddr::V4(Ipv4Addr::from(0xC000_0300 + i)), 0, x, now);
         }
         assert!(c.len() <= MAX_CACHE_ENTRIES);
         // Per-device service cap.
@@ -671,9 +910,9 @@ mod tests {
         for i in 0..100 {
             many.services.insert(format!("_s{i}._tcp"));
         }
-        let ip = Ipv4Addr::new(192, 0, 2, 200);
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 200));
         let mut c2 = MdnsCache::default();
-        c2.observe(ip, many, now);
+        c2.observe(ip, 0, many, now);
         assert!(c2.get(ip).unwrap().services.len() <= MAX_SERVICES_PER_DEVICE);
     }
 

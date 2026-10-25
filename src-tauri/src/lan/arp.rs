@@ -1,4 +1,4 @@
-//! The neighbor (ARP) table, read with `sysctl` (`CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS,
+//! The IPv4 neighbor (ARP) table, read with `sysctl` (`CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS,
 //! RTF_LLINFO`), the same call `arp -an` makes, without running it. Read-only: the kernel
 //! hands back what it already learned; nothing is sent.
 //!
@@ -9,19 +9,19 @@
 use std::net::Ipv4Addr;
 
 /// `sizeof(struct rt_msghdr)` on macOS (checked against `libc` in a macOS-only test).
-const RT_MSGHDR_LEN: usize = 92;
-const OFF_MSGLEN: usize = 0;
-const OFF_TYPE: usize = 3;
-const OFF_INDEX: usize = 4;
-const OFF_ADDRS: usize = 12;
+pub(super) const RT_MSGHDR_LEN: usize = 92;
+pub(super) const OFF_MSGLEN: usize = 0;
+pub(super) const OFF_TYPE: usize = 3;
+pub(super) const OFF_INDEX: usize = 4;
+pub(super) const OFF_ADDRS: usize = 12;
 /// `RTM_GET`: what a NET_RT_FLAGS dump returns.
-const RTM_GET: u8 = 4;
-const RTA_DST: i32 = 0x1;
-const RTA_GATEWAY: i32 = 0x2;
+pub(super) const RTM_GET: u8 = 4;
+pub(super) const RTA_DST: i32 = 0x1;
+pub(super) const RTA_GATEWAY: i32 = 0x2;
 const AF_INET: u8 = 2;
-const AF_LINK: u8 = 18;
+pub(super) const AF_LINK: u8 = 18;
 /// Most route messages one dump is allowed to yield (a /23 plus slack).
-const MAX_ENTRIES: usize = 4096;
+pub(super) const MAX_ENTRIES: usize = 4096;
 
 /// One resolved neighbor: IPv4 address, hardware address, and the interface it was learned on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,16 +39,16 @@ pub fn format_mac(mac: &[u8; 6]) -> String {
     )
 }
 
-fn u16_at(b: &[u8], off: usize) -> Option<u16> {
+pub(super) fn u16_at(b: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_ne_bytes(b.get(off..off + 2)?.try_into().ok()?))
 }
 
-fn i32_at(b: &[u8], off: usize) -> Option<i32> {
+pub(super) fn i32_at(b: &[u8], off: usize) -> Option<i32> {
     Some(i32::from_ne_bytes(b.get(off..off + 4)?.try_into().ok()?))
 }
 
 /// Bytes a sockaddr occupies in a routing message: `sa_len` rounded up to 4, 4 when zero.
-fn sa_size(sa_len: u8) -> usize {
+pub(super) fn sa_size(sa_len: u8) -> usize {
     if sa_len == 0 {
         4
     } else {
@@ -57,7 +57,7 @@ fn sa_size(sa_len: u8) -> usize {
 }
 
 /// Hardware addresses that are not a real neighbor: all-zero, broadcast, multicast.
-fn usable_mac(mac: &[u8; 6]) -> bool {
+pub(super) fn usable_mac(mac: &[u8; 6]) -> bool {
     *mac != [0; 6] && *mac != [0xff; 6] && mac[0] & 1 == 0
 }
 
@@ -132,7 +132,7 @@ fn parse_sockaddr_in(sa: &[u8]) -> Option<Ipv4Addr> {
 }
 
 /// `struct sockaddr_dl`: len, family, index(2), type, nlen, alen, slen, then name + address.
-fn parse_sockaddr_dl(sa: &[u8]) -> Option<[u8; 6]> {
+pub(super) fn parse_sockaddr_dl(sa: &[u8]) -> Option<[u8; 6]> {
     if sa.len() < 8 || sa[1] != AF_LINK {
         return None;
     }
@@ -144,14 +144,16 @@ fn parse_sockaddr_dl(sa: &[u8]) -> Option<[u8; 6]> {
     sa.get(start..start + 6)?.try_into().ok()
 }
 
-/// Read the kernel's neighbor table. macOS only; elsewhere an empty table.
+/// Dump the kernel's neighbor entries for `family` (`AF_INET` = ARP, `AF_INET6` = ND) as raw
+/// routing messages: `sysctl(CTL_NET, PF_ROUTE, 0, family, NET_RT_FLAGS, RTF_LLINFO)`.
+/// Read-only. macOS only.
 #[cfg(target_os = "macos")]
-pub fn read_arp_table() -> std::io::Result<Vec<ArpEntry>> {
+pub(super) fn read_route_dump(family: libc::c_int) -> std::io::Result<Vec<u8>> {
     let mut mib = [
         libc::CTL_NET,
         libc::PF_ROUTE,
         0,
-        libc::AF_INET,
+        family,
         libc::NET_RT_FLAGS,
         libc::RTF_LLINFO,
     ];
@@ -191,7 +193,7 @@ pub fn read_arp_table() -> std::io::Result<Vec<ArpEntry>> {
         };
         if rc == 0 {
             buf.truncate(len);
-            return Ok(parse_arp_buffer(&buf));
+            return Ok(buf);
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::ENOMEM) {
@@ -199,6 +201,13 @@ pub fn read_arp_table() -> std::io::Result<Vec<ArpEntry>> {
         }
     }
     Err(std::io::Error::other("neighbor table kept changing"))
+}
+
+/// Read the IPv4 ARP table. Best effort: on macOS 27 this comes back empty for non-platform
+/// binaries (measured), but it may work on other releases, so it stays a source.
+#[cfg(target_os = "macos")]
+pub fn read_arp_table() -> std::io::Result<Vec<ArpEntry>> {
+    Ok(parse_arp_buffer(&read_route_dump(libc::AF_INET)?))
 }
 
 #[cfg(not(target_os = "macos"))]

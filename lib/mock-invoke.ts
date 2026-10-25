@@ -66,6 +66,7 @@ const H_GROUP_A = fakeHash(0xf1);
 const H_LAN_NET = fakeHash(0xf2);
 const H_LAN_1 = fakeHash(0xf3);
 const H_LAN_2 = fakeHash(0xf4);
+const H_LAN_3 = fakeHash(0xf5);
 const H_PLACE_1 = fakeHash(0xf5);
 
 let settings: Settings = {
@@ -424,6 +425,7 @@ function lanDevices(networkKey?: string | null): LanDevice[] {
       lastSeen: now - 1 * MIN,
       ip: "192.0.2.10",
       mine: false,
+      source: "both",
     },
     {
       networkKey: H_LAN_NET,
@@ -433,8 +435,21 @@ function lanDevices(networkKey?: string | null): LanDevice[] {
       services: [],
       firstSeen: now - 10 * MIN,
       lastSeen: now - 1 * MIN,
-      ip: "192.0.2.23",
+      ip: "2001:db8::23",
       mine: false,
+      source: "neighbor",
+    },
+    {
+      networkKey: H_LAN_NET,
+      macHash: H_LAN_3,
+      vendor: null,
+      hostname: "device-3.local",
+      services: ["_airplay._tcp"],
+      firstSeen: now - 2 * DAY,
+      lastSeen: now - 3 * MIN,
+      ip: "192.0.2.41",
+      mine: false,
+      source: "announced",
     },
   ];
   return all

@@ -184,6 +184,29 @@ describe("synthetic-only invariants for the v2 mock data", () => {
     const ips = [...all.matchAll(/\b(\d{1,3}(?:\.\d{1,3}){3})(?:\/\d+)?\b/g)].map((m) => m[1]);
     expect(ips.length).toBeGreaterThan(0);
     for (const ip of ips) expect(ip).toMatch(/^192\.0\.2\./);
+    // IPv6 addresses (neighbor-table devices) are in the 2001:db8::/32 documentation range.
+    const V6 = /\b([0-9a-f]{1,4}(?::{1,2}[0-9a-f]{1,4}){2,7})\b/gi;
+    const found = (text: string) =>
+      [...text.matchAll(V6)].map((m) => m[1]).filter((s) => !/^02(?::|-)/i.test(s));
+    // Negative control: the matcher sees a real-looking address, and ignores a 02: MAC.
+    expect(found("x 2001:4860::1 y")).toEqual(["2001:4860::1"]);
+    expect(found("x 02:00:00:00:00:01 y")).toEqual([]);
+    const v6 = found(all);
+    expect(v6.length).toBeGreaterThan(0);
+    for (const a of v6) expect(a.toLowerCase()).toMatch(/^2001:db8:/);
+  });
+
+  it("LAN devices cover every source, and announced-only ones have no vendor", async () => {
+    const devs = await listLanDevices();
+    const bySource = new Set(devs.map((d) => d.source));
+    expect([...bySource].sort()).toEqual(["announced", "both", "neighbor"]);
+    for (const d of devs.filter((d) => d.source === "announced")) {
+      expect(d.vendor).toBeNull();
+      expect(d.hostname).not.toBeNull();
+    }
+    for (const d of devs.filter((d) => d.source !== "announced")) {
+      expect(d.vendor).not.toBeNull();
+    }
   });
 
   it("can fail: a real-looking vendor is rejected; can pass: a synthetic one is accepted", () => {

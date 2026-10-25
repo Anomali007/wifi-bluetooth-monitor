@@ -2,7 +2,7 @@
 //!
 //! CONTRACT (frozen):
 //! - `rusqlite` (bundled). Tables: `wifi_sightings`, `ble_sightings`, `alerts`, `settings`,
-//!   `meta` (salt); v3 adds `places`, `place_sightings`, `mine`, `watchlist`, `lan_devices`
+//!   `meta` (salt); v4 adds `lan_devices.source`; v3 adds `places`, `place_sightings`, `mine`, `watchlist`, `lan_devices`
 //!   and the `vendor` / `group_id` columns on `wifi_sightings`. Observations are grouped by their scan's `scanned_at` so
 //!   [`Store::get_history`] can rebuild [`ScanSnapshot`]s.
 //! - Salt: 32 random bytes generated on first open, persisted (file/DB mode 0600), never
@@ -17,9 +17,9 @@
 //! - `Store` holds a non-`Sync` connection; the integrator wraps it in a `Mutex`.
 
 use crate::model::{
-    Alert, AlertKind, BleObservation, History, LanDevice, Millis, MineEntry, MineKind, Place,
-    PlaceSighting, Salt, ScanResult, ScanSnapshot, Settings, SightingKind, WatchKind, WatchMatch,
-    WatchlistEntry, WifiObservation,
+    Alert, AlertKind, BleObservation, History, LanDevice, LanSource, Millis, MineEntry, MineKind,
+    Place, PlaceSighting, Salt, ScanResult, ScanSnapshot, Settings, SightingKind, WatchKind,
+    WatchMatch, WatchlistEntry, WifiObservation,
 };
 mod lan_queries;
 mod places_queries;
@@ -33,7 +33,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SALT_LEN: usize = 32;
 const DB_FILE: &str = "store.sqlite3";
 /// The salt lives in its own 0600 file, NOT in the database: a copy, backup or export of the
@@ -169,6 +169,11 @@ fn add_wifi_vendor_group_columns(tx: &rusqlite::Transaction<'_>) -> StoreResult<
     add_column_if_missing(tx, "wifi_sightings", "group_id", "TEXT")
 }
 
+/// v3 -> v4: how a LAN device was learned (neighbor table, mDNS announcement, or both).
+fn add_lan_source_column(tx: &rusqlite::Transaction<'_>) -> StoreResult<()> {
+    add_column_if_missing(tx, "lan_devices", "source", "TEXT")
+}
+
 impl Store {
     /// Open (creating if needed) the store in directory `path` (the integrator passes the
     /// Tauri app-data dir): `store.sqlite3` plus `salt.key`. Runs [`Store::migrate`] and loads
@@ -278,6 +283,7 @@ impl Store {
                 // Fresh database: the v1 CREATE above has no owner_state / v3 columns yet.
                 add_owner_state_column(&tx)?;
                 add_wifi_vendor_group_columns(&tx)?;
+                add_lan_source_column(&tx)?;
                 tx.execute(
                     "INSERT INTO schema_version (version) VALUES (?1)",
                     [SCHEMA_VERSION],
@@ -293,11 +299,18 @@ impl Store {
                     [],
                 )?;
                 add_wifi_vendor_group_columns(&tx)?;
+                add_lan_source_column(&tx)?;
                 tx.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])?;
             }
             Some(v) if v < 3 => {
                 // v2 -> v3: vendor/group_id columns (tables were created above).
                 add_wifi_vendor_group_columns(&tx)?;
+                add_lan_source_column(&tx)?;
+                tx.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])?;
+            }
+            Some(v) if v < 4 => {
+                // v3 -> v4: lan_devices.source. Existing rows read back as None.
+                add_lan_source_column(&tx)?;
                 tx.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])?;
             }
             Some(_) => {}
@@ -821,7 +834,8 @@ impl Store {
         let mut q = self.conn.prepare(
             "SELECT d.network_key, d.mac_hash, d.vendor, d.hostname, d.services, d.first_seen,
                     d.last_seen,
-                    EXISTS(SELECT 1 FROM mine m WHERE m.kind = ?2 AND m.id_hash = d.mac_hash)
+                    EXISTS(SELECT 1 FROM mine m WHERE m.kind = ?2 AND m.id_hash = d.mac_hash),
+                    d.source
              FROM lan_devices d
              WHERE (?1 IS NULL OR d.network_key = ?1)
              ORDER BY d.last_seen DESC, d.mac_hash",
@@ -836,12 +850,22 @@ impl Store {
                 r.get::<_, Millis>(5)?,
                 r.get::<_, Millis>(6)?,
                 r.get::<_, bool>(7)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (network_key, mac_hash, vendor, hostname, services, first_seen, last_seen, mine) =
-                row?;
+            let (
+                network_key,
+                mac_hash,
+                vendor,
+                hostname,
+                services,
+                first_seen,
+                last_seen,
+                mine,
+                source,
+            ) = row?;
             out.push(LanDevice {
                 network_key,
                 mac_hash,
@@ -852,22 +876,47 @@ impl Store {
                 last_seen,
                 ip: None,
                 mine,
+                source: source.as_deref().and_then(LanSource::parse),
             });
         }
         Ok(out)
+    }
+
+    /// Remove one stored LAN device and return it (with `mine` filled), or `None` if absent.
+    /// Used to fold a hostname-keyed row into its MAC-keyed row once a hardware address is known.
+    pub fn take_lan_device(
+        &mut self,
+        network_key: &str,
+        mac_hash: &str,
+    ) -> StoreResult<Option<LanDevice>> {
+        let found = self
+            .list_lan_devices(Some(network_key))?
+            .into_iter()
+            .find(|d| d.mac_hash == mac_hash);
+        if found.is_some() {
+            self.conn.execute(
+                "DELETE FROM lan_devices WHERE network_key = ?1 AND mac_hash = ?2",
+                params![network_key, mac_hash],
+            )?;
+        }
+        Ok(found)
     }
 
     /// Insert a device, or on conflict keep `first_seen` and refresh `last_seen`, vendor,
     /// hostname and services (a missing new value does not erase an old one).
     pub fn upsert_lan_device(&mut self, d: &LanDevice) -> StoreResult<()> {
         self.conn.execute(
-            "INSERT INTO lan_devices (network_key, mac_hash, vendor, hostname, services, first_seen, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO lan_devices (network_key, mac_hash, vendor, hostname, services, first_seen, last_seen, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(network_key, mac_hash) DO UPDATE SET
                  vendor = COALESCE(excluded.vendor, vendor),
                  hostname = COALESCE(excluded.hostname, hostname),
                  services = CASE WHEN excluded.services = '[]' THEN services ELSE excluded.services END,
-                 last_seen = MAX(last_seen, excluded.last_seen)",
+                 last_seen = MAX(last_seen, excluded.last_seen),
+                 source = CASE
+                     WHEN source IS NULL THEN excluded.source
+                     WHEN excluded.source IS NULL OR source = excluded.source THEN source
+                     ELSE 'both' END",
             params![
                 d.network_key,
                 d.mac_hash,
@@ -875,7 +924,8 @@ impl Store {
                 d.hostname,
                 to_json(&d.services)?,
                 d.first_seen,
-                d.last_seen
+                d.last_seen,
+                d.source.map(LanSource::as_str)
             ],
         )?;
         Ok(())
@@ -1011,7 +1061,7 @@ mod tests {
             .conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
         let h = s.get_history(0).unwrap();
         let ble = &h.scans[0].ble;
         assert_eq!(ble.len(), 2);
@@ -1072,7 +1122,7 @@ mod tests {
             .conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
         for t in V3_TABLES {
             assert!(table_exists(&s, t), "{t} missing after v2 -> v3");
         }
@@ -1095,6 +1145,115 @@ mod tests {
         drop(s);
         let s = Store::open(dir.path()).unwrap();
         assert_eq!(s.list_mine().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn v3_database_migrates_to_v4_and_keeps_its_lan_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // Hand-built v3 schema: lan_devices without the `source` column.
+            let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES (3);
+                 CREATE TABLE lan_devices (
+                   network_key TEXT NOT NULL, mac_hash TEXT NOT NULL, vendor TEXT, hostname TEXT,
+                   services TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+                   PRIMARY KEY (network_key, mac_hash));
+                 INSERT INTO lan_devices VALUES ('net', 'old', 'Vendor-A', NULL, '[]', 10, 20);",
+            )
+            .unwrap();
+        }
+        let mut s = Store::open(dir.path()).unwrap();
+        let v: i64 = s
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 4);
+        let old = s.list_lan_devices(Some("net")).unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!((old[0].first_seen, old[0].last_seen), (10, 20));
+        assert_eq!(old[0].source, None, "pre-v4 rows have no source");
+        // The new column is writable, and an old row learns its source on the next sighting.
+        let mut d = lan_dev("net", "old", 30);
+        d.source = Some(LanSource::Neighbor);
+        s.upsert_lan_device(&d).unwrap();
+        let got = s.list_lan_devices(Some("net")).unwrap();
+        assert_eq!(got[0].source, Some(LanSource::Neighbor));
+        assert_eq!(got[0].first_seen, 10);
+        // Re-opening a v4 database changes nothing.
+        drop(s);
+        let s = Store::open(dir.path()).unwrap();
+        assert_eq!(s.list_lan_devices(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fresh_database_has_the_lan_source_column() {
+        let (_d, s) = open();
+        let has: bool = s
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('lan_devices') WHERE name = 'source')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has);
+        let v: i64 = s
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 4);
+    }
+
+    #[test]
+    fn lan_source_merges_to_both_and_never_loses_information() {
+        let (_d, mut s) = open();
+        let seen = |src: Option<LanSource>, at: Millis| {
+            let mut d = lan_dev("net", "dev", at);
+            d.source = src;
+            d
+        };
+        let read = |s: &Store| s.list_lan_devices(Some("net")).unwrap()[0].source;
+        s.upsert_lan_device(&seen(Some(LanSource::Announced), 1))
+            .unwrap();
+        assert_eq!(read(&s), Some(LanSource::Announced));
+        s.upsert_lan_device(&seen(Some(LanSource::Announced), 2))
+            .unwrap();
+        assert_eq!(read(&s), Some(LanSource::Announced), "same source stays");
+        s.upsert_lan_device(&seen(Some(LanSource::Neighbor), 3))
+            .unwrap();
+        assert_eq!(
+            read(&s),
+            Some(LanSource::Both),
+            "a different source merges to both"
+        );
+        s.upsert_lan_device(&seen(Some(LanSource::Neighbor), 4))
+            .unwrap();
+        assert_eq!(read(&s), Some(LanSource::Both), "both is sticky");
+        s.upsert_lan_device(&seen(None, 5)).unwrap();
+        assert_eq!(
+            read(&s),
+            Some(LanSource::Both),
+            "an unknown source erases nothing"
+        );
+    }
+
+    #[test]
+    fn take_lan_device_removes_and_returns_only_the_named_row() {
+        let (_d, mut s) = open();
+        s.upsert_lan_device(&lan_dev("net", "a", 1)).unwrap();
+        s.upsert_lan_device(&lan_dev("net", "b", 2)).unwrap();
+        s.upsert_lan_device(&lan_dev("other", "a", 3)).unwrap();
+        assert!(s.take_lan_device("net", "zzz").unwrap().is_none());
+        let got = s.take_lan_device("net", "a").unwrap().unwrap();
+        assert_eq!((got.mac_hash.as_str(), got.first_seen), ("a", 1));
+        assert!(s.take_lan_device("net", "a").unwrap().is_none(), "gone");
+        assert_eq!(
+            s.list_lan_devices(None).unwrap().len(),
+            2,
+            "other rows untouched"
+        );
     }
 
     #[test]
@@ -1136,6 +1295,7 @@ mod tests {
             last_seen: at,
             ip: Some("192.0.2.9".into()),
             mine: false,
+            source: None,
         }
     }
 

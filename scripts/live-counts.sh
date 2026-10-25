@@ -30,6 +30,10 @@ echo "place sightings (wifi/ble/lan):      $(q "SELECT COALESCE(SUM(kind LIKE '%
 echo "mine entries:                        $(q 'SELECT COUNT(*) FROM mine;')"
 echo "watchlist entries:                   $(q 'SELECT COUNT(*) FROM watchlist;')"
 echo "LAN devices (all):                   $(q 'SELECT COUNT(*) FROM lan_devices;')"
+echo "LAN devices with a hardware address (neighbor/both/pre-v4): $(q "SELECT COUNT(*) FROM lan_devices WHERE source IS NULL OR source <> 'announced';")"
+echo "LAN devices by source:"
+rows=$(q "SELECT COALESCE(source, 'unknown'), COUNT(*) FROM lan_devices GROUP BY source ORDER BY 1;" | tr '|' ' ')
+if [ -n "$rows" ]; then printf '%s\n' "$rows" | sed 's/^/  /'; else echo "  none"; fi
 echo "LAN devices with an mDNS hostname:   $(q "SELECT COUNT(*) FROM lan_devices WHERE hostname IS NOT NULL AND hostname <> '';")"
 echo "LAN devices with a vendor:           $(q "SELECT COUNT(*) FROM lan_devices WHERE vendor IS NOT NULL;")"
 echo "distinct LAN networks:               $(q 'SELECT COUNT(DISTINCT network_key) FROM lan_devices;')"

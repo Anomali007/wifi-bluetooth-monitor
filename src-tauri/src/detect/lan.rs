@@ -106,6 +106,7 @@ mod tests {
             last_seen: first_seen,
             ip: None,
             mine: false,
+            source: None,
         }
     }
 
@@ -271,6 +272,69 @@ mod tests {
             assert!(run(c, &s).is_empty(), "case must not alert: {name}");
         }
         assert_eq!(n, 12, "every negative case must run");
+    }
+
+    #[test]
+    fn hostname_keyed_and_mac_keyed_devices_are_judged_the_same_way() {
+        // Namespaced hostname hashes and MAC hashes are both just opaque keys to the rule.
+        let host_key = "mdns-host-key-0001";
+        let mac_key = "mac-key-0001";
+        for newcomer in [host_key, mac_key] {
+            let devs = vec![device("old", T0), device(newcomer, T0 + 60 * MIN)];
+            let c = ctx(vec![mine_ap(T0 - MIN)], devs.clone(), Some(net(true)));
+            assert_eq!(
+                run(&c, &Settings::default()).len(),
+                1,
+                "must alert: {newcomer}"
+            );
+            // NEGATIVE: the same newcomer, marked mine under that key.
+            let c = ctx(
+                vec![
+                    mine_ap(T0 - MIN),
+                    MineEntry {
+                        kind: MineKind::Lan,
+                        id_hash: newcomer.into(),
+                        label: None,
+                        added_at: T0,
+                    },
+                ],
+                devs,
+                Some(net(true)),
+            );
+            assert!(run(&c, &Settings::default()).is_empty(), "mine: {newcomer}");
+        }
+        // NEGATIVE: marking the hostname key mine does not silence a different key.
+        let devs = vec![
+            device("old", T0),
+            device(host_key, T0 + 60 * MIN),
+            device(mac_key, T0 + 61 * MIN),
+        ];
+        let c = ctx(
+            vec![
+                mine_ap(T0 - MIN),
+                MineEntry {
+                    kind: MineKind::Lan,
+                    id_hash: host_key.into(),
+                    label: None,
+                    added_at: T0,
+                },
+            ],
+            devs,
+            Some(net(true)),
+        );
+        let alerts = run(&c, &Settings::default());
+        assert_eq!(alerts.len(), 1);
+        // A device with no vendor (announced only) still reads sensibly.
+        let mut anon = device(host_key, T0 + 60 * MIN);
+        anon.vendor = None;
+        anon.hostname = Some("device-a.local".into());
+        let c = ctx(
+            vec![mine_ap(T0 - MIN)],
+            vec![device("old", T0), anon],
+            Some(net(true)),
+        );
+        let alerts = run(&c, &Settings::default());
+        assert!(alerts[0].detail.contains("unknown vendor, device-a.local"));
     }
 
     #[test]

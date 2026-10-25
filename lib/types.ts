@@ -233,10 +233,17 @@ export interface LanDevice {
   services: string[];
   firstSeen: Millis;
   lastSeen: Millis;
-  /** Live only, from the current ARP table; never persisted. */
+  /** Live only, from the current neighbor/ARP tables or mDNS; never persisted. */
   ip: string | null;
   mine: boolean;
+  /**
+   * How it was learned: in the neighbor table ("neighbor"), heard announcing itself over mDNS
+   * with no hardware address ("announced"), or both. Null only for rows from before v4.
+   */
+  source: LanSource | null;
 }
+
+export type LanSource = "neighbor" | "announced" | "both";
 
 export type LanMode = "passive" | "sweep";
 

@@ -9,8 +9,10 @@ export default function LanSection({ draft, set }: SectionProps) {
       <h2 className="font-semibold">Network devices</h2>
       <p className="text-sm text-muted-foreground">
         The Network page lists devices on the network you are joined to, using
-        only what the network already announces. This app never connects to a
-        device or looks for open ports.
+        only what your Mac has already learned about its neighbors and what
+        devices announce about themselves. This app never connects to a device
+        or looks for open ports. Devices that only speak IPv4 and never
+        announce themselves can be missed.
       </p>
       <label className="flex items-start gap-2 text-sm">
         <input
@@ -22,11 +24,12 @@ export default function LanSection({ draft, set }: SectionProps) {
         <span>
           Find quiet devices with an active sweep
           <span className="block text-muted-foreground">
-            Sends one small, empty packet to each address on your own network
-            (at most 50 per second, networks up to 512 addresses), then reads
-            which devices answered. It only runs while you are joined to an
-            access point you marked as mine, at most every 10 minutes and when
-            you press Sweep now. Off by default.
+            Sends a single small packet (an IPv6 echo request) to the
+            all-devices address on your own network, then reads which devices
+            answered. On some macOS versions those answers cannot be read by
+            apps, and then the sweep changes nothing. It only runs while you are joined to an access point you
+            marked as mine, at most every 10 minutes and when you press Sweep
+            now. Off by default.
           </span>
         </span>
       </label>

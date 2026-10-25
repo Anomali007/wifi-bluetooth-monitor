@@ -94,6 +94,9 @@ try {
   await page.getByRole("heading", { name: "Network", exact: true }).waitFor();
   await page.getByText("Vendor-A").first().waitFor();
   check("network page lists devices with vendors", (await page.getByText("Vendor-A").count()) > 0);
+  for (const label of ["Neighbor table", "Announced", "Both"]) {
+    check(`network page shows the source "${label}"`, (await page.getByTestId("lan-source").filter({ hasText: label }).count()) > 0);
+  }
   const sweepBtn = page.getByRole("button", { name: /Sweep now/ });
   check("sweep now is disabled while the sweep setting is off", await sweepBtn.isDisabled());
   check(

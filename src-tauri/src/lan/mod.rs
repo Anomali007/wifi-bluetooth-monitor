@@ -1,39 +1,49 @@
-//! Local-network discovery: ARP table, receive-only mDNS, opt-in sweep. OWNER: WP-D.
+//! Local-network discovery: IPv6 neighbor table, receive-only mDNS, IPv4 ARP (best effort), and
+//! an opt-in sweep. OWNER: WP-D.
 //!
-//! CONTRACT (frozen signatures):
-//! - Passive (always): read the ARP table via `sysctl`, listen on mDNS (never send).
+//! CONTRACT:
+//! - Passive (always): read the IPv6 neighbor table and the IPv4 ARP table via `sysctl`, listen
+//!   on mDNS (never send). Devices come from three sources joined together: neighbor entries
+//!   (hardware address + IPv6/IPv4 address), mDNS announcements (hostname + services per source
+//!   address), and ARP rows. Dropped: incomplete entries, multicast, our own addresses, other
+//!   interfaces.
 //! - Active sweep: only when `settings.lan_active_sweep` AND the joined access point is in
 //!   Mine, or when `force_sweep` is set by the user's "Sweep now" (the same gate still applies).
-//!   One zero-byte UDP datagram per host to port 9, rate-limited. No TCP, no port scans.
+//!   ONE ICMPv6 echo request to `ff02::1` (all nodes on the link), then the neighbor table is
+//!   re-read. No TCP, no port scans, no per-host packets.
 //! - [`scan`] is blocking; callers run it on a blocking thread. [`record`] persists the
-//!   outcome (devices by MAC hash, never an IP).
+//!   outcome (devices by MAC hash, or a namespaced hostname hash when no MAC is known; never
+//!   an IP).
 //!
-//! Layout: [`gate`] decides (pure), [`sweep`] is the only file that transmits, [`arp`] and
-//! [`mdns`] only read, [`net`] reads the joined network. [`scan`] reaches `run_sweep` only
+//! Layout: [`gate`] decides (pure), [`sweep`] is the only file that transmits, [`nd6`], [`arp`]
+//! and [`mdns`] only read, [`net`] reads the joined network. [`scan`] reaches `run_sweep` only
 //! through [`gate::may_sweep`].
 
 pub mod arp;
 pub mod gate;
 pub mod mdns;
+pub mod nd6;
 pub mod net;
 pub mod sweep;
 
-use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use crate::model::{
-    hash_identifier, LanDevice, LanMode, Millis, MineEntry, NetworkInfo, Salt, ScanError, Settings,
+    hash_identifier, LanDevice, LanMode, LanSource, Millis, MineEntry, MineKind, NetworkInfo, Salt,
+    ScanError, Settings,
 };
 use crate::store::{Store, StoreResult};
 use crate::vendor;
 
 use gate::{GateInput, SweepRefusal};
-use mdns::Announcement;
 use net::Link;
 
-/// How long to wait after the sweep before reading the ARP table, so replies can be learned.
-const ARP_SETTLE: Duration = Duration::from_secs(2);
+/// How long to wait after the sweep before reading the neighbor table, so replies are learned.
+const NEIGHBOR_SETTLE: Duration = Duration::from_secs(2);
+/// Service types kept per device in one scan.
+const MAX_SERVICES: usize = 24;
 
 fn now_ms() -> Millis {
     crate::pipeline::now_ms()
@@ -84,7 +94,7 @@ fn gate_for<'a>(link: &Link, inputs: &LanInputs, key: Option<&'a str>) -> GateIn
             link.bssid_hash.as_deref(),
             link.group_id.as_deref(),
         ),
-        subnet: link.subnet,
+        if_index: link.if_index,
     }
 }
 
@@ -115,104 +125,311 @@ fn build_info(link: &Link, inputs: &LanInputs, state: &LanState) -> NetworkInfo 
     }
 }
 
-/// Devices from an ARP dump: this interface only, inside its subnet, never our own address,
-/// one per hardware address. IPs are carried for display and never persisted.
-fn devices_from_arp(
-    entries: &[arp::ArpEntry],
+/// The key a device with no known hardware address is stored under: a salted hash of its mDNS
+/// hostname, namespaced so it can never equal a MAC hash (a MAC hash is the hash of
+/// six colon-separated hex pairs; this is the hash of `mdns-host:<name>`).
+pub fn host_key(salt: &Salt, hostname: &str) -> String {
+    hash_identifier(
+        salt,
+        &format!("mdns-host:{}", hostname.to_ascii_lowercase()),
+    )
+}
+
+/// Raw observations from one pass, before they are joined into devices.
+#[derive(Debug, Clone, Default)]
+pub struct Observed {
+    pub neighbors: Vec<nd6::NeighborEntry>,
+    pub arp: Vec<arp::ArpEntry>,
+    pub heard: Vec<mdns::Heard>,
+}
+
+/// One physical device keyed by hardware address, while joining.
+#[derive(Debug, Default)]
+struct MacRow {
+    v6: BTreeSet<Ipv6Addr>,
+    v4: BTreeSet<Ipv4Addr>,
+    hostname: Option<String>,
+    services: BTreeSet<String>,
+    announced: bool,
+}
+
+/// One announcing host with no hardware address, while joining.
+#[derive(Debug, Default)]
+struct HostRow {
+    hostname: String,
+    services: BTreeSet<String>,
+    ip: Option<IpAddr>,
+}
+
+fn merge_services(into: &mut BTreeSet<String>, from: &BTreeSet<String>) {
+    for s in from {
+        if into.len() < MAX_SERVICES {
+            into.insert(s.clone());
+        }
+    }
+}
+
+/// A global/ULA IPv6 address is a better thing to show than a link-local one.
+fn display_v6(set: &BTreeSet<Ipv6Addr>) -> Option<Ipv6Addr> {
+    set.iter()
+        .find(|a| a.octets()[0] != 0xfe || a.octets()[1] & 0xc0 != 0x80)
+        .or_else(|| set.iter().next())
+        .copied()
+}
+
+/// Join the three sources into devices. Pure: no I/O, so every case is unit-testable.
+///
+/// - Neighbor and ARP rows on the Wi-Fi interface become devices keyed by hashed MAC (one per
+///   hardware address, however many addresses it has).
+/// - An announcement joins a device when its source address, or any address its hostname owns,
+///   matches a neighbor/ARP row; the device then reads `Both`.
+/// - An announcement with a hostname that matches nothing is still a device, keyed by
+///   [`host_key`], vendor `None`, source `Announced`. Several announcements of one hostname are
+///   one device, and a hostname already joined to a MAC never also becomes a second row.
+pub fn build_devices(
+    obs: &Observed,
     link: &Link,
     key: &str,
     salt: &Salt,
     now: Millis,
-    lookup: impl Fn(Ipv4Addr) -> Option<Announcement>,
 ) -> Vec<LanDevice> {
-    let (Some(if_index), Some(subnet)) = (link.if_index, link.subnet) else {
+    let Some(if_index) = link.if_index else {
         return Vec::new();
     };
-    let mut by_mac: BTreeMap<String, LanDevice> = BTreeMap::new();
-    for e in entries {
-        if e.if_index != if_index || !subnet.contains(e.ip) || e.ip == subnet.addr {
+    let own_v4 = link.subnet.map(|s| s.addr);
+    let mut rows: BTreeMap<[u8; 6], MacRow> = BTreeMap::new();
+    let mut by_ip: HashMap<IpAddr, [u8; 6]> = HashMap::new();
+
+    for e in &obs.neighbors {
+        if e.if_index != if_index || link.own_v6.contains(&e.ip) {
             continue;
         }
-        let mac = arp::format_mac(&e.mac);
-        let mac_hash = hash_identifier(salt, &mac);
-        let dev = by_mac.entry(mac_hash.clone()).or_insert_with(|| {
-            let announced = lookup(e.ip).unwrap_or_default();
-            LanDevice {
-                network_key: key.to_string(),
-                mac_hash,
-                vendor: vendor::vendor_for(&mac),
-                hostname: announced.hostname,
-                services: announced.services.into_iter().collect(),
-                first_seen: now,
-                last_seen: now,
-                ip: Some(e.ip.to_string()),
-                mine: false,
+        rows.entry(e.mac).or_default().v6.insert(e.ip);
+        by_ip.insert(IpAddr::V6(e.ip), e.mac);
+    }
+    if let Some(subnet) = link.subnet {
+        for e in &obs.arp {
+            if e.if_index != if_index || !subnet.contains(e.ip) || e.ip == subnet.addr {
+                continue;
             }
-        });
-        // Several addresses for one MAC: show the lowest, deterministically.
-        if let Some(cur) = dev.ip.as_deref().and_then(|s| s.parse::<Ipv4Addr>().ok()) {
-            if e.ip < cur {
-                dev.ip = Some(e.ip.to_string());
-            }
+            rows.entry(e.mac).or_default().v4.insert(e.ip);
+            by_ip.insert(IpAddr::V4(e.ip), e.mac);
         }
     }
-    by_mac.into_values().collect()
+
+    // Is this announcement from a host on this Wi-Fi network (and not us)?
+    let on_link = |h: &mdns::Heard| match h.from {
+        IpAddr::V4(a) => link.subnet.is_some_and(|s| s.contains(a)) && Some(a) != own_v4,
+        IpAddr::V6(a) => {
+            !link.own_v6.contains(&a)
+                && (h.scope == u32::from(if_index) || by_ip.contains_key(&h.from))
+        }
+    };
+    let mut heard: Vec<&mdns::Heard> = obs.heard.iter().filter(|h| on_link(h)).collect();
+    heard.sort_by_key(|h| h.from);
+
+    let mut host_to_mac: HashMap<String, [u8; 6]> = HashMap::new();
+    let mut unmatched: Vec<&mdns::Heard> = Vec::new();
+    for h in heard {
+        let mac = by_ip.get(&h.from).copied().or_else(|| {
+            h.info
+                .addrs
+                .iter()
+                .filter(|a| match a {
+                    IpAddr::V6(v6) => !link.own_v6.contains(v6),
+                    IpAddr::V4(v4) => Some(*v4) != own_v4,
+                })
+                .find_map(|a| by_ip.get(a).copied())
+        });
+        match mac {
+            Some(mac) => {
+                let row = rows.entry(mac).or_default();
+                row.announced = true;
+                if row.hostname.is_none() {
+                    row.hostname = h.info.hostname.clone();
+                }
+                merge_services(&mut row.services, &h.info.services);
+                if let Some(host) = &h.info.hostname {
+                    host_to_mac.entry(host.to_ascii_lowercase()).or_insert(mac);
+                }
+            }
+            None => unmatched.push(h),
+        }
+    }
+
+    let mut hosts: BTreeMap<String, HostRow> = BTreeMap::new();
+    for h in unmatched {
+        let Some(host) = &h.info.hostname else {
+            continue; // services alone, from an address with no hardware address: nothing to key on
+        };
+        let lower = host.to_ascii_lowercase();
+        if let Some(mac) = host_to_mac.get(&lower) {
+            // The same host, heard from an address we could not place: fold into its device.
+            if let Some(row) = rows.get_mut(mac) {
+                merge_services(&mut row.services, &h.info.services);
+            }
+            continue;
+        }
+        let row = hosts.entry(lower).or_insert_with(|| HostRow {
+            hostname: host.clone(),
+            ..HostRow::default()
+        });
+        merge_services(&mut row.services, &h.info.services);
+        // Prefer showing an IPv4 address; otherwise the first heard.
+        if row.ip.is_none() || (row.ip.is_some_and(|i| i.is_ipv6()) && h.from.is_ipv4()) {
+            row.ip = Some(h.from);
+        }
+    }
+
+    let mut out = Vec::with_capacity(rows.len() + hosts.len());
+    for (mac, row) in rows {
+        let text = arp::format_mac(&mac);
+        let ip = row
+            .v4
+            .iter()
+            .next()
+            .map(|a| a.to_string())
+            .or_else(|| display_v6(&row.v6).map(|a| a.to_string()));
+        out.push(LanDevice {
+            network_key: key.to_string(),
+            mac_hash: hash_identifier(salt, &text),
+            vendor: vendor::vendor_for(&text),
+            hostname: row.hostname,
+            services: row.services.into_iter().collect(),
+            first_seen: now,
+            last_seen: now,
+            ip,
+            mine: false,
+            source: Some(if row.announced {
+                LanSource::Both
+            } else {
+                LanSource::Neighbor
+            }),
+        });
+    }
+    for (lower, row) in hosts {
+        out.push(LanDevice {
+            network_key: key.to_string(),
+            mac_hash: host_key(salt, &lower),
+            vendor: None,
+            hostname: Some(row.hostname),
+            services: row.services.into_iter().collect(),
+            first_seen: now,
+            last_seen: now,
+            ip: row.ip.map(|i| i.to_string()),
+            mine: false,
+            source: Some(LanSource::Announced),
+        });
+    }
+    out
 }
 
-/// Observe the joined network: always the ARP table and the mDNS cache; additionally one sweep
-/// when [`gate::may_sweep`] allows it. A failed ARP read yields no devices, not an error: the
-/// LAN is an extra and must not cost a Wi-Fi/BLE cycle.
+/// Counts for the log line. Never a name, address or hash.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceCounts {
+    pub total: usize,
+    pub with_mac: usize,
+    pub with_vendor: usize,
+    pub with_name: usize,
+    pub neighbor: usize,
+    pub announced: usize,
+    pub both: usize,
+}
+
+pub fn count_devices(devices: &[LanDevice]) -> DeviceCounts {
+    let src = |s| devices.iter().filter(|d| d.source == Some(s)).count();
+    DeviceCounts {
+        total: devices.len(),
+        // Hardware address known = anything not announced-only.
+        with_mac: devices
+            .iter()
+            .filter(|d| d.source != Some(LanSource::Announced))
+            .count(),
+        with_vendor: devices.iter().filter(|d| d.vendor.is_some()).count(),
+        with_name: devices.iter().filter(|d| d.hostname.is_some()).count(),
+        neighbor: src(LanSource::Neighbor),
+        announced: src(LanSource::Announced),
+        both: src(LanSource::Both),
+    }
+}
+
+/// Observe the joined network: always the neighbor tables and the mDNS cache; additionally one
+/// sweep when [`gate::may_sweep`] allows it. A failed table read yields no rows from that
+/// source, not an error: the LAN is an extra and must not cost a Wi-Fi/BLE cycle.
 pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, ScanError> {
     let now = now_ms();
     let mdns = mdns::ensure_listener();
     let link = net::read_link(&inputs.salt);
     let key = key_of(&link);
 
-    // The only route to a transmit: the gate (setting ON + AP Mine + subnet <= /23) and cadence.
+    // The only route to a transmit: the gate (setting ON + AP Mine + known interface) and cadence.
     let decision = gate::may_sweep(
         &gate_for(&link, inputs, key.as_deref()),
         inputs.force_sweep,
         state.last_sweep_for(key.as_deref()),
         now,
     );
-    if let Ok(subnet) = decision {
-        if let Ok(mut sink) = sweep::UdpSink::new() {
-            sweep::run_sweep(&mut sink, &subnet.hosts(), std::thread::sleep);
+    let mut swept = SweepLog::default();
+    if let Ok(if_index) = decision {
+        if let Ok(mut sink) = sweep::IcmpSink::new(if_index) {
+            let stats = sweep::run_sweep(&mut sink, if_index);
+            swept = SweepLog {
+                ran: true,
+                sent: stats.sent,
+                failed: stats.failed,
+            };
             state.last_sweep_at = Some(now);
             state.last_sweep_network = key.clone();
-            std::thread::sleep(ARP_SETTLE);
+            std::thread::sleep(NEIGHBOR_SETTLE);
         }
     }
 
     let network = build_info(&link, inputs, state);
-    let mut arp_rows = 0usize;
-    let devices = match key.as_deref() {
-        Some(k) => {
-            let entries = arp::read_arp_table().unwrap_or_default();
-            arp_rows = entries.len();
-            devices_from_arp(&entries, &link, k, &inputs.salt, now_ms(), |ip| {
-                mdns.lookup(ip)
-            })
-        }
-        None => Vec::new(),
-    };
-    let mdns_counts = mdns::listener_counts();
+    let mut obs = Observed::default();
+    let mut devices = Vec::new();
+    if let Some(k) = key.as_deref() {
+        obs.neighbors = nd6::read_neighbor_table().unwrap_or_default();
+        obs.arp = arp::read_arp_table().unwrap_or_default();
+        obs.heard = mdns.snapshot();
+        devices = build_devices(&obs, &link, k, &inputs.salt, now_ms());
+    }
+    let on_if = |i: u16| Some(i) == link.if_index;
+    let c = count_devices(&devices);
+    let mc = mdns::listener_counts();
     // Counts only: never a name, address or hash.
     log::info!(
-        "lan: network identified={}, subnet known={}, arp rows={}, devices={}, mdns sources={}, mdns socket bound={}, bind failures={}, datagrams={}",
+        "lan: network identified={}, nd6 rows={} (wifi {}), arp rows={}, mdns sources={}, devices={} (neighbor {}, announced {}, both {}; with mac {}, vendor {}, name {}), sweep ran={} sent={} failed={}, mdns bound v4={} v6={}, bind failures={}, datagrams={}",
         key.is_some(),
-        link.subnet.is_some(),
-        arp_rows,
-        devices.len(),
+        obs.neighbors.len(),
+        obs.neighbors.iter().filter(|e| on_if(e.if_index)).count(),
+        obs.arp.len(),
         mdns.announced_sources(),
-        mdns_counts.0,
-        mdns_counts.1,
-        mdns_counts.2
+        c.total,
+        c.neighbor,
+        c.announced,
+        c.both,
+        c.with_mac,
+        c.with_vendor,
+        c.with_name,
+        swept.ran,
+        swept.sent,
+        swept.failed,
+        mc.bound_v4,
+        mc.bound_v6,
+        mc.bind_failures,
+        mc.datagrams
     );
     Ok(LanScanOutcome { network, devices })
 }
 
-/// The currently joined network without touching the LAN: no sweep, no ARP read.
+#[derive(Debug, Clone, Copy, Default)]
+struct SweepLog {
+    ran: bool,
+    sent: usize,
+    failed: usize,
+}
+
+/// The currently joined network without touching the LAN: no sweep, no table reads.
 pub fn current_network(inputs: &LanInputs, state: &LanState) -> NetworkInfo {
     build_info(&net::read_link(&inputs.salt), inputs, state)
 }
@@ -232,10 +449,34 @@ pub fn sweep_refusal(inputs: &LanInputs, state: &LanState) -> Option<&'static st
     .map(SweepRefusal::message)
 }
 
-/// Persist an outcome's devices (hashed MACs; the live IP is dropped by the store).
-pub fn record(store: &mut Store, outcome: &LanScanOutcome, _now: Millis) -> StoreResult<()> {
+/// Persist an outcome's devices (hashed MACs or namespaced hostname hashes; the live IP is
+/// dropped by the store).
+///
+/// A device first stored by hostname alone that now has a hardware address is ONE device
+/// again: its hostname-keyed row is folded into the MAC-keyed row, keeping the earlier
+/// `first_seen` so the upgrade is not "news" to the NewLanDevice rule.
+pub fn record(store: &mut Store, outcome: &LanScanOutcome, now: Millis) -> StoreResult<()> {
     for d in &outcome.devices {
-        store.upsert_lan_device(d)?;
+        let mut d = d.clone();
+        if d.source == Some(LanSource::Both) {
+            if let Some(host) = &d.hostname {
+                let old_key = host_key(store.salt(), host);
+                if old_key != d.mac_hash {
+                    if let Some(old) = store.take_lan_device(&d.network_key, &old_key)? {
+                        d.first_seen = d.first_seen.min(old.first_seen);
+                        if old.mine {
+                            store.add_mine(&MineEntry {
+                                kind: MineKind::Lan,
+                                id_hash: d.mac_hash.clone(),
+                                label: None,
+                                added_at: now,
+                            })?;
+                        }
+                    }
+                }
+            }
+        }
+        store.upsert_lan_device(&d)?;
     }
     Ok(())
 }
@@ -243,8 +484,8 @@ pub fn record(store: &mut Store, outcome: &LanScanOutcome, _now: Millis) -> Stor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::MineKind;
     use gate::Subnet;
+    use mdns::{Announcement, Heard};
 
     fn salt() -> Salt {
         Salt::from_bytes(vec![1; 32])
@@ -271,6 +512,10 @@ mod tests {
         }
     }
 
+    fn v6(s: &str) -> Ipv6Addr {
+        s.parse().unwrap()
+    }
+
     fn link() -> Link {
         Link {
             ssid: Some("Net-A".into()),
@@ -281,15 +526,56 @@ mod tests {
                 addr: Ipv4Addr::new(192, 0, 2, 7),
                 prefix: 24,
             }),
+            own_v6: vec![v6("fe80::7"), v6("2001:db8::7")],
+        }
+    }
+
+    fn mac(last: u8) -> [u8; 6] {
+        [0x02, 0, 0, 0, 0, last]
+    }
+
+    fn mac_hash(last: u8) -> String {
+        hash_identifier(&salt(), &arp::format_mac(&mac(last)))
+    }
+
+    fn nb(ip: &str, last: u8, if_index: u16) -> nd6::NeighborEntry {
+        nd6::NeighborEntry {
+            ip: v6(ip),
+            mac: mac(last),
+            if_index,
         }
     }
 
     fn arp_entry(last: u8, if_index: u16, mac_last: u8) -> arp::ArpEntry {
         arp::ArpEntry {
             ip: Ipv4Addr::new(192, 0, 2, last),
-            mac: [0x02, 0, 0, 0, 0, mac_last],
+            mac: mac(mac_last),
             if_index,
         }
+    }
+
+    fn heard(from: IpAddr, scope: u32, host: Option<&str>, svcs: &[&str], addrs: &[&str]) -> Heard {
+        Heard {
+            from,
+            scope,
+            info: Announcement {
+                hostname: host.map(str::to_string),
+                services: svcs.iter().map(|s| s.to_string()).collect(),
+                addrs: addrs.iter().map(|a| a.parse().unwrap()).collect(),
+            },
+        }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn build(obs: &Observed) -> Vec<LanDevice> {
+        build_devices(obs, &link(), "key", &salt(), 777)
+    }
+
+    fn by_hash<'a>(devs: &'a [LanDevice], h: &str) -> &'a LanDevice {
+        devs.iter().find(|d| d.mac_hash == h).expect("device")
     }
 
     #[test]
@@ -312,6 +598,15 @@ mod tests {
         // NEGATIVE: no network at all.
         let n = build_info(&Link::default(), &inputs(true, vec![mine_ap("ap-1")]), &st);
         assert_eq!(n, NetworkInfo::default());
+        // An IPv6-only network (no IPv4 subnet) can still be swept.
+        let mut l = link();
+        l.subnet = None;
+        let n = build_info(&l, &inputs(true, vec![mine_ap("ap-1")]), &st);
+        assert!(n.sweep_enabled && n.subnet.is_none());
+        // NEGATIVE: no Wi-Fi interface.
+        l.if_index = None;
+        let n = build_info(&l, &inputs(true, vec![mine_ap("ap-1")]), &st);
+        assert!(!n.sweep_enabled);
     }
 
     #[test]
@@ -333,82 +628,432 @@ mod tests {
     }
 
     #[test]
-    fn devices_are_filtered_hashed_and_deduplicated() {
-        let entries = vec![
-            arp_entry(10, 11, 1),
-            arp_entry(5, 11, 1), // same MAC, lower IP wins
-            arp_entry(11, 11, 2),
-            arp_entry(12, 99, 3), // other interface
-            arp_entry(7, 11, 4),  // our own address
-            arp::ArpEntry {
-                ip: Ipv4Addr::new(198, 51, 100, 9), // outside the subnet
-                mac: [0x02, 0, 0, 0, 0, 5],
-                if_index: 11,
-            },
-        ];
-        let mut announced = Announcement {
-            hostname: Some("device-a.local".into()),
-            ..Announcement::default()
+    fn neighbor_only_device_has_mac_vendor_source_and_one_row_per_mac() {
+        let obs = Observed {
+            neighbors: vec![
+                nb("fe80::10", 1, 11),
+                nb("2001:db8::10", 1, 11), // same MAC, second address: still one device
+                nb("fe80::20", 2, 11),
+                nb("fe80::30", 3, 99),    // other interface
+                nb("fe80::7", 4, 11),     // our own address
+                nb("2001:db8::7", 5, 11), // our own address
+            ],
+            ..Observed::default()
         };
-        announced.services.insert("_http._tcp".into());
-        let devs = devices_from_arp(&entries, &link(), "key", &salt(), 777, |ip| {
-            (ip == Ipv4Addr::new(192, 0, 2, 10)).then(|| announced.clone())
-        });
+        let devs = build(&obs);
         assert_eq!(devs.len(), 2);
-        let d1 = devs
-            .iter()
-            .find(|d| d.mac_hash == hash_identifier(&salt(), "02:00:00:00:00:01"))
-            .unwrap();
-        assert_eq!(d1.ip.as_deref(), Some("192.0.2.5"));
+        let d1 = by_hash(&devs, &mac_hash(1));
+        assert_eq!(d1.source, Some(LanSource::Neighbor));
         assert_eq!(d1.network_key, "key");
         assert_eq!((d1.first_seen, d1.last_seen), (777, 777));
-        // mDNS was looked up by the first-seen IP (.10) for this MAC.
-        assert_eq!(d1.hostname.as_deref(), Some("device-a.local"));
-        assert_eq!(d1.services, vec!["_http._tcp".to_string()]);
-        // No raw MAC anywhere.
-        let json = serde_json::to_string(&devs).unwrap();
-        assert!(!json.contains("02:00:00"));
+        assert_eq!(
+            d1.ip.as_deref(),
+            Some("2001:db8::10"),
+            "global shown over link-local"
+        );
+        assert_eq!(d1.hostname, None);
+        assert_eq!(by_hash(&devs, &mac_hash(2)).ip.as_deref(), Some("fe80::20"));
+        // No raw MAC or address-derived text in what is serialised for storage keys.
+        assert!(!devs.iter().any(|d| d.mac_hash.contains("02:00")));
+        // NEGATIVE: with no interface known, nothing is listed.
+        let mut l = link();
+        l.if_index = None;
+        assert!(build_devices(&obs, &l, "key", &salt(), 1).is_empty());
     }
 
     #[test]
-    fn no_interface_or_subnet_means_no_devices() {
-        let entries = vec![arp_entry(10, 11, 1)];
-        let mut l = link();
-        l.if_index = None;
-        assert!(devices_from_arp(&entries, &l, "k", &salt(), 0, |_| None).is_empty());
+    fn mdns_only_host_is_a_device_keyed_by_a_namespaced_hostname_hash() {
+        let obs = Observed {
+            heard: vec![heard(
+                ip("192.0.2.40"),
+                0,
+                Some("device-a.local"),
+                &["_http._tcp"],
+                &[],
+            )],
+            ..Observed::default()
+        };
+        let devs = build(&obs);
+        assert_eq!(devs.len(), 1);
+        let d = &devs[0];
+        assert_eq!(d.source, Some(LanSource::Announced));
+        assert_eq!(d.vendor, None);
+        assert_eq!(d.hostname.as_deref(), Some("device-a.local"));
+        assert_eq!(d.services, vec!["_http._tcp".to_string()]);
+        assert_eq!(d.mac_hash, host_key(&salt(), "device-a.local"));
+        assert_eq!(d.ip.as_deref(), Some("192.0.2.40"));
+        // Case-insensitive host key; and it cannot collide with a MAC hash.
+        assert_eq!(host_key(&salt(), "DEVICE-A.local"), d.mac_hash);
+        assert_ne!(
+            host_key(&salt(), "device-a.local"),
+            host_key(&salt(), "device-b.local")
+        );
+        for last in 0..=255u8 {
+            assert_ne!(mac_hash(last), d.mac_hash);
+        }
+        // A different salt gives a different key (not a bare hash of the hostname).
+        assert_ne!(
+            host_key(&Salt::from_bytes(vec![2; 32]), "device-a.local"),
+            d.mac_hash
+        );
+    }
+
+    #[test]
+    fn announcement_joins_a_neighbor_by_aaaa_address() {
+        let obs = Observed {
+            neighbors: vec![nb("2001:db8::10", 1, 11)],
+            // Heard over IPv4; its AAAA record names the neighbor's IPv6 address.
+            heard: vec![heard(
+                ip("192.0.2.40"),
+                0,
+                Some("device-a.local"),
+                &["_airplay._tcp"],
+                &["2001:db8::10"],
+            )],
+            ..Observed::default()
+        };
+        let devs = build(&obs);
+        assert_eq!(devs.len(), 1, "one physical device, one row");
+        let d = &devs[0];
+        assert_eq!(d.mac_hash, mac_hash(1));
+        assert_eq!(d.source, Some(LanSource::Both));
+        assert_eq!(d.hostname.as_deref(), Some("device-a.local"));
+        assert_eq!(d.services, vec!["_airplay._tcp".to_string()]);
+    }
+
+    #[test]
+    fn announcement_joins_by_its_own_source_ipv6_and_by_arp_ipv4() {
+        let obs = Observed {
+            neighbors: vec![nb("fe80::10", 1, 11)],
+            arp: vec![arp_entry(50, 11, 2)],
+            heard: vec![
+                // Source IPv6 matches the neighbor entry (scope 11 = the Wi-Fi interface).
+                heard(
+                    ip("fe80::10"),
+                    11,
+                    Some("device-a.local"),
+                    &[],
+                    &["fe80::10"],
+                ),
+                // Source IPv4 matches an ARP row.
+                heard(ip("192.0.2.50"), 0, Some("device-b.local"), &[], &[]),
+            ],
+        };
+        let devs = build(&obs);
+        assert_eq!(devs.len(), 2);
+        assert_eq!(
+            by_hash(&devs, &mac_hash(1)).hostname.as_deref(),
+            Some("device-a.local")
+        );
+        assert_eq!(
+            by_hash(&devs, &mac_hash(2)).hostname.as_deref(),
+            Some("device-b.local")
+        );
+        assert!(devs.iter().all(|d| d.source == Some(LanSource::Both)));
+        // IPv4 from ARP is preferred for display.
+        assert_eq!(
+            by_hash(&devs, &mac_hash(2)).ip.as_deref(),
+            Some("192.0.2.50")
+        );
+    }
+
+    #[test]
+    fn duplicates_collapse_to_one_device() {
+        let obs = Observed {
+            neighbors: vec![nb("2001:db8::10", 1, 11)],
+            heard: vec![
+                // Same host over IPv4 (names its AAAA) and over IPv6, plus a third packet
+                // from an address we cannot place that repeats the hostname.
+                heard(
+                    ip("192.0.2.40"),
+                    0,
+                    Some("device-a.local"),
+                    &["_http._tcp"],
+                    &["2001:db8::10"],
+                ),
+                heard(
+                    ip("2001:db8::10"),
+                    11,
+                    Some("Device-A.local"),
+                    &["_ipp._tcp"],
+                    &[],
+                ),
+                heard(
+                    ip("192.0.2.41"),
+                    0,
+                    Some("device-a.local"),
+                    &["_ssh._tcp"],
+                    &[],
+                ),
+                // Two unplaced announcements of another host: one row.
+                heard(
+                    ip("192.0.2.60"),
+                    0,
+                    Some("device-c.local"),
+                    &["_http._tcp"],
+                    &[],
+                ),
+                heard(
+                    ip("192.0.2.61"),
+                    0,
+                    Some("DEVICE-C.local"),
+                    &["_ipp._tcp"],
+                    &[],
+                ),
+            ],
+            ..Observed::default()
+        };
+        let devs = build(&obs);
+        assert_eq!(devs.len(), 2, "device-a joined to its MAC, device-c alone");
+        let a = by_hash(&devs, &mac_hash(1));
+        assert_eq!(a.source, Some(LanSource::Both));
+        assert_eq!(
+            a.services.len(),
+            3,
+            "services merged from all three packets"
+        );
+        let c = by_hash(&devs, &host_key(&salt(), "device-c.local"));
+        assert_eq!(c.source, Some(LanSource::Announced));
+        assert_eq!(c.services.len(), 2);
+    }
+
+    #[test]
+    fn announcements_from_elsewhere_or_from_us_are_ignored() {
+        let obs = Observed {
+            heard: vec![
+                heard(ip("198.51.100.9"), 0, Some("far.local"), &[], &[]), // outside the subnet
+                heard(ip("192.0.2.7"), 0, Some("me.local"), &[], &[]),     // our IPv4
+                heard(ip("fe80::7"), 11, Some("me.local"), &[], &[]),      // our IPv6
+                heard(ip("fe80::99"), 4, Some("other-if.local"), &[], &[]), // another interface
+                heard(ip("fe80::98"), 0, Some("no-scope.local"), &[], &[]), // unknown scope, unknown neighbor
+                heard(ip("192.0.2.70"), 0, None, &["_http._tcp"], &[]), // services only, no MAC, no name
+            ],
+            ..Observed::default()
+        };
+        assert!(build(&obs).is_empty());
+        // CONTROL: the same shapes on the right link are accepted.
+        let obs = Observed {
+            heard: vec![
+                heard(ip("fe80::99"), 11, Some("on-link.local"), &[], &[]),
+                heard(ip("192.0.2.71"), 0, Some("in-subnet.local"), &[], &[]),
+            ],
+            ..Observed::default()
+        };
+        assert_eq!(build(&obs).len(), 2);
+        // An IPv4 announcement with no known subnet cannot be placed on this link.
         let mut l = link();
         l.subnet = None;
-        assert!(devices_from_arp(&entries, &l, "k", &salt(), 0, |_| None).is_empty());
+        let obs = Observed {
+            heard: vec![heard(
+                ip("192.0.2.71"),
+                0,
+                Some("in-subnet.local"),
+                &[],
+                &[],
+            )],
+            ..Observed::default()
+        };
+        assert!(build_devices(&obs, &l, "key", &salt(), 1).is_empty());
+    }
+
+    #[test]
+    fn a_claimed_address_nobody_owns_does_not_steal_a_mac() {
+        // The announcement claims an AAAA that matches no neighbor: it stays its own device.
+        let obs = Observed {
+            neighbors: vec![nb("fe80::10", 1, 11)],
+            heard: vec![heard(
+                ip("192.0.2.80"),
+                0,
+                Some("claimed.local"),
+                &[],
+                &["2001:db8::dead"],
+            )],
+            ..Observed::default()
+        };
+        let devs = build(&obs);
+        assert_eq!(devs.len(), 2);
+        assert_eq!(
+            by_hash(&devs, &mac_hash(1)).source,
+            Some(LanSource::Neighbor)
+        );
+        assert_eq!(
+            by_hash(&devs, &host_key(&salt(), "claimed.local")).source,
+            Some(LanSource::Announced)
+        );
+    }
+
+    #[test]
+    fn counts_by_source() {
+        let obs = Observed {
+            neighbors: vec![nb("2001:db8::10", 1, 11), nb("2001:db8::20", 2, 11)],
+            heard: vec![
+                heard(ip("2001:db8::10"), 11, Some("a.local"), &[], &[]),
+                heard(ip("192.0.2.90"), 0, Some("b.local"), &[], &[]),
+            ],
+            ..Observed::default()
+        };
+        let c = count_devices(&build(&obs));
+        assert_eq!(
+            c,
+            DeviceCounts {
+                total: 3,
+                with_mac: 2,
+                with_vendor: 2,
+                with_name: 2,
+                neighbor: 1,
+                announced: 1,
+                both: 1
+            }
+        );
+    }
+
+    fn lan_dev(hash: &str, host: Option<&str>, source: LanSource, at: Millis) -> LanDevice {
+        LanDevice {
+            network_key: "key".into(),
+            mac_hash: hash.into(),
+            vendor: Some("Vendor-A".into()),
+            hostname: host.map(str::to_string),
+            services: vec![],
+            first_seen: at,
+            last_seen: at,
+            ip: Some("192.0.2.10".into()),
+            mine: false,
+            source: Some(source),
+        }
+    }
+
+    fn out(d: LanDevice) -> LanScanOutcome {
+        LanScanOutcome {
+            network: NetworkInfo::default(),
+            devices: vec![d],
+        }
     }
 
     #[test]
     fn record_persists_hashed_devices_without_ip_and_keeps_first_seen() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path()).unwrap();
-        let mk = |at: Millis| LanDevice {
-            network_key: "key".into(),
-            mac_hash: "h1".into(),
-            vendor: Some("Vendor-A".into()),
-            hostname: None,
-            services: vec![],
-            first_seen: at,
-            last_seen: at,
-            ip: Some("192.0.2.10".into()),
-            mine: false,
-        };
-        let out = |at| LanScanOutcome {
-            network: NetworkInfo::default(),
-            devices: vec![mk(at)],
-        };
-        record(&mut store, &out(100), 100).unwrap();
-        record(&mut store, &out(200), 200).unwrap();
+        record(
+            &mut store,
+            &out(lan_dev("h1", None, LanSource::Neighbor, 100)),
+            100,
+        )
+        .unwrap();
+        record(
+            &mut store,
+            &out(lan_dev("h1", None, LanSource::Neighbor, 200)),
+            200,
+        )
+        .unwrap();
         let got = store.list_lan_devices(Some("key")).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!((got[0].first_seen, got[0].last_seen), (100, 200));
         assert_eq!(got[0].ip, None, "IPs are never persisted");
+        assert_eq!(got[0].source, Some(LanSource::Neighbor));
         // An empty outcome stores nothing.
         record(&mut store, &LanScanOutcome::default(), 300).unwrap();
         assert_eq!(store.list_lan_devices(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_hostname_only_device_that_gains_a_mac_is_folded_into_one_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let hk = host_key(store.salt(), "device-a.local");
+        // Day 1: heard announcing, no hardware address.
+        record(
+            &mut store,
+            &out(lan_dev(
+                &hk,
+                Some("device-a.local"),
+                LanSource::Announced,
+                100,
+            )),
+            100,
+        )
+        .unwrap();
+        // Day 2: the same host is now in the neighbor table.
+        record(
+            &mut store,
+            &out(lan_dev(
+                "mac-hash",
+                Some("device-a.local"),
+                LanSource::Both,
+                900,
+            )),
+            900,
+        )
+        .unwrap();
+        let got = store.list_lan_devices(Some("key")).unwrap();
+        assert_eq!(got.len(), 1, "the hostname-keyed row is gone");
+        assert_eq!(got[0].mac_hash, "mac-hash");
+        assert_eq!(got[0].first_seen, 100, "first_seen survives the upgrade");
+        assert_eq!(got[0].source, Some(LanSource::Both));
+        // NEGATIVE CONTROL: an unrelated hostname-keyed row is left alone.
+        let other = host_key(store.salt(), "device-z.local");
+        record(
+            &mut store,
+            &out(lan_dev(
+                &other,
+                Some("device-z.local"),
+                LanSource::Announced,
+                50,
+            )),
+            50,
+        )
+        .unwrap();
+        record(
+            &mut store,
+            &out(lan_dev(
+                "mac-2",
+                Some("device-b.local"),
+                LanSource::Both,
+                60,
+            )),
+            60,
+        )
+        .unwrap();
+        assert_eq!(store.list_lan_devices(Some("key")).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn marking_a_hostname_row_mine_carries_over_to_the_mac_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let hk = host_key(store.salt(), "device-a.local");
+        record(
+            &mut store,
+            &out(lan_dev(
+                &hk,
+                Some("device-a.local"),
+                LanSource::Announced,
+                100,
+            )),
+            100,
+        )
+        .unwrap();
+        store
+            .add_mine(&MineEntry {
+                kind: MineKind::Lan,
+                id_hash: hk.clone(),
+                label: None,
+                added_at: 110,
+            })
+            .unwrap();
+        record(
+            &mut store,
+            &out(lan_dev(
+                "mac-hash",
+                Some("device-a.local"),
+                LanSource::Both,
+                900,
+            )),
+            900,
+        )
+        .unwrap();
+        let got = store.list_lan_devices(Some("key")).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].mine, "still mine under its new key");
     }
 
     /// Reads the live network passively (no sweep: the setting is off). Counts only.
@@ -417,13 +1062,19 @@ mod tests {
     #[ignore]
     fn lan_live() {
         let out = scan(&inputs(false, vec![]), &mut LanState::default()).unwrap();
+        let c = count_devices(&out.devices);
         println!(
-            "lan_live: network={} mine={} sweep_enabled={} devices={} with_vendor={}",
+            "lan_live: network={} mine={} sweep_enabled={} devices={} with_mac={} with_vendor={} with_name={} neighbor={} announced={} both={}",
             out.network.network_key.is_some(),
             out.network.is_mine,
             out.network.sweep_enabled,
-            out.devices.len(),
-            out.devices.iter().filter(|d| d.vendor.is_some()).count()
+            c.total,
+            c.with_mac,
+            c.with_vendor,
+            c.with_name,
+            c.neighbor,
+            c.announced,
+            c.both
         );
     }
 }

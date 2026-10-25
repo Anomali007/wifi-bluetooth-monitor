@@ -3,7 +3,7 @@ import {
   deviceName,
   modeLabel,
   serviceLabel,
-  subnetPrefix,
+  sourceLabel,
   sweepBlockedReason,
 } from "../components/network/lan-logic";
 import type { LanDevice, NetworkInfo } from "../lib/types";
@@ -33,11 +33,6 @@ describe("sweepBlockedReason", () => {
       ["no network", null, on],
       ["network key withheld", { ...open, networkKey: null }, on],
       ["AP not mine", { ...open, isMine: false }, on],
-      ["no subnet", { ...open, subnet: null }, on],
-      ["/22 too large", { ...open, subnet: "192.0.0.0/22" }, on],
-      ["/16 too large", { ...open, subnet: "192.0.0.0/16" }, on],
-      ["/31 nothing to sweep", { ...open, subnet: "192.0.2.4/31" }, on],
-      ["garbage subnet", { ...open, subnet: "not-a-cidr" }, on],
     ];
     let ran = 0;
     for (const [name, n, s] of cases) {
@@ -46,26 +41,18 @@ describe("sweepBlockedReason", () => {
       expect(reason!.length, name).toBeGreaterThan(10);
       ran++;
     }
-    expect(ran).toBe(10);
+    expect(ran).toBe(5);
   });
 
-  it("allows the /23 and /30 boundaries", () => {
-    expect(sweepBlockedReason({ ...open, subnet: "192.0.2.0/23" }, on)).toBeNull();
-    expect(sweepBlockedReason({ ...open, subnet: "192.0.2.4/30" }, on)).toBeNull();
+  it("does not care about the IPv4 subnet: the sweep is one IPv6 packet", () => {
+    for (const subnet of [null, "192.0.2.0/24", "192.0.0.0/16", "192.0.2.4/31"]) {
+      expect(sweepBlockedReason({ ...open, subnet }, on), String(subnet)).toBeNull();
+    }
   });
 
   it("checks the setting before the network", () => {
     expect(sweepBlockedReason(null, { lanActiveSweep: false })).toMatch(/switched off/);
     expect(sweepBlockedReason(null, on)).toMatch(/identified/);
-  });
-});
-
-describe("subnetPrefix", () => {
-  it("parses CIDR and rejects the rest", () => {
-    expect(subnetPrefix("192.0.2.0/24")).toBe(24);
-    expect(subnetPrefix("192.0.2.0/33")).toBeNull();
-    expect(subnetPrefix("192.0.2.0")).toBeNull();
-    expect(subnetPrefix(null)).toBeNull();
   });
 });
 
@@ -80,6 +67,7 @@ describe("labels", () => {
     lastSeen: 0,
     ip: null,
     mine: false,
+    source: null,
     ...over,
   });
 
@@ -87,6 +75,13 @@ describe("labels", () => {
     expect(deviceName(dev({ hostname: "device-1.local" }))).toBe("device-1");
     expect(deviceName(dev({ vendor: "Vendor-A" }))).toBe("Vendor-A device");
     expect(deviceName(dev({}))).toBe("Unnamed device");
+  });
+
+  it("says where a device came from", () => {
+    expect(sourceLabel({ source: "neighbor" })).toBe("Neighbor table");
+    expect(sourceLabel({ source: "announced" })).toBe("Announced");
+    expect(sourceLabel({ source: "both" })).toBe("Both");
+    expect(sourceLabel({ source: null })).toBe("Earlier version");
   });
 
   it("shortens service types", () => {

@@ -514,6 +514,43 @@ pub struct LanDevice {
     /// Filled when listing: whether the MAC hash is in Mine.
     #[serde(default)]
     pub mine: bool,
+    /// How the device was learned: from the neighbor tables, from its mDNS announcements, or
+    /// both (merged across scans when stored). `None` only for rows from before v4.
+    #[serde(default)]
+    pub source: Option<LanSource>,
+}
+
+/// Where a LAN device came from. A device only ever heard announcing has no hardware address
+/// here, so its key is a namespaced hash of its hostname instead of a MAC hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LanSource {
+    /// In the IPv6 neighbor table (or the IPv4 ARP table): has a hardware address.
+    Neighbor,
+    /// Heard announcing itself over mDNS, with no hardware address matched.
+    Announced,
+    /// Both: an mDNS host joined to a neighbor entry.
+    Both,
+}
+
+impl LanSource {
+    /// Stored text form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LanSource::Neighbor => "neighbor",
+            LanSource::Announced => "announced",
+            LanSource::Both => "both",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LanSource> {
+        match s {
+            "neighbor" => Some(LanSource::Neighbor),
+            "announced" => Some(LanSource::Announced),
+            "both" => Some(LanSource::Both),
+            _ => None,
+        }
+    }
 }
 
 /// How the LAN was last observed.
@@ -722,6 +759,7 @@ mod tests {
             last_seen: 2,
             ip: Some("192.0.2.10".into()),
             mine: false,
+            source: Some(LanSource::Both),
         };
         roundtrip(&dev);
         roundtrip(&NetworkInfo::default());

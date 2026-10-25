@@ -1,8 +1,9 @@
-//! The joined Wi-Fi network: SSID and BSSID from CoreWLAN, IPv4 address and netmask from
-//! `getifaddrs`. Read-only; no shell-outs. The raw BSSID is hashed before it leaves this file.
+//! The joined Wi-Fi network: SSID and BSSID from CoreWLAN, IPv4 address and netmask and the
+//! interface's own IPv6 addresses from `getifaddrs`. Read-only; no shell-outs. The raw BSSID is hashed before it leaves this file.
 
 #[cfg(target_os = "macos")]
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 
 #[cfg(target_os = "macos")]
 use crate::model::hash_identifier;
@@ -21,6 +22,8 @@ pub struct Link {
     /// OS interface index of the Wi-Fi interface (matches `rtm_index` in the ARP dump).
     pub if_index: Option<u16>,
     pub subnet: Option<Subnet>,
+    /// The Wi-Fi interface's own IPv6 addresses, so our own entries are never listed as devices.
+    pub own_v6: Vec<Ipv6Addr>,
 }
 
 /// The key a network's devices are stored under: the access point's radio-group id when known,
@@ -73,6 +76,45 @@ fn interface_v4(ifname: &str) -> Option<Subnet> {
     found
 }
 
+/// Every IPv6 address configured on `ifname` (scope bits cleared), via `getifaddrs`.
+#[cfg(target_os = "macos")]
+fn interface_v6(ifname: &str) -> Vec<Ipv6Addr> {
+    use std::ffi::CStr;
+
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list we free with freeifaddrs below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a non-null node of the list getifaddrs returned.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() || ifa.ifa_name.is_null() {
+            continue;
+        }
+        // SAFETY: ifa_name is a NUL-terminated string owned by the list.
+        let name = unsafe { CStr::from_ptr(ifa.ifa_name) };
+        if name.to_bytes() != ifname.as_bytes() {
+            continue;
+        }
+        // SAFETY: the pointer was checked non-null; sa_family tells us the concrete type.
+        let addr = unsafe {
+            if i32::from((*ifa.ifa_addr).sa_family) != libc::AF_INET6 {
+                continue;
+            }
+            let a = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+            Ipv6Addr::from(a.sin6_addr.s6_addr)
+        };
+        found.push(super::nd6::normalize_v6(addr));
+    }
+    // SAFETY: `head` came from getifaddrs and is freed exactly once.
+    unsafe { libc::freeifaddrs(head) };
+    found
+}
+
 #[cfg(target_os = "macos")]
 fn interface_index(ifname: &str) -> Option<u16> {
     let c = std::ffi::CString::new(ifname).ok()?;
@@ -112,6 +154,7 @@ pub fn read_link(salt: &Salt) -> Link {
         group_id: bssid.as_deref().and_then(|b| vendor::group_id(salt, b)),
         if_index: interface_index(&ifname),
         subnet: interface_v4(&ifname),
+        own_v6: interface_v6(&ifname),
     }
 }
 
@@ -146,5 +189,6 @@ mod tests {
             l.if_index.is_some(),
             l.subnet.map(|s| s.prefix)
         );
+        println!("link_live: own_v6={}", l.own_v6.len());
     }
 }
