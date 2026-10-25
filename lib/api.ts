@@ -7,6 +7,7 @@
  * normal build the branch is dead code and the mock module is not bundled.
  */
 import type {
+  HelperStatus,
   Alert,
   History,
   LanDevice,
@@ -43,7 +44,9 @@ export type CommandName =
   | "remove_watchlist"
   | "list_lan_devices"
   | "get_current_network"
-  | "sweep_now";
+  | "sweep_now"
+  | "get_helper_status"
+  | "open_login_items";
 
 async function call<T>(
   cmd: CommandName,
@@ -114,6 +117,12 @@ export const getCurrentNetwork = () => call<NetworkInfo>("get_current_network");
 
 /** Observe the LAN now (the sweep gate still applies); returns the joined network's devices. */
 export const sweepNow = () => call<LanDevice[]>("sweep_now");
+
+/** Off, enabled, or waiting for approval in System Settings, Login Items. */
+export const getHelperStatus = () => call<HelperStatus>("get_helper_status");
+
+/** Open System Settings at Login Items. */
+export const openLoginItems = () => call<void>("open_login_items");
 
 type Unsubscribe = () => void;
 

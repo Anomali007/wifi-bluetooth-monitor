@@ -7,6 +7,7 @@ import {
   forgetPlace,
   getAlerts,
   getCurrentNetwork,
+  getHelperStatus,
   getSettings,
   listLanDevices,
   listMine,
@@ -38,6 +39,7 @@ describe("v2 defaults", () => {
   it("settings defaults match model.rs", () => {
     expect(DEFAULT_SETTINGS.placeRetentionDays).toBe(14);
     expect(DEFAULT_SETTINGS.lanActiveSweep).toBe(false);
+    expect(DEFAULT_SETTINGS.lanNeighborHelper).toBe(false);
     const t = DEFAULT_SETTINGS.alertToggles;
     expect([t.followedAcrossPlaces, t.watchlist, t.newLanDevice]).toEqual([true, true, true]);
   });
@@ -46,6 +48,18 @@ describe("v2 defaults", () => {
     const s = await getSettings();
     expect(s.placeRetentionDays).toBe(14);
     expect(s.lanActiveSweep).toBe(false);
+    expect(s.lanNeighborHelper).toBe(false);
+  });
+});
+
+describe("neighbor helper", () => {
+  it("status follows the setting in the mock", async () => {
+    const s = await getSettings();
+    expect(await getHelperStatus()).toBe("off");
+    await setSettings({ ...s, lanNeighborHelper: true });
+    expect(await getHelperStatus()).toBe("enabled");
+    await setSettings({ ...s, lanNeighborHelper: false });
+    expect(await getHelperStatus()).toBe("off");
   });
 });
 

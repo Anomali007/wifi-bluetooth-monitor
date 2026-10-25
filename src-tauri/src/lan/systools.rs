@@ -1,26 +1,17 @@
-//! Apple's own `/usr/sbin/arp -an` and `/usr/sbin/ndp -an`, run read-only, as the primary
-//! neighbor source on macOS releases where the kernel hides the ARP and ND tables from
-//! non-platform binaries (measured on 27.0.1: `sysctl` returns nothing, the tools still list
-//! the entries). This is the ONLY place the crate spawns a process, and it is deliberately
-//! narrow: absolute paths, fixed arguments, no shell, no user-supplied input, a cleared
-//! environment, a hard timeout, and stdout that is parsed and dropped (never logged).
-//! `tests/lan_listen_only.rs` scans the source and fails if any other `Command::new` appears.
+//! Neighbor-table text from Apple's own `/usr/sbin/arp -an` and `/usr/sbin/ndp -an`, and the
+//! parsers for it. The app does NOT run these tools: macOS 27 shows the neighbor tables to
+//! them only when launchd starts them (see [`super::helper`], an opt-in background item), so
+//! the app reads the files those jobs write. This file spawns nothing; `tests/lan_listen_only.rs`
+//! fails if any file in the crate does.
 //!
-//! Anything that goes wrong (tool missing, non-zero exit, timeout, unparseable output) yields
-//! no rows and a typed [`ToolFailure`]; the caller falls back to announced-only devices.
+//! Anything that goes wrong (no output yet, stale output, unparseable output) yields no rows
+//! and a typed [`ToolFailure`]; the caller falls back to announced-only devices.
 
-use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 use super::arp::{usable_mac, ArpEntry};
 use super::nd6::{normalize_v6, NeighborEntry};
 
-/// How long a tool may run before it is killed.
-pub const TOOL_TIMEOUT: Duration = Duration::from_secs(3);
-/// Output beyond this is ignored (a /23 plus IPv6 is a few tens of KB).
-const MAX_OUTPUT: u64 = 1024 * 1024;
 /// Rows kept per tool.
 const MAX_ROWS: usize = 4096;
 
@@ -43,16 +34,15 @@ impl Tool {
 /// Why a tool gave us nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolFailure {
-    /// The binary is not there (a future macOS may remove it).
-    Missing(Tool),
-    /// It could not be started or exited non-zero.
-    Failed(Tool),
-    /// It ran past [`TOOL_TIMEOUT`] and was killed.
-    TimedOut(Tool),
-    /// It ran, printed something, and none of it looked like neighbor-table output.
+    /// The "full device list" setting is off: nothing is registered, nothing is read.
+    HelperOff(Tool),
+    /// The job's output file does not exist (not approved yet, or not running).
+    NoOutput(Tool),
+    /// The job's output is older than the freshness window, so it is not shown as current.
+    Stale(Tool),
+    /// It printed something, and none of it looked like neighbor-table output.
     Unparseable(Tool),
-    /// The tools ran and printed fine, but none of it was on the Wi-Fi interface: macOS is
-    /// showing this app (and its children) no neighbor entries for the network.
+    /// The files were fresh and parsed fine, but none of it was on the Wi-Fi interface.
     Hidden,
 }
 
@@ -60,86 +50,31 @@ impl ToolFailure {
     /// Plain-language reason for the Network page.
     pub fn reason(self) -> String {
         match self {
-            ToolFailure::Missing(t) => format!("macOS has no {} tool", t.name()),
-            ToolFailure::Failed(t) => format!("the {} tool failed", t.name()),
-            ToolFailure::TimedOut(t) => format!("the {} tool took too long", t.name()),
+            ToolFailure::HelperOff(_) => {
+                "the full device list is off (Settings, Network devices)".to_string()
+            }
+            ToolFailure::NoOutput(t) => {
+                format!(
+                    "the background item has not written {} output yet (check Login Items)",
+                    t.name()
+                )
+            }
+            ToolFailure::Stale(t) => {
+                format!("the background item's {} output is out of date", t.name())
+            }
             ToolFailure::Unparseable(t) => {
-                format!("the {} tool printed something unexpected", t.name())
+                format!("the {} output was not a neighbor table", t.name())
             }
             ToolFailure::Hidden => {
-                "macOS shows this app no neighbor entries for the Wi-Fi network".to_string()
+                "the background item listed no neighbor entries for the Wi-Fi network".to_string()
             }
         }
     }
 }
 
-/// Runs a tool and returns its stdout. A trait so tests can inject output, a missing binary or
-/// a timeout without spawning anything.
+/// Supplies a tool's text. A trait so tests can inject output or a failure.
 pub trait Runner {
     fn run(&self, tool: Tool) -> Result<String, ToolFailure>;
-}
-
-/// The real runner.
-pub struct SystemRunner;
-
-impl Runner for SystemRunner {
-    fn run(&self, tool: Tool) -> Result<String, ToolFailure> {
-        run_with_timeout(tool, TOOL_TIMEOUT)
-    }
-}
-
-fn run_with_timeout(tool: Tool, timeout: Duration) -> Result<String, ToolFailure> {
-    // Two literal absolute paths and one fixed argument: the whole spawn surface of the crate.
-    let mut cmd = match tool {
-        Tool::Arp => Command::new("/usr/sbin/arp"),
-        Tool::Ndp => Command::new("/usr/sbin/ndp"),
-    };
-    let mut child = cmd
-        .arg("-an")
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => ToolFailure::Missing(tool),
-            _ => ToolFailure::Failed(tool),
-        })?;
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(ToolFailure::Failed(tool));
-    };
-    // Drain on a thread so a full pipe can never stall the child past the timeout.
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.take(MAX_OUTPUT).read_to_end(&mut bytes);
-        bytes
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(ToolFailure::TimedOut(tool));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(ToolFailure::Failed(tool));
-            }
-        }
-    };
-    let bytes = reader.join().map_err(|_| ToolFailure::Failed(tool))?;
-    if !status.success() {
-        return Err(ToolFailure::Failed(tool));
-    }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// One usable neighbor row from a tool.
@@ -474,9 +409,9 @@ ff02::fb%en0                            33:33:0:0:0:fb     en0 permanent R
     #[test]
     fn runner_failures_become_typed_reasons_with_no_rows() {
         for failure in [
-            ToolFailure::Missing(Tool::Arp),
-            ToolFailure::Failed(Tool::Arp),
-            ToolFailure::TimedOut(Tool::Arp),
+            ToolFailure::HelperOff(Tool::Arp),
+            ToolFailure::NoOutput(Tool::Arp),
+            ToolFailure::Stale(Tool::Arp),
         ] {
             let r = read_tool(&Fake(Err(failure)), Tool::Arp);
             assert_eq!(r.failure, Some(failure));
@@ -484,8 +419,8 @@ ff02::fb%en0                            33:33:0:0:0:fb     en0 permanent R
             assert!(!failure.reason().is_empty());
         }
         assert_eq!(
-            ToolFailure::Missing(Tool::Ndp).reason(),
-            "macOS has no ndp tool"
+            ToolFailure::NoOutput(Tool::Ndp).reason(),
+            "the background item has not written ndp output yet (check Login Items)"
         );
     }
 
@@ -525,41 +460,5 @@ ff02::fb%en0                            33:33:0:0:0:fb     en0 permanent R
         // Family separation.
         assert!(arp_entries(&n.rows, "en0", 11).is_empty());
         assert!(nd6_entries(&a.rows, "en0", 11).is_empty());
-    }
-
-    #[test]
-    fn real_runner_times_out_and_kills_the_child() {
-        // A zero timeout expires on the first poll, before `arp` can finish. Retry in case the
-        // child wins the race once; it must lose at least once in 50 tries.
-        let mut timed_out = false;
-        for _ in 0..50 {
-            if matches!(
-                run_with_timeout(Tool::Arp, Duration::ZERO),
-                Err(ToolFailure::TimedOut(Tool::Arp))
-            ) {
-                timed_out = true;
-                break;
-            }
-        }
-        assert!(timed_out, "timeout path never taken");
-        // NEGATIVE CONTROL: with a real timeout the same call returns text (macOS) or a typed
-        // failure elsewhere, never a timeout.
-        let r = run_with_timeout(Tool::Arp, TOOL_TIMEOUT);
-        assert!(!matches!(r, Err(ToolFailure::TimedOut(_))));
-    }
-
-    /// Prints counts only. `cargo test -- --ignored systools_live --nocapture`.
-    #[test]
-    #[ignore]
-    fn systools_live() {
-        for tool in [Tool::Arp, Tool::Ndp] {
-            let r = read_tool(&SystemRunner, tool);
-            println!(
-                "systools_live: {} rows={} failure={:?}",
-                tool.name(),
-                r.rows.len(),
-                r.failure.map(|f| f.reason())
-            );
-        }
     }
 }

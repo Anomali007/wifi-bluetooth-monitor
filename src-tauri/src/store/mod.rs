@@ -1636,6 +1636,7 @@ mod tests {
             tracker_min_minutes: 10,
             place_retention_days: 30,
             lan_active_sweep: true,
+            lan_neighbor_helper: true,
         };
         s.set_settings(&custom).unwrap();
         assert_eq!(s.get_settings().unwrap(), custom);

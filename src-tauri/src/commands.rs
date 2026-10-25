@@ -218,8 +218,29 @@ pub async fn set_settings(
     settings: Settings,
 ) -> Result<Settings, String> {
     let mut store = state.store.lock().map_err(lock_err)?;
+    let was = store
+        .get_settings()
+        .map(|s| s.lan_neighbor_helper)
+        .unwrap_or(false);
     store.set_settings(&settings).map_err(|e| e.to_string())?;
-    store.get_settings().map_err(|e| e.to_string())
+    let saved = store.get_settings().map_err(|e| e.to_string())?;
+    if saved.lan_neighbor_helper != was {
+        lan::helper::apply(saved.lan_neighbor_helper);
+    }
+    Ok(saved)
+}
+
+/// State of the opt-in background item (off / enabled / needs approval in Login Items).
+#[tauri::command]
+pub async fn get_helper_status() -> Result<lan::helper::HelperStatus, String> {
+    Ok(lan::helper::status())
+}
+
+/// Open System Settings at Login Items, where the background item is approved.
+#[tauri::command]
+pub async fn open_login_items() -> Result<(), String> {
+    lan::helper::open_login_items();
+    Ok(())
 }
 
 /// Current Bluetooth + Location authorisation.

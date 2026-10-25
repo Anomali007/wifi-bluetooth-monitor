@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   deviceName,
+  helperStatusLine,
   modeLabel,
   neighborStatus,
   serviceLabel,
@@ -109,5 +110,17 @@ describe("neighborStatus", () => {
     expect(neighborStatus({ neighborNote: "  " })).toBeNull();
     expect(neighborStatus(null)).toBeNull();
     expect(neighborStatus(open)).toBeNull();
+  });
+});
+
+describe("helperStatusLine", () => {
+  it("says what each state needs", () => {
+    expect(helperStatusLine("enabled", true)).toMatch(/^On/);
+    expect(helperStatusLine("needsApproval", true)).toMatch(/Login Items/);
+    expect(helperStatusLine("off", false)).toBe("Off.");
+    expect(helperStatusLine("unavailable", true)).toMatch(/Not available/);
+    // NEGATIVE CONTROL: a pending toggle is not reported as on.
+    expect(helperStatusLine("off", true)).toMatch(/Save/);
+    expect(helperStatusLine("off", true)).not.toMatch(/^On/);
   });
 });

@@ -559,6 +559,10 @@ export async function mockInvoke<T>(
       return lanDevices(args?.networkKey as string | null | undefined) as T;
     case "get_current_network":
       return currentNetwork() as T;
+    case "get_helper_status":
+      return (settings.lanNeighborHelper ? "enabled" : "off") as T;
+    case "open_login_items":
+      return undefined as T;
     case "sweep_now": {
       // Same strings as the Rust gate (lan/gate.rs SweepRefusal::message).
       if (!settings.lanActiveSweep)

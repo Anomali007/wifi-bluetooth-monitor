@@ -1,4 +1,4 @@
-import type { LanDevice, NetworkInfo, Settings } from "@/lib/types";
+import type { HelperStatus, LanDevice, NetworkInfo, Settings } from "@/lib/types";
 
 /**
  * Why "Sweep now" would be refused, or null when it may run. Same order and wording as the
@@ -59,4 +59,13 @@ export function deviceName(d: LanDevice): string {
 /** Service types without the leading underscore and protocol: `_http._tcp` -> `http`. */
 export function serviceLabel(s: string): string {
   return s.replace(/\._(tcp|udp)$/i, "").replace(/^_/, "");
+}
+
+/** Plain-language state of the background item. Pure, so it is unit-tested. */
+export function helperStatusLine(status: HelperStatus | null, wanted: boolean): string {
+  if (status === "enabled") return "On: the background item is running.";
+  if (status === "needsApproval")
+    return "Needs your approval: turn it on in System Settings, General, Login Items.";
+  if (status === "unavailable") return "Not available in this build.";
+  return wanted ? "Press Save to turn it on." : "Off.";
 }

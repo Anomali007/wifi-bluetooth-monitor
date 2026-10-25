@@ -7,7 +7,7 @@
     "frontendDist": "../out",
     "devUrl": "http://localhost:3000",
     "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build"
+    "beforeBuildCommand": "bash scripts/render-helper-plists.sh && pnpm build"
   },
   "app": {
     "windows": [
@@ -49,7 +49,10 @@
           "width": 660
         }
       },
-      "files": {},
+      "files": {
+        "Library/LaunchAgents/com.anomali007.wifibtmonitor.arp.plist": "helper/rendered/com.anomali007.wifibtmonitor.arp.plist",
+        "Library/LaunchAgents/com.anomali007.wifibtmonitor.ndp.plist": "helper/rendered/com.anomali007.wifibtmonitor.ndp.plist"
+      },
       "hardenedRuntime": true,
       "minimumSystemVersion": "13.0",
       "entitlements": "Entitlements.plist"

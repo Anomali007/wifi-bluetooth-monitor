@@ -177,7 +177,12 @@ export interface Settings {
   placeRetentionDays: number;
   /** Opt-in LAN sweep (one zero-byte UDP datagram per host), only while the joined access point is mine. default false */
   lanActiveSweep: boolean;
+  /** Opt-in background item that runs Apple's arp and ndp every minute (the app spawns nothing). default false */
+  lanNeighborHelper: boolean;
 }
+
+/** State of the background item (mirror of lan::helper::HelperStatus). */
+export type HelperStatus = "off" | "enabled" | "needsApproval" | "unavailable";
 
 // ---- Places, Mine, watchlist, LAN (mirror of the v2 section of model.rs) ----
 
@@ -284,4 +289,5 @@ export const DEFAULT_SETTINGS: Settings = {
   trackerMinMinutes: 20,
   placeRetentionDays: 14,
   lanActiveSweep: false,
+  lanNeighborHelper: false,
 };

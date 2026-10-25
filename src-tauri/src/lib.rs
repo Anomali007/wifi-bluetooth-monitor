@@ -53,6 +53,8 @@ pub fn run() {
             commands::list_lan_devices,
             commands::get_current_network,
             commands::sweep_now,
+            commands::get_helper_status,
+            commands::open_login_items,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -63,8 +65,15 @@ pub fn run() {
                 )?;
             }
             let dir = app.path().app_data_dir()?;
+            lan::helper::set_data_dir(&dir);
             let store = store::Store::open(&dir)?;
-            let notify = store.get_settings().map(|s| s.notify).unwrap_or(true);
+            lan::helper::prepare_dir(&dir);
+            let settings = store.get_settings().ok();
+            let notify = settings.as_ref().map(|s| s.notify).unwrap_or(true);
+            lan::helper::reconcile(
+                settings.map(|s| s.lan_neighbor_helper).unwrap_or(false),
+                &dir,
+            );
             app.manage(commands::AppState::new(store));
 
             // `setup` runs on the main thread, which CoreLocation requires for the prompt.

@@ -1,9 +1,9 @@
 //! Structural guarantees for the LAN module, checked against its own source: the only file that
 //! transmits is `sweep.rs`, which has exactly two send sites (one ICMPv6 echo request to the
 //! all-nodes address, one zero-byte UDP datagram to port 9 per IPv4 host), there is no TCP
-//! anywhere, the mDNS socket is receive-only, and the only process spawns in the crate are
-//! Apple's `/usr/sbin/arp` and `/usr/sbin/ndp` with the fixed argument `-an`. These are text checks, so each has a negative control proving the scanner can
-//! fail.
+//! anywhere, the mDNS socket is receive-only, and the crate spawns NO process at all (Apple's
+//! `arp -an` and `ndp -an` are run by launchd as bundled background items, never by the app).
+//! These are text checks, so each has a negative control proving the scanner can fail.
 
 use std::fs;
 use std::path::PathBuf;
@@ -164,21 +164,7 @@ fn sweep_negative_controls_the_checks_can_fail() {
     assert!(!hits(&production_code(other_file), TRANSMIT_TOKENS).is_empty());
 }
 
-/// Every `Command::new(<literal>)` in production code under `src/`, with the file it is in.
-fn spawns(src: &str) -> Vec<String> {
-    let code = production_code(src);
-    let mut out = Vec::new();
-    let mut rest = code.as_str();
-    while let Some(i) = rest.find("Command::new(") {
-        let after = &rest[i + "Command::new(".len()..];
-        let end = after.find(')').unwrap_or(after.len());
-        out.push(after[..end].trim().to_string());
-        rest = &after[end..];
-    }
-    out
-}
-
-/// Anything that starts a process, other than the literal-path `Command::new` above.
+/// Anything that starts a process. The app crate must contain none of these in production code.
 const SPAWN_TOKENS: &[&str] = &[
     "Command::new",
     "std::process::Command",
@@ -186,18 +172,28 @@ const SPAWN_TOKENS: &[&str] = &[
     "tokio::process",
     "posix_spawn",
     "libc::system",
+    "libc::popen",
     "libc::fork",
+    "libc::vfork",
     "libc::exec",
     "NSTask",
     "Process::new",
+    "launchctl",
 ];
 
+fn spawn_hits(code: &str) -> Vec<&'static str> {
+    SPAWN_TOKENS
+        .iter()
+        .copied()
+        .filter(|t| code.contains(t))
+        .collect()
+}
+
 #[test]
-fn only_arp_and_ndp_are_ever_spawned() {
-    let allowed = ["\"/usr/sbin/arp\"", "\"/usr/sbin/ndp\""];
+fn the_app_crate_spawns_no_process_at_all() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut stack = vec![src];
-    let (mut scanned, mut spawn_sites) = (0, 0);
+    let mut scanned = 0;
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).unwrap() {
             let p = entry.unwrap().path();
@@ -209,65 +205,64 @@ fn only_arp_and_ndp_are_ever_spawned() {
                 continue;
             }
             scanned += 1;
-            let text = fs::read_to_string(&p).unwrap();
-            let is_systools = p.ends_with("lan/systools.rs");
-            let code = production_code(&text);
-            // Process-spawning tokens (systools' own literal `Command::new` is checked below).
-            for t in SPAWN_TOKENS {
-                if is_systools && *t == "Command::new" {
-                    continue;
-                }
-                assert!(!code.contains(t), "{p:?} contains process token {t}");
-            }
-            for target in spawns(&text) {
-                assert!(is_systools, "{p:?} spawns {target} outside systools.rs");
-                assert!(
-                    allowed.contains(&target.as_str()),
-                    "unexpected spawn {target}"
-                );
-                spawn_sites += 1;
-            }
-            if is_systools {
-                // One fixed argument, a cleared environment, no shell, no formatting into args.
-                assert_eq!(code.matches(".arg(\"-an\")").count(), 1);
-                assert_eq!(code.matches(".arg(").count(), 1, "no other arguments");
-                assert!(!code.contains(".args(") && !code.contains(".envs("));
-                assert!(code.contains(".env_clear()"));
-                assert!(code.contains("stdin(Stdio::null())"));
-                assert!(
-                    !code.contains("\"sh\"") && !code.contains("/bin/sh") && !code.contains("-c\"")
-                );
-                assert!(
-                    !code.contains("log::") && !code.contains("println!"),
-                    "tool output is never logged"
-                );
-            }
+            let code = production_code(&fs::read_to_string(&p).unwrap());
+            assert_eq!(
+                spawn_hits(&code),
+                Vec::<&str>::new(),
+                "{p:?} starts a process"
+            );
         }
     }
     assert!(scanned >= 10, "only scanned {scanned} files");
-    assert_eq!(spawn_sites, 2, "exactly the arp and ndp spawns");
 }
 
 #[test]
 fn spawn_scanner_negative_controls() {
-    // It must catch a different binary, a shell, and a spawn in the wrong place.
-    assert_eq!(
-        spawns("fn f() { Command::new(\"/bin/ls\"); }"),
-        ["\"/bin/ls\""]
-    );
-    assert_eq!(spawns("fn f() { Command::new(cmd) }"), ["cmd"]);
-    assert_eq!(
-        spawns("fn f() { Command::new(\"/usr/sbin/arp\"); Command::new(\"/usr/sbin/ndp\"); }")
-            .len(),
-        2
-    );
-    assert!(spawns("// Command::new(\"x\")\nfn f() {}").is_empty());
-    assert!(
-        spawns("fn f() {}\n#[cfg(test)]\nmod t { fn g() { Command::new(\"x\"); } }").is_empty()
-    );
+    // It must catch every spawn spelling, in production code, and ignore comments and tests.
     for t in SPAWN_TOKENS {
         let sample = format!("fn f() {{ {t}(); }}");
-        assert!(production_code(&sample).contains(t));
+        assert!(spawn_hits(&production_code(&sample)).contains(t), "{t}");
+    }
+    assert!(!spawn_hits(&production_code("fn f() { Command::new(\"/bin/ls\"); }")).is_empty());
+    assert!(spawn_hits(&production_code("// Command::new(\"x\")\nfn f() {}")).is_empty());
+    assert!(spawn_hits(&production_code(
+        "fn f() {}\n#[cfg(test)]\nmod t { fn g() { Command::new(\"x\"); } }"
+    ))
+    .is_empty());
+}
+
+#[test]
+fn the_bundled_jobs_are_exactly_arp_and_ndp_and_nothing_else_ships() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let conf = fs::read_to_string(root.join("tauri.conf.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&conf).unwrap();
+    let files = json["bundle"]["macOS"]["files"].as_object().unwrap();
+    let mut dests: Vec<&str> = files.keys().map(String::as_str).collect();
+    dests.sort();
+    assert_eq!(
+        dests,
+        [
+            "Library/LaunchAgents/com.anomali007.wifibtmonitor.arp.plist",
+            "Library/LaunchAgents/com.anomali007.wifibtmonitor.ndp.plist"
+        ]
+    );
+    for (name, prog) in [("arp", "/usr/sbin/arp"), ("ndp", "/usr/sbin/ndp")] {
+        let t = fs::read_to_string(root.join(format!(
+            "helper/com.anomali007.wifibtmonitor.{name}.plist.in"
+        )))
+        .unwrap();
+        let args: Vec<&str> = t
+            .split("<key>ProgramArguments</key>")
+            .nth(1)
+            .and_then(|r| r.split("</array>").next())
+            .unwrap()
+            .split("<string>")
+            .skip(1)
+            .map(|p| p.split("</string>").next().unwrap())
+            .collect();
+        assert_eq!(args, [prog, "-an"]);
+        // NEGATIVE CONTROL: a wrapper in ProgramArguments would not compare equal.
+        assert_ne!(vec!["/bin/sh", "-c", "arp -an"], args);
     }
 }
 

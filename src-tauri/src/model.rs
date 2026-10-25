@@ -386,6 +386,10 @@ pub struct Settings {
     /// Opt-in LAN sweep: one zero-byte UDP datagram per host, only while the joined access point
     /// is marked mine. The one deliberate exception to listen-only. Default false.
     pub lan_active_sweep: bool,
+    /// Opt-in background item: two launchd jobs (Apple's `arp -an` and `ndp -an`, once a minute)
+    /// whose output the app reads, because macOS 27 hides the neighbor tables from apps. The
+    /// app spawns nothing. Default false.
+    pub lan_neighbor_helper: bool,
 }
 
 impl Default for Settings {
@@ -401,6 +405,7 @@ impl Default for Settings {
             tracker_min_minutes: 20,
             place_retention_days: 14,
             lan_active_sweep: false,
+            lan_neighbor_helper: false,
         }
     }
 }

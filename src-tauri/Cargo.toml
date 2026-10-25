@@ -42,6 +42,7 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-core-wlan = "0.3"
 objc2-core-location = "0.3"
+objc2-service-management = { version = "0.3", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 
 [dev-dependencies]
 tempfile = "3"
