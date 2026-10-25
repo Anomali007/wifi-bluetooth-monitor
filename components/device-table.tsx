@@ -6,6 +6,8 @@ import {
   SECURITY_LABEL,
   TRACKER_LABEL,
   formatTime,
+  groupWifiByRadio,
+  radiosLabel,
 } from "@/lib/format";
 
 export interface DeviceRow {
@@ -16,9 +18,11 @@ export interface DeviceRow {
   rssi: number | null;
   tracker: string | null;
   lastSeen: number;
-  /** Wi-Fi only: vendor from the OUI and the multi-radio group (WP-C renders them). */
+  /** Wi-Fi only: vendor from the OUI and the multi-radio group. */
   vendor: string | null;
   groupId: string | null;
+  /** Wi-Fi only: radios collapsed into this row (1 when ungrouped). */
+  radios: number;
   /** What "Mark as mine" would mark; null when the identifier is withheld. */
   mine: MineTarget | null;
 }
@@ -28,16 +32,30 @@ export function rowsFrom(
   ble: BleObservation[],
 ): DeviceRow[] {
   return [
-    ...wifi.map((w, i) => ({
-      key: `w-${w.bssidHash ?? "x"}-${i}`,
+    ...groupWifiByRadio(wifi).map(({ rep: w, radios }, i) => ({
+      key: `w-${w.groupId ?? w.bssidHash ?? "x"}-${i}`,
       type: "Wi-Fi" as const,
       name: w.ssid ?? "(hidden or withheld)",
-      detail: `${SECURITY_LABEL[w.security]}${w.channel ? `, ch ${w.channel}` : ""}`,
+      detail: [
+        SECURITY_LABEL[w.security],
+        ...(radios.length > 1
+          ? [
+              `ch ${radios
+                .map((r) => r.channel)
+                .filter((c): c is number => c !== null)
+                .join(", ")}`,
+              radiosLabel(radios.length),
+            ]
+          : w.channel
+            ? [`ch ${w.channel}`]
+            : []),
+      ].join(", "),
       rssi: w.rssi,
       tracker: null,
       lastSeen: w.seenAt,
       vendor: w.vendor,
       groupId: w.groupId,
+      radios: radios.length,
       mine: w.groupId
         ? { kind: "wifiGroup" as const, idHash: w.groupId, rotatingAddress: false }
         : w.bssidHash
@@ -59,6 +77,7 @@ export function rowsFrom(
       lastSeen: b.seenAt,
       vendor: null,
       groupId: null,
+      radios: 1,
       mine: {
         kind: "ble" as const,
         idHash: b.peripheralHash,
@@ -83,6 +102,7 @@ export default function DeviceTable({ rows }: { rows: DeviceRow[] }) {
           <tr className="border-b text-left text-muted-foreground">
             <th className="p-2 font-medium">Type</th>
             <th className="p-2 font-medium">Name / SSID</th>
+            <th className="p-2 font-medium">Vendor</th>
             <th className="p-2 font-medium">Details</th>
             <th className="p-2 font-medium">Signal</th>
             <th className="p-2 font-medium">Last seen</th>
@@ -101,6 +121,7 @@ export default function DeviceTable({ rows }: { rows: DeviceRow[] }) {
                   </span>
                 )}
               </td>
+              <td className="p-2 text-muted-foreground">{r.vendor ?? ""}</td>
               <td className="p-2 text-muted-foreground">{r.detail}</td>
               <td className="p-2 tabular-nums">
                 {r.rssi === null ? "n/a" : `${r.rssi} dBm`}
