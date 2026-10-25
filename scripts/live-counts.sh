@@ -36,4 +36,5 @@ rows=$(q "SELECT COALESCE(source, 'unknown'), COUNT(*) FROM lan_devices GROUP BY
 if [ -n "$rows" ]; then printf '%s\n' "$rows" | sed 's/^/  /'; else echo "  none"; fi
 echo "LAN devices with an mDNS hostname:   $(q "SELECT COUNT(*) FROM lan_devices WHERE hostname IS NOT NULL AND hostname <> '';")"
 echo "LAN devices with a vendor:           $(q "SELECT COUNT(*) FROM lan_devices WHERE vendor IS NOT NULL;")"
+echo "  of which 'Private address':        $(q "SELECT COUNT(*) FROM lan_devices WHERE vendor = 'Private address';")"
 echo "distinct LAN networks:               $(q 'SELECT COUNT(DISTINCT network_key) FROM lan_devices;')"

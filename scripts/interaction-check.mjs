@@ -104,6 +104,13 @@ try {
     (await page.getByText("The active sweep is switched off in Settings.").count()) > 0,
   );
   await shot(page, "network");
+  check("no tools-unavailable status line when neighbors are readable", (await page.getByTestId("neighbor-status").count()) === 0);
+  await page.goto(`${base}/network?noTools=1`);
+  await page.getByTestId("neighbor-status").waitFor();
+  check(
+    "tools-unavailable status line names the reason",
+    (await page.getByTestId("neighbor-status").innerText()).startsWith("Showing announced devices only: "),
+  );
 
   // Settings: new sections render; turn the sweep on and the button enables
   await page.goto(`${base}/settings`);

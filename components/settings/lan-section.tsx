@@ -9,10 +9,11 @@ export default function LanSection({ draft, set }: SectionProps) {
       <h2 className="font-semibold">Network devices</h2>
       <p className="text-sm text-muted-foreground">
         The Network page lists devices on the network you are joined to, using
-        only what your Mac has already learned about its neighbors and what
-        devices announce about themselves. This app never connects to a device
-        or looks for open ports. Devices that only speak IPv4 and never
-        announce themselves can be missed.
+        what your Mac has already learned about its neighbors (read through
+        Apple&apos;s built-in arp and ndp tools when macOS hides that from apps)
+        and what devices announce about themselves. This app never connects to
+        a device or looks for open ports. Quiet devices that your Mac has not
+        talked to recently can be missed.
       </p>
       <label className="flex items-start gap-2 text-sm">
         <input
@@ -24,12 +25,12 @@ export default function LanSection({ draft, set }: SectionProps) {
         <span>
           Find quiet devices with an active sweep
           <span className="block text-muted-foreground">
-            Sends a single small packet (an IPv6 echo request) to the
-            all-devices address on your own network, then reads which devices
-            answered. On some macOS versions those answers cannot be read by
-            apps, and then the sweep changes nothing. It only runs while you are joined to an access point you
-            marked as mine, at most every 10 minutes and when you press Sweep
-            now. Off by default.
+            Sends one IPv6 packet to the all-devices address and one small,
+            empty packet to each IPv4 address on your own network (at most 50 a
+            second, on networks up to a /23), then reads which devices answered.
+            It never opens a connection or scans ports. It only runs while you
+            are joined to an access point you marked as mine, at most every 10
+            minutes and when you press Sweep now. Off by default.
           </span>
         </span>
       </label>

@@ -260,6 +260,8 @@ export interface NetworkInfo {
   sweepEnabled: boolean;
   mode: LanMode;
   lastSweepAt: Millis | null;
+  /** Why neighbor tables could not be read (Apple's arp/ndp unavailable); null when they could. */
+  neighborNote: string | null;
 }
 
 export const DEFAULT_SETTINGS: Settings = {

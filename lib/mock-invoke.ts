@@ -409,6 +409,11 @@ function currentNetwork(): NetworkInfo {
     sweepEnabled,
     mode: sweepEnabled ? "sweep" : "passive",
     lastSweepAt: sweepEnabled ? Date.now() - 4 * MIN : null,
+    // `/network?noTools=1` previews the "tools unavailable" status line.
+    neighborNote:
+      typeof window !== "undefined" && window.location.search.includes("noTools=1")
+        ? "macOS has no arp tool"
+        : null,
   };
 }
 

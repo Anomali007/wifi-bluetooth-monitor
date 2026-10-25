@@ -3,8 +3,8 @@ import type { LanDevice, NetworkInfo, Settings } from "@/lib/types";
 /**
  * Why "Sweep now" would be refused, or null when it may run. Same order and wording as the
  * backend gate (`lan::gate::sweep_gate`), so the page can explain before the user clicks.
- * The backend remains the authority; this only explains. The sweep is one IPv6 packet on the
- * link, so the network's IPv4 size no longer matters.
+ * The backend remains the authority; this only explains. (A network larger than a /23 is still
+ * swept, but only with the single IPv6 packet; the backend skips the per-address IPv4 pass.)
  */
 export function sweepBlockedReason(
   network: NetworkInfo | null,
@@ -20,6 +20,15 @@ export function sweepBlockedReason(
     return "This access point is not marked as yours. Mark it as mine first.";
   }
   return null;
+}
+
+/**
+ * The status line shown when neighbor tables could not be read at all (Apple's built-in `arp`
+ * and `ndp` unavailable and macOS hiding the tables from apps), or null when they were.
+ */
+export function neighborStatus(network: Pick<NetworkInfo, "neighborNote"> | null): string | null {
+  const note = network?.neighborNote?.trim();
+  return note ? `Showing announced devices only: ${note}.` : null;
 }
 
 /** Badge text for how the list was gathered. */

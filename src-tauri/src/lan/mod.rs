@@ -1,22 +1,24 @@
-//! Local-network discovery: IPv6 neighbor table, receive-only mDNS, IPv4 ARP (best effort), and
-//! an opt-in sweep. OWNER: WP-D.
+//! Local-network discovery: neighbor tables, receive-only mDNS, and an opt-in sweep. OWNER: WP-D.
 //!
 //! CONTRACT:
-//! - Passive (always): read the IPv6 neighbor table and the IPv4 ARP table via `sysctl`, listen
-//!   on mDNS (never send). Devices come from three sources joined together: neighbor entries
-//!   (hardware address + IPv6/IPv4 address), mDNS announcements (hostname + services per source
-//!   address), and ARP rows. Dropped: incomplete entries, multicast, our own addresses, other
+//! - Passive (always): read the IPv6 and IPv4 neighbor tables via `sysctl` first; where macOS
+//!   hides a family's rows on the Wi-Fi interface from non-platform binaries, read Apple's own
+//!   `/usr/sbin/ndp -an` / `/usr/sbin/arp -an` instead ([`systools`], read-only, fixed args, 3 s
+//!   timeout). Listen on mDNS (never send). Devices come from the joined sources: neighbor rows
+//!   (hardware address + IPv6/IPv4 address) and mDNS announcements (hostname + services per
+//!   source address). Dropped: incomplete entries, permanent/own entries, multicast, other
 //!   interfaces.
 //! - Active sweep: only when `settings.lan_active_sweep` AND the joined access point is in
 //!   Mine, or when `force_sweep` is set by the user's "Sweep now" (the same gate still applies).
-//!   ONE ICMPv6 echo request to `ff02::1` (all nodes on the link), then the neighbor table is
-//!   re-read. No TCP, no port scans, no per-host packets.
+//!   ONE ICMPv6 echo request to `ff02::1`, plus one zero-byte UDP datagram to port 9 of each
+//!   IPv4 host (at most 50/s, subnets up to /23), then the neighbor tables are re-read. No TCP,
+//!   no port scans, no mDNS queries.
 //! - [`scan`] is blocking; callers run it on a blocking thread. [`record`] persists the
 //!   outcome (devices by MAC hash, or a namespaced hostname hash when no MAC is known; never
 //!   an IP).
 //!
-//! Layout: [`gate`] decides (pure), [`sweep`] is the only file that transmits, [`nd6`], [`arp`]
-//! and [`mdns`] only read, [`net`] reads the joined network. [`scan`] reaches `run_sweep` only
+//! Layout: [`gate`] decides (pure), [`sweep`] is the only file that transmits, [`nd6`], [`arp`],
+//! [`systools`] and [`mdns`] only read ([`systools`] is the only file that spawns a process), [`net`] reads the joined network. [`scan`] reaches `run_sweep` only
 //! through [`gate::may_sweep`].
 
 pub mod arp;
@@ -25,6 +27,7 @@ pub mod mdns;
 pub mod nd6;
 pub mod net;
 pub mod sweep;
+pub mod systools;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -65,6 +68,9 @@ pub struct LanState {
     pub last_sweep_at: Option<Millis>,
     /// Network key the last sweep ran on, so a sweep of one network never throttles another.
     pub last_sweep_network: Option<String>,
+    /// Set after a scan that could not read any neighbor table (sysctl empty AND the Apple
+    /// tools unavailable): why, for the Network page. `None` when neighbors were readable.
+    pub neighbor_note: Option<String>,
 }
 
 impl LanState {
@@ -122,6 +128,7 @@ fn build_info(link: &Link, inputs: &LanInputs, state: &LanState) -> NetworkInfo 
         },
         last_sweep_at,
         network_key: key,
+        neighbor_note: state.neighbor_note.clone(),
     }
 }
 
@@ -159,6 +166,89 @@ struct HostRow {
     hostname: String,
     services: BTreeSet<String>,
     ip: Option<IpAddr>,
+}
+
+/// The neighbor rows for the Wi-Fi interface, and why the Apple tools were not enough if so.
+#[derive(Debug, Default)]
+pub struct Neighbors {
+    pub v6: Vec<nd6::NeighborEntry>,
+    pub v4: Vec<arp::ArpEntry>,
+    /// Set only when NO neighbor row could be had for the interface and a tool failed.
+    pub failure: Option<systools::ToolFailure>,
+    /// Counts for the log: which tools ran, how many rows they gave for the Wi-Fi interface, and
+    /// how many usable rows they printed for any interface.
+    pub tools: ToolLog,
+}
+
+/// What the Apple tools did in one pass. Counts only.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ToolLog {
+    pub ndp_ran: bool,
+    pub arp_ran: bool,
+    pub ndp_rows: usize,
+    pub arp_rows: usize,
+    pub ndp_wifi: usize,
+    pub arp_wifi: usize,
+    pub failed: usize,
+    /// Non-empty output lines per tool (all interfaces), to tell "printed nothing" from "printed
+    /// rows we skipped".
+    pub ndp_lines: usize,
+    pub arp_lines: usize,
+}
+
+/// Join the kernel-table reads (the first attempt) with Apple's `arp`/`ndp` (used per family
+/// when sysctl gave no row on the Wi-Fi interface). Never fails; a tool problem is data.
+pub fn gather_neighbors<R: systools::Runner + ?Sized>(
+    link: &Link,
+    sysctl_v6: Vec<nd6::NeighborEntry>,
+    sysctl_v4: Vec<arp::ArpEntry>,
+    runner: &R,
+) -> Neighbors {
+    let (Some(idx), Some(name)) = (link.if_index, link.if_name.as_deref()) else {
+        return Neighbors {
+            v6: sysctl_v6,
+            v4: sysctl_v4,
+            ..Neighbors::default()
+        };
+    };
+    let mut out = Neighbors {
+        v6: sysctl_v6,
+        v4: sysctl_v4,
+        ..Neighbors::default()
+    };
+    let mut first_failure = None;
+    if !out.v6.iter().any(|e| e.if_index == idx) {
+        let r = systools::read_tool(runner, systools::Tool::Ndp);
+        let mine = systools::nd6_entries(&r.rows, name, idx);
+        out.tools.ndp_ran = true;
+        out.tools.ndp_rows = r.rows.len();
+        out.tools.ndp_lines = r.lines;
+        out.tools.ndp_wifi = mine.len();
+        out.tools.failed += usize::from(r.failure.is_some());
+        out.v6.extend(mine);
+        first_failure = first_failure.or(r.failure);
+    }
+    if !out.v4.iter().any(|e| e.if_index == idx) {
+        let r = systools::read_tool(runner, systools::Tool::Arp);
+        let mine = systools::arp_entries(&r.rows, name, idx);
+        out.tools.arp_ran = true;
+        out.tools.arp_rows = r.rows.len();
+        out.tools.arp_lines = r.lines;
+        out.tools.arp_wifi = mine.len();
+        out.tools.failed += usize::from(r.failure.is_some());
+        out.v4.extend(mine);
+        first_failure = first_failure.or(r.failure);
+    }
+    let any = out.v6.iter().any(|e| e.if_index == idx) || out.v4.iter().any(|e| e.if_index == idx);
+    // No Wi-Fi row from any source: say why. A tool that failed is the reason; tools that ran
+    // fine and still gave nothing mean macOS is hiding the entries from this app.
+    let ran = out.tools.ndp_ran || out.tools.arp_ran;
+    out.failure = if any {
+        None
+    } else {
+        first_failure.or(ran.then_some(systools::ToolFailure::Hidden))
+    };
+    out
 }
 
 fn merge_services(into: &mut BTreeSet<String>, from: &BTreeSet<String>) {
@@ -371,12 +461,14 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
     );
     let mut swept = SweepLog::default();
     if let Ok(if_index) = decision {
-        if let Ok(mut sink) = sweep::IcmpSink::new(if_index) {
-            let stats = sweep::run_sweep(&mut sink, if_index);
+        if let Ok(mut sink) = sweep::NetSink::new(if_index) {
+            let stats = sweep::run_sweep(&mut sink, if_index, link.subnet.as_ref());
             swept = SweepLog {
                 ran: true,
-                sent: stats.sent,
+                sent_v6: stats.sent_v6,
+                sent_v4: stats.sent_v4,
                 failed: stats.failed,
+                v4_skipped: stats.v4_skip.is_some(),
             };
             state.last_sweep_at = Some(now);
             state.last_sweep_network = key.clone();
@@ -387,9 +479,18 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
     let network = build_info(&link, inputs, state);
     let mut obs = Observed::default();
     let mut devices = Vec::new();
+    let mut tools = ToolLog::default();
     if let Some(k) = key.as_deref() {
-        obs.neighbors = nd6::read_neighbor_table().unwrap_or_default();
-        obs.arp = arp::read_arp_table().unwrap_or_default();
+        let nb = gather_neighbors(
+            &link,
+            nd6::read_neighbor_table().unwrap_or_default(),
+            arp::read_arp_table().unwrap_or_default(),
+            &systools::SystemRunner,
+        );
+        state.neighbor_note = nb.failure.map(systools::ToolFailure::reason);
+        tools = nb.tools;
+        obs.neighbors = nb.v6;
+        obs.arp = nb.v4;
         obs.heard = mdns.snapshot();
         devices = build_devices(&obs, &link, k, &inputs.salt, now_ms());
     }
@@ -398,7 +499,7 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
     let mc = mdns::listener_counts();
     // Counts only: never a name, address or hash.
     log::info!(
-        "lan: network identified={}, nd6 rows={} (wifi {}), arp rows={}, mdns sources={}, devices={} (neighbor {}, announced {}, both {}; with mac {}, vendor {}, name {}), sweep ran={} sent={} failed={}, mdns bound v4={} v6={}, bind failures={}, datagrams={}",
+        "lan: network identified={}, nd6 rows={} (wifi {}), arp rows={}, mdns sources={}, devices={} (neighbor {}, announced {}, both {}; with mac {}, vendor {}, name {}), sweep ran={} sent v6={} v4={} failed={} v4 skipped={}, tools ndp ran={} lines={} rows={} wifi={}, arp ran={} lines={} rows={} wifi={}, failed={}, mdns bound v4={} v6={}, bind failures={}, datagrams={}",
         key.is_some(),
         obs.neighbors.len(),
         obs.neighbors.iter().filter(|e| on_if(e.if_index)).count(),
@@ -412,8 +513,19 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
         c.with_vendor,
         c.with_name,
         swept.ran,
-        swept.sent,
+        swept.sent_v6,
+        swept.sent_v4,
         swept.failed,
+        swept.v4_skipped,
+        tools.ndp_ran,
+        tools.ndp_lines,
+        tools.ndp_rows,
+        tools.ndp_wifi,
+        tools.arp_ran,
+        tools.arp_lines,
+        tools.arp_rows,
+        tools.arp_wifi,
+        tools.failed,
         mc.bound_v4,
         mc.bound_v6,
         mc.bind_failures,
@@ -425,8 +537,10 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
 #[derive(Debug, Clone, Copy, Default)]
 struct SweepLog {
     ran: bool,
-    sent: usize,
+    sent_v6: usize,
+    sent_v4: usize,
     failed: usize,
+    v4_skipped: bool,
 }
 
 /// The currently joined network without touching the LAN: no sweep, no table reads.
@@ -522,6 +636,7 @@ mod tests {
             bssid_hash: Some("ap-1".into()),
             group_id: None,
             if_index: Some(11),
+            if_name: Some("en0".into()),
             subnet: Some(Subnet {
                 addr: Ipv4Addr::new(192, 0, 2, 7),
                 prefix: 24,
@@ -614,6 +729,7 @@ mod tests {
         let mut st = LanState {
             last_sweep_at: Some(5_000),
             last_sweep_network: Some("ap-1".into()),
+            neighbor_note: None,
         };
         let inp = inputs(true, vec![mine_ap("ap-1")]);
         let n = build_info(&link(), &inp, &st);
@@ -1075,6 +1191,225 @@ mod tests {
             c.neighbor,
             c.announced,
             c.both
+        );
+    }
+
+    // ---- neighbor sources: sysctl first, Apple's tools when sysctl is empty ----
+
+    struct Canned {
+        arp: Result<String, systools::ToolFailure>,
+        ndp: Result<String, systools::ToolFailure>,
+        calls: std::cell::RefCell<Vec<systools::Tool>>,
+    }
+
+    impl systools::Runner for Canned {
+        fn run(&self, tool: systools::Tool) -> Result<String, systools::ToolFailure> {
+            self.calls.borrow_mut().push(tool);
+            match tool {
+                systools::Tool::Arp => self.arp.clone(),
+                systools::Tool::Ndp => self.ndp.clone(),
+            }
+        }
+    }
+
+    fn canned(arp: &str, ndp: &str) -> Canned {
+        Canned {
+            arp: Ok(arp.into()),
+            ndp: Ok(ndp.into()),
+            calls: Default::default(),
+        }
+    }
+
+    const TOOL_ARP: &str = "\
+? (192.0.2.1) at 2:0:0:0:0:1 on en0 ifscope [ethernet]
+? (192.0.2.20) at 2:0:0:0:0:14 on en0 ifscope [ethernet]
+? (192.0.2.21) at (incomplete) on en0 ifscope [ethernet]
+? (192.0.2.7) at 2:0:0:0:0:7 on en0 ifscope permanent [ethernet]
+? (198.51.100.4) at 2:0:0:0:0:4 on en5 ifscope [ethernet]
+";
+    const TOOL_NDP: &str = "\
+Neighbor Linklayer Address Netif Expire St Flgs Prbs
+fe80::1%en0 2:0:0:0:0:1 en0 23h59m55s S R
+2001:db8::14 2:0:0:0:0:14 en0 10h47m46s S
+2001:db8::7 2:0:0:0:0:7 en0 permanent R
+fe80::7%en0 2:0:0:0:0:7 en0 permanent R
+";
+
+    #[test]
+    fn tool_rows_join_with_mdns_by_address_and_read_both() {
+        let r = canned(TOOL_ARP, TOOL_NDP);
+        let got = gather_neighbors(&link(), vec![], vec![], &r);
+        assert_eq!(got.failure, None);
+        assert_eq!(
+            got.v4.len(),
+            2,
+            "incomplete, permanent and other-interface rows dropped"
+        );
+        assert_eq!(
+            got.v6.len(),
+            2,
+            "permanent rows (our own addresses) are dropped"
+        );
+        let obs = Observed {
+            neighbors: got.v6,
+            arp: got.v4,
+            heard: vec![
+                heard(
+                    ip("192.0.2.20"),
+                    0,
+                    Some("printer.local"),
+                    &["_ipp._tcp"],
+                    &[],
+                ),
+                heard(ip("192.0.2.99"), 0, Some("ghost.local"), &["_x._tcp"], &[]),
+            ],
+        };
+        let devs = build(&obs);
+        // MACs .1 and .14 from tools, plus the unmatched announcer.
+        assert_eq!(devs.len(), 3);
+        let printer = by_hash(&devs, &mac_hash(0x14));
+        assert_eq!(printer.source, Some(LanSource::Both));
+        assert_eq!(printer.hostname.as_deref(), Some("printer.local"));
+        assert_eq!(printer.ip.as_deref(), Some("192.0.2.20"));
+        let gw = by_hash(&devs, &mac_hash(1));
+        assert_eq!(gw.source, Some(LanSource::Neighbor));
+        assert_eq!(
+            devs.iter()
+                .filter(|d| d.source == Some(LanSource::Announced))
+                .count(),
+            1
+        );
+        assert_eq!(
+            devs.iter()
+                .filter(|d| d.source == Some(LanSource::Neighbor))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn our_own_tool_rows_are_not_devices() {
+        // 2001:db8::7 is in link().own_v6; its tool row (non-permanent here) must not list.
+        let ndp = "2001:db8::7 2:0:0:0:0:7 en0 1h S\nfe80::50%en0 2:0:0:0:0:50 en0 1h S\n";
+        let r = canned("", ndp);
+        let got = gather_neighbors(&link(), vec![], vec![], &r);
+        let devs = build(&Observed {
+            neighbors: got.v6,
+            arp: got.v4,
+            heard: vec![],
+        });
+        assert_eq!(devs.len(), 2 - 1);
+        assert_eq!(devs[0].mac_hash, mac_hash(0x50));
+    }
+
+    #[test]
+    fn sysctl_rows_win_and_the_tools_are_not_run_for_that_family() {
+        let r = canned(TOOL_ARP, TOOL_NDP);
+        let got = gather_neighbors(
+            &link(),
+            vec![nb("fe80::10", 0x10, 11)],
+            vec![arp_entry(30, 11, 0x30)],
+            &r,
+        );
+        assert!(
+            r.calls.borrow().is_empty(),
+            "sysctl had Wi-Fi rows for both families"
+        );
+        assert_eq!((got.v6.len(), got.v4.len()), (1, 1));
+        // NEGATIVE: sysctl rows on ANOTHER interface do not count, so the tool runs.
+        let r = canned(TOOL_ARP, TOOL_NDP);
+        let got = gather_neighbors(&link(), vec![nb("fe80::10", 0x10, 99)], vec![], &r);
+        assert_eq!(r.calls.borrow().len(), 2);
+        assert_eq!(got.v4.len(), 2);
+        // Only the empty family triggers its tool.
+        let r = canned(TOOL_ARP, TOOL_NDP);
+        gather_neighbors(&link(), vec![nb("fe80::10", 0x10, 11)], vec![], &r);
+        assert_eq!(*r.calls.borrow(), vec![systools::Tool::Arp]);
+    }
+
+    #[test]
+    fn tool_failure_becomes_a_note_only_when_nothing_else_was_readable() {
+        use systools::{Tool, ToolFailure};
+        let both_missing = Canned {
+            arp: Err(ToolFailure::Missing(Tool::Arp)),
+            ndp: Err(ToolFailure::Missing(Tool::Ndp)),
+            calls: Default::default(),
+        };
+        let got = gather_neighbors(&link(), vec![], vec![], &both_missing);
+        assert!(got.v4.is_empty() && got.v6.is_empty());
+        assert_eq!(got.failure, Some(ToolFailure::Missing(Tool::Ndp)));
+        // Announced devices still build with no neighbor rows.
+        let devs = build(&Observed {
+            heard: vec![heard(ip("192.0.2.99"), 0, Some("ghost.local"), &[], &[])],
+            ..Observed::default()
+        });
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].source, Some(LanSource::Announced));
+        // Timeout and garbage are failures too.
+        for f in [
+            Err(ToolFailure::TimedOut(Tool::Arp)),
+            Err(ToolFailure::Failed(Tool::Arp)),
+            Ok("Segmentation fault\n".to_string()),
+        ] {
+            let r = Canned {
+                arp: f,
+                ndp: Ok(String::new()),
+                calls: Default::default(),
+            };
+            let got = gather_neighbors(&link(), vec![], vec![], &r);
+            assert!(got.failure.is_some());
+        }
+        // NEGATIVE CONTROL: one tool failing while the other yields rows is not "announced only".
+        let half = Canned {
+            arp: Err(ToolFailure::Failed(Tool::Arp)),
+            ndp: Ok(TOOL_NDP.into()),
+            calls: Default::default(),
+        };
+        let got = gather_neighbors(&link(), vec![], vec![], &half);
+        assert_eq!(got.failure, None);
+        assert_eq!(got.v6.len(), 2);
+        // Working tools that print nothing for the Wi-Fi interface mean macOS hides the entries.
+        let quiet = canned("", "Neighbor Linklayer Address Netif Expire St Flgs Prbs\n");
+        let got = gather_neighbors(&link(), vec![], vec![], &quiet);
+        assert_eq!(got.failure, Some(ToolFailure::Hidden));
+        assert!(got.tools.ndp_ran && got.tools.arp_ran && got.tools.failed == 0);
+        assert!(got
+            .failure
+            .unwrap()
+            .reason()
+            .contains("no neighbor entries"));
+        // NEGATIVE CONTROL: tools that did not need to run (sysctl had rows) give no note.
+        let r = canned("", "");
+        let got = gather_neighbors(
+            &link(),
+            vec![nb("fe80::10", 0x10, 11)],
+            vec![arp_entry(30, 11, 0x30)],
+            &r,
+        );
+        assert_eq!(got.failure, None);
+    }
+
+    #[test]
+    fn no_interface_name_means_no_tool_run() {
+        let mut l = link();
+        l.if_name = None;
+        let r = canned(TOOL_ARP, TOOL_NDP);
+        let got = gather_neighbors(&l, vec![], vec![], &r);
+        assert!(r.calls.borrow().is_empty());
+        assert!(got.v4.is_empty() && got.failure.is_none());
+    }
+
+    #[test]
+    fn the_note_reaches_network_info() {
+        let st = LanState {
+            neighbor_note: Some("macOS has no arp tool".into()),
+            ..LanState::default()
+        };
+        let n = build_info(&link(), &inputs(false, vec![]), &st);
+        assert_eq!(n.neighbor_note.as_deref(), Some("macOS has no arp tool"));
+        assert_eq!(
+            build_info(&link(), &inputs(false, vec![]), &LanState::default()).neighbor_note,
+            None
         );
     }
 }

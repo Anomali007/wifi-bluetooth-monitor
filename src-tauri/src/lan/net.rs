@@ -1,5 +1,5 @@
 //! The joined Wi-Fi network: SSID and BSSID from CoreWLAN, IPv4 address and netmask and the
-//! interface's own IPv6 addresses from `getifaddrs`. Read-only; no shell-outs. The raw BSSID is hashed before it leaves this file.
+//! interface's own IPv6 addresses from `getifaddrs`. Read-only. The raw BSSID is hashed before it leaves this file.
 
 #[cfg(target_os = "macos")]
 use std::net::Ipv4Addr;
@@ -21,6 +21,8 @@ pub struct Link {
     pub group_id: Option<String>,
     /// OS interface index of the Wi-Fi interface (matches `rtm_index` in the ARP dump).
     pub if_index: Option<u16>,
+    /// The Wi-Fi interface's name (`en0`), to pick its rows out of `arp`/`ndp` output.
+    pub if_name: Option<String>,
     pub subnet: Option<Subnet>,
     /// The Wi-Fi interface's own IPv6 addresses, so our own entries are never listed as devices.
     pub own_v6: Vec<Ipv6Addr>,
@@ -155,6 +157,7 @@ pub fn read_link(salt: &Salt) -> Link {
         if_index: interface_index(&ifname),
         subnet: interface_v4(&ifname),
         own_v6: interface_v6(&ifname),
+        if_name: Some(ifname),
     }
 }
 

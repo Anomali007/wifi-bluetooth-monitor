@@ -2,14 +2,15 @@
 
 import { useCallback, useEffect, useState } from "react";
 import LanDeviceTable from "@/components/network/lan-device-table";
-import { modeLabel, sweepBlockedReason } from "@/components/network/lan-logic";
+import { modeLabel, neighborStatus, sweepBlockedReason } from "@/components/network/lan-logic";
 import { formatAgo } from "@/lib/format";
 import { getCurrentNetwork, getSettings, listLanDevices, sweepNow } from "@/lib/api";
 import type { LanDevice, NetworkInfo, Settings } from "@/lib/types";
 
 /**
- * Devices on the joined network: the IPv6 neighbor table, IPv4 ARP where readable, and mDNS
- * announcements, plus the opt-in sweep (one IPv6 packet to the link's all-nodes address).
+ * Devices on the joined network: the neighbor tables (read through Apple's built-in arp and ndp
+ * tools when macOS hides them from apps) joined with mDNS announcements, plus the opt-in sweep
+ * (one IPv6 packet and one small packet per IPv4 address, only on a network marked as yours).
  */
 export default function NetworkPage() {
   const [network, setNetwork] = useState<NetworkInfo | null>(null);
@@ -79,6 +80,11 @@ export default function NetworkPage() {
         {network?.lastSweepAt != null && (
           <p className="text-sm text-muted-foreground">
             Last sweep {formatAgo(network.lastSweepAt)}.
+          </p>
+        )}
+        {neighborStatus(network) && (
+          <p data-testid="neighbor-status" className="text-sm text-amber-800">
+            {neighborStatus(network)}
           </p>
         )}
         <div className="flex flex-wrap items-center gap-3 pt-1">

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   deviceName,
   modeLabel,
+  neighborStatus,
   serviceLabel,
   sourceLabel,
   sweepBlockedReason,
@@ -18,6 +19,7 @@ const open: NetworkInfo = {
   sweepEnabled: true,
   mode: "passive",
   lastSweepAt: null,
+  neighborNote: null,
 };
 const on = { lanActiveSweep: true };
 
@@ -93,5 +95,19 @@ describe("labels", () => {
     expect(modeLabel(open)).toBe("Passive");
     expect(modeLabel({ ...open, mode: "sweep" })).toBe("Passive + sweep");
     expect(modeLabel(null)).toBe("Passive");
+  });
+});
+
+describe("neighborStatus", () => {
+  it("names the reason when the tools are unavailable, else says nothing", () => {
+    expect(neighborStatus({ neighborNote: "macOS has no arp tool" })).toBe(
+      "Showing announced devices only: macOS has no arp tool.",
+    );
+    expect(neighborStatus({ neighborNote: "the ndp tool took too long" })).toContain("took too long");
+    // NEGATIVE CONTROLS: no note, blank note, no network.
+    expect(neighborStatus({ neighborNote: null })).toBeNull();
+    expect(neighborStatus({ neighborNote: "  " })).toBeNull();
+    expect(neighborStatus(null)).toBeNull();
+    expect(neighborStatus(open)).toBeNull();
   });
 });

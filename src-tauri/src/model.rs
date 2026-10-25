@@ -580,6 +580,9 @@ pub struct NetworkInfo {
     pub sweep_enabled: bool,
     pub mode: LanMode,
     pub last_sweep_at: Option<Millis>,
+    /// Why no neighbor table could be read (Apple's `arp`/`ndp` unavailable), so the page can
+    /// say it is showing announced devices only. `None` when neighbors were readable.
+    pub neighbor_note: Option<String>,
 }
 
 impl Default for NetworkInfo {
@@ -594,6 +597,7 @@ impl Default for NetworkInfo {
             sweep_enabled: false,
             mode: LanMode::Passive,
             last_sweep_at: None,
+            neighbor_note: None,
         }
     }
 }
