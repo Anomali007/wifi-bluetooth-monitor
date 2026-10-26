@@ -1,42 +1,214 @@
-//! Structural guarantees for the LAN module, checked against its own source: the only file that
-//! transmits is `sweep.rs`, which has exactly two send sites (one ICMPv6 echo request to the
-//! all-nodes address, one zero-byte UDP datagram to port 9 per IPv4 host), there is no TCP
-//! anywhere, the mDNS socket is receive-only, and the crate spawns NO process at all (Apple's
-//! `arp -an` and `ndp -an` are run by launchd as bundled background items, never by the app).
-//! These are text checks, so each has a negative control proving the scanner can fail.
+//! Structural guarantees for the LAN module, checked against the crate's own source: the only
+//! file that transmits is `src/lan/sweep.rs`, which has exactly two send sites (one ICMPv6 echo
+//! request to the all-nodes address, one zero-byte UDP datagram to port 9 per IPv4 host), there
+//! is no TCP anywhere, the mDNS socket is receive-only, and the crate spawns NO process at all
+//! (Apple's `arp -an` and `ndp -an` are run by launchd as bundled background items, never by
+//! the app). `NetSink::new` also needs a `GateToken` that only `gate::may_sweep` can build.
+//!
+//! These are text checks over ALL of `src/` (recursively), so each has a negative control that
+//! runs the same scanner over a throwaway source tree and proves it can fail.
+//!
+//! Allowlist: send primitives only in `lan/sweep.rs`. Opening a socket (`UdpSocket`,
+//! `Socket::new`) is allowed there and in `lan/mdns.rs`, whose listener must open its receive
+//! sockets; mdns.rs is held to "no send primitive at all" and exactly two `Socket::new`.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Calls that put bytes on the network or open a connection.
-const TRANSMIT_TOKENS: &[&str] = &[
-    "send_to",
-    ".send(",
-    "send_vectored",
-    "sendmsg",
-    ".connect(",
-    "connect(",
-    "TcpStream",
-    "TcpListener",
-    "UdpSocket::connect",
+use regex::Regex;
+
+/// Anything that puts bytes on the wire or opens a connection. Allowed in `lan/sweep.rs` only.
+const SEND_PATTERNS: &[&str] = &[
+    r"send_to\w*\(",
+    r"sendto",
+    r"libc::send",
+    r"sendmsg",
+    r"send_vectored",
+    r"\.send\(",
+    r"\bsend\s*\(",
+    r"\.connect\(",
+    r"\bconnect\(",
+    r"TcpStream",
+    r"TcpListener",
+    r"UdpSocket::connect",
+    r"libc::write",
 ];
 
-fn lan_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lan")
+/// Opening a socket at all. Allowed in `lan/sweep.rs` and `lan/mdns.rs` (receive-only).
+const SOCKET_PATTERNS: &[&str] = &[r"UdpSocket", r"Socket::new"];
+
+/// Anything that starts a process. The app crate must contain none of these in production code.
+const SPAWN_TOKENS: &[&str] = &[
+    "Command::new",
+    "std::process::Command",
+    "process::Command",
+    "tokio::process",
+    "posix_spawn",
+    "libc::system",
+    "libc::popen",
+    "libc::fork",
+    "libc::vfork",
+    "libc::exec",
+    "NSTask",
+    "Process::new",
+    "launchctl",
+];
+
+/// Never anywhere in the crate.
+const TCP_TOKENS: &[&str] = &["TcpStream", "TcpListener", "Type::STREAM", "Protocol::TCP"];
+
+fn src_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-/// Production code only: drop the `#[cfg(test)]` tail and comment lines.
+fn lan_dir() -> PathBuf {
+    src_dir().join("lan")
+}
+
+// -- Source reading ---------------------------------------------------------------------
+
+/// Index just past the `}` matching the `{` at `open`, skipping comments, strings, raw strings
+/// and char literals (so a `"{"` in a test cannot unbalance it). `None` if unbalanced.
+fn matching_brace(b: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut d = 1;
+                i += 2;
+                while i < b.len() && d > 0 {
+                    if b[i..].starts_with(b"/*") {
+                        d += 1;
+                        i += 2;
+                    } else if b[i..].starts_with(b"*/") {
+                        d -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'r' if (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+                && matches!(b.get(i + 1), Some(b'"') | Some(b'#')) =>
+            {
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while b.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if b.get(j) != Some(&b'"') {
+                    i += 1;
+                    continue;
+                }
+                j += 1;
+                let mut close = vec![b'"'];
+                close.extend(std::iter::repeat_n(b'#', hashes));
+                while j < b.len() && !b[j..].starts_with(&close) {
+                    j += 1;
+                }
+                i = j + close.len();
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'\'' => {
+                if b.get(i + 1) == Some(&b'\\') {
+                    let mut j = i + 3;
+                    while j < b.len() && b[j] != b'\'' {
+                        j += 1;
+                    }
+                    i = j + 1;
+                } else {
+                    // A one-character literal ('{'), or a lifetime ('a).
+                    let len = match b.get(i + 1) {
+                        Some(c) if *c < 0x80 => 1,
+                        Some(c) if *c >= 0xf0 => 4,
+                        Some(c) if *c >= 0xe0 => 3,
+                        Some(_) => 2,
+                        None => 0,
+                    };
+                    if len > 0 && b.get(i + 1 + len) == Some(&b'\'') {
+                        i += 2 + len;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                i += 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Drop ONLY a trailing `#[cfg(test)] mod name { .. }` block: the one that is the last item in
+/// the file. A `#[cfg(test)]` on anything else, or a test module with code after it, strips
+/// nothing, so production code can never hide behind an early `#[cfg(test)]`.
+fn strip_trailing_test_mod(src: &str) -> &str {
+    let re = Regex::new(
+        r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{",
+    )
+    .unwrap();
+    for m in re.find_iter(src) {
+        let open = m.end() - 1;
+        if let Some(end) = matching_brace(src.as_bytes(), open) {
+            if src[end..].trim().is_empty() {
+                return &src[..m.start()];
+            }
+        }
+    }
+    src
+}
+
+/// Production code only: drop the trailing test module and comment lines.
 fn production_code(src: &str) -> String {
-    src.split("#[cfg(test)]")
-        .next()
-        .unwrap_or("")
+    strip_trailing_test_mod(src)
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn hits(code: &str, tokens: &[&str]) -> Vec<String> {
+fn regexes(patterns: &[&str]) -> Vec<(String, Regex)> {
+    patterns
+        .iter()
+        .map(|p| (p.to_string(), Regex::new(p).unwrap()))
+        .collect()
+}
+
+fn pattern_hits(code: &str, patterns: &[&str]) -> Vec<String> {
+    regexes(patterns)
+        .into_iter()
+        .filter(|(_, re)| re.is_match(code))
+        .map(|(p, _)| p)
+        .collect()
+}
+
+fn literal_hits(code: &str, tokens: &[&str]) -> Vec<String> {
     tokens
         .iter()
         .filter(|t| code.contains(*t))
@@ -44,51 +216,183 @@ fn hits(code: &str, tokens: &[&str]) -> Vec<String> {
         .collect()
 }
 
-fn lan_files() -> Vec<(String, String)> {
+/// Every `.rs` file under `root`, as (path relative to root with `/`, contents).
+fn rs_files(root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(lan_dir()).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|e| e == "rs") {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            out.push((name, fs::read_to_string(&path).unwrap()));
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e == "rs") {
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, fs::read_to_string(&p).unwrap()));
+            }
         }
     }
     out.sort();
     out
 }
 
-#[test]
-fn scanner_can_fail_negative_control() {
-    // The checker must flag each token it claims to look for.
-    for t in TRANSMIT_TOKENS {
-        let sample = format!("fn f() {{ x{t}; }}");
-        assert!(
-            !hits(&production_code(&sample), TRANSMIT_TOKENS).is_empty(),
-            "scanner missed {t}"
-        );
+/// Every rule that applies to a whole source tree, as human-readable violations.
+fn violations(root: &Path) -> Vec<String> {
+    let mut bad = Vec::new();
+    for (rel, src) in rs_files(root) {
+        let code = production_code(&src);
+        if rel != "lan/sweep.rs" {
+            for h in pattern_hits(&code, SEND_PATTERNS) {
+                bad.push(format!("{rel}: send primitive /{h}/"));
+            }
+        }
+        if rel != "lan/sweep.rs" && rel != "lan/mdns.rs" {
+            for h in pattern_hits(&code, SOCKET_PATTERNS) {
+                bad.push(format!("{rel}: socket /{h}/"));
+            }
+        }
+        for h in literal_hits(&code, SPAWN_TOKENS) {
+            bad.push(format!("{rel}: process spawn {h}"));
+        }
+        for h in literal_hits(&code, TCP_TOKENS) {
+            bad.push(format!("{rel}: TCP {h}"));
+        }
     }
-    // And it must ignore comments and the test tail.
-    let quiet = "// socket.send_to(..)\nfn f() {}\n#[cfg(test)]\nmod t { fn g() { s.send_to(); } }";
-    assert!(hits(&production_code(quiet), TRANSMIT_TOKENS).is_empty());
+    bad
+}
+
+/// A throwaway source tree for negative controls.
+fn tree(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for (rel, body) in files {
+        let p = dir.path().join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+    dir
+}
+
+fn lan_files() -> Vec<(String, String)> {
+    rs_files(&lan_dir())
+}
+
+/// `send_to`-family call sites in `code`.
+fn send_sites(code: &str) -> usize {
+    Regex::new(r"send_to\w*\(").unwrap().find_iter(code).count()
+}
+
+// -- The checks ---------------------------------------------------------------------------
+
+#[test]
+fn nothing_in_src_transmits_except_sweep_rs() {
+    let files = rs_files(&src_dir());
+    // FLOOR: the whole tree was found, including nested modules.
+    assert!(files.len() >= 20, "found only {} source files", files.len());
+    for must in [
+        "lan/sweep.rs",
+        "lan/mdns.rs",
+        "lan/nd6.rs",
+        "commands.rs",
+        "ble/mod.rs",
+    ] {
+        assert!(files.iter().any(|(n, _)| n == must), "{must} not scanned");
+    }
+    assert_eq!(violations(&src_dir()), Vec::<String>::new());
 }
 
 #[test]
-fn only_sweep_rs_can_transmit() {
-    let files = lan_files();
-    // FLOOR: the module's files were actually found (incl. the new neighbor-table reader).
-    assert!(files.len() >= 8, "found only {} lan files", files.len());
-    assert!(files.iter().any(|(n, _)| n == "nd6.rs"));
-    assert!(files.iter().any(|(n, _)| n == "systools.rs"));
-    let mut checked = 0;
-    for (name, src) in &files {
-        if name == "sweep.rs" {
-            continue;
+fn scanner_negative_controls_every_token_is_caught_outside_the_allowlist() {
+    // Each send token, in a file outside src/lan AND inside src/lan but not sweep.rs.
+    let samples = [
+        "fn f() { s.send_to_anything(a, b); }",
+        "fn f() { s.send_to(a, b); }",
+        "fn f() { unsafe { libc::sendto(fd, p, n, 0, a, l) }; }",
+        "fn f() { unsafe { libc::sendmsg(fd, m, 0) }; }",
+        "fn f() { s.send_vectored(&b); }",
+        "fn f() { s.send(&b); }",
+        "fn f() { s.connect(&a); }",
+        "fn f() { let _ = TcpStream::connect(a); }",
+        "fn f() { unsafe { libc::write(fd, p, 1) }; }",
+        "fn f() { let _ = UdpSocket::bind(a); }",
+        "fn f() { let _ = Socket::new(d, t, p); }",
+        "fn f() { let _ = std::process::Command::new(\"x\"); }",
+    ];
+    for s in samples {
+        for rel in ["commands.rs", "wifi/mod.rs", "lan/arp.rs", "lan/mod.rs"] {
+            let t = tree(&[(rel, s)]);
+            assert!(!violations(t.path()).is_empty(), "missed `{s}` in {rel}");
         }
-        let bad = hits(&production_code(src), TRANSMIT_TOKENS);
-        assert!(bad.is_empty(), "{name} contains transmit calls: {bad:?}");
-        checked += 1;
     }
-    assert!(checked >= 6);
+    // Every spawn spelling, and every TCP spelling, is caught in a file outside src/lan.
+    for t in SPAWN_TOKENS.iter().chain(TCP_TOKENS) {
+        let t_tree = tree(&[("places/mod.rs", &format!("fn f() {{ {t}(); }}"))]);
+        assert!(!violations(t_tree.path()).is_empty(), "missed {t}");
+    }
+    // NEGATIVE CONTROL OF THE CONTROL: the same text in sweep.rs is allowed (except spawn).
+    let t = tree(&[(
+        "lan/sweep.rs",
+        "fn f() { s.send_to(a, b); let _ = Socket::new(d,t,p); }",
+    )]);
+    assert!(violations(t.path()).is_empty());
+    let t = tree(&[("lan/sweep.rs", "fn f() { let _ = Command::new(\"x\"); }")]);
+    assert!(!violations(t.path()).is_empty(), "sweep.rs may not spawn");
+    // The mdns listener may open sockets but not send.
+    let t = tree(&[("lan/mdns.rs", "fn f() { let _ = Socket::new(d, t, p); }")]);
+    assert!(violations(t.path()).is_empty());
+    let t = tree(&[("lan/mdns.rs", "fn f() { s.send_to(a, b); }")]);
+    assert!(!violations(t.path()).is_empty());
+    // Comments and a real trailing test module are ignored.
+    let t = tree(&[(
+        "commands.rs",
+        "// s.send_to(a, b)\nfn f() {}\n#[cfg(test)]\nmod tests { fn g() { let s = \"{\"; x.send_to(a, b); } }\n",
+    )]);
+    assert!(violations(t.path()).is_empty());
+}
+
+#[test]
+fn an_early_cfg_test_cannot_hide_production_code() {
+    // The old scanner kept only the text BEFORE the first `#[cfg(test)]`.
+    let cases = [
+        "#[cfg(test)]\nfn helper() {}\nfn go() { s.send_to(a, b); }\n",
+        "#[cfg(test)]\nmod early { fn t() {} }\nfn go() { s.send_to(a, b); }\n",
+        "#[cfg(test)]\nuse std::fmt;\nfn go() { unsafe { libc::sendto(1, p, 0, 0, a, 0) }; }\n",
+        // A test module that is NOT last, with a second one after it.
+        "#[cfg(test)]\nmod a { }\nfn go() { s.send_to(a, b); }\n#[cfg(test)]\nmod b { }\n",
+    ];
+    for c in cases {
+        let t = tree(&[("commands.rs", c)]);
+        assert!(!violations(t.path()).is_empty(), "hid `{c}`");
+    }
+    // The real shape (production code, then a trailing test module) is still stripped, even
+    // with braces in strings, chars and raw strings inside it.
+    let ok = "fn f() {}\n#[cfg(test)]\nmod tests {\n    fn g() { let _ = '{'; let _ = r#\"}\"#; let _ = \"}\"; s.send_to(a, b); }\n}\n";
+    let t = tree(&[("commands.rs", ok)]);
+    assert!(violations(t.path()).is_empty());
+}
+
+#[test]
+fn sweep_rs_has_exactly_two_send_sites_counted_by_regex() {
+    // NEGATIVE CONTROLS for the counter: variants of the name and a third site.
+    assert_eq!(send_sites("a.send_to(x); b.send_to(y);"), 2);
+    assert_eq!(
+        send_sites("a.send_to(x); b.send_to(y); c.send_to_raw(z);"),
+        3
+    );
+    assert_eq!(
+        send_sites("a.send_to_all (x)"),
+        0,
+        "documented: needs the paren attached"
+    );
+    let files = lan_files();
+    let (_, sweep) = files.iter().find(|(n, _)| n == "sweep.rs").unwrap();
+    assert_eq!(
+        send_sites(&production_code(sweep)),
+        2,
+        "exactly two send sites"
+    );
 }
 
 #[test]
@@ -108,15 +412,11 @@ fn sweep_rs_is_one_icmpv6_echo_plus_zero_byte_udp_to_port_9() {
         "set_broadcast",
         "join_multicast",
         "Command::new",
+        "libc::",
     ] {
         assert!(!code.contains(banned), "sweep.rs must not use {banned}");
     }
-    // Exactly two send sites: the ICMPv6 socket and the UDP socket.
-    assert_eq!(
-        code.matches("send_to(").count(),
-        2,
-        "exactly two send sites"
-    );
+    assert_eq!(send_sites(&code), 2, "exactly two send sites");
     let squashed: String = code.split_whitespace().collect();
     assert_eq!(squashed.matches("self.icmp.send_to(").count(), 1);
     assert_eq!(squashed.matches("self.udp.send_to(&[],").count(), 1);
@@ -154,81 +454,36 @@ fn sweep_rs_is_one_icmpv6_echo_plus_zero_byte_udp_to_port_9() {
 }
 
 #[test]
-fn sweep_negative_controls_the_checks_can_fail() {
-    // A UDP send anywhere else, a third send site, or a TCP socket in sweep.rs would be caught.
-    let extra = "fn f() { s.send_to(a, b); s.send_to(c, d); s.send_to(e, f); }";
-    assert_ne!(production_code(extra).matches("send_to(").count(), 2);
-    let tcp = "fn f() { let _ = Protocol::TCP; }";
-    assert!(production_code(tcp).contains("Protocol::TCP"));
-    let other_file = "fn f() { UdpSocket::bind(a).unwrap().send_to(b, c); }";
-    assert!(!hits(&production_code(other_file), TRANSMIT_TOKENS).is_empty());
-}
-
-/// Anything that starts a process. The app crate must contain none of these in production code.
-const SPAWN_TOKENS: &[&str] = &[
-    "Command::new",
-    "std::process::Command",
-    "process::Command",
-    "tokio::process",
-    "posix_spawn",
-    "libc::system",
-    "libc::popen",
-    "libc::fork",
-    "libc::vfork",
-    "libc::exec",
-    "NSTask",
-    "Process::new",
-    "launchctl",
-];
-
-fn spawn_hits(code: &str) -> Vec<&'static str> {
-    SPAWN_TOKENS
-        .iter()
-        .copied()
-        .filter(|t| code.contains(t))
-        .collect()
-}
-
-#[test]
-fn the_app_crate_spawns_no_process_at_all() {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut stack = vec![src];
-    let mut scanned = 0;
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).unwrap() {
-            let p = entry.unwrap().path();
-            if p.is_dir() {
-                stack.push(p);
-                continue;
-            }
-            if !p.extension().is_some_and(|e| e == "rs") {
-                continue;
-            }
-            scanned += 1;
-            let code = production_code(&fs::read_to_string(&p).unwrap());
+fn the_sink_needs_a_gate_token_only_may_sweep_can_build() {
+    let sweep = production_code(&fs::read_to_string(lan_dir().join("sweep.rs")).unwrap());
+    let new_sig = Regex::new(r"pub fn new\(\s*token: GateToken\s*\)").unwrap();
+    assert!(
+        new_sig.is_match(&sweep),
+        "NetSink::new must take a GateToken"
+    );
+    // Construction sites of the token (struct literal with its private field).
+    let build = Regex::new(r"GateToken\s*\{\s*if_index").unwrap();
+    for (rel, src) in rs_files(&src_dir()) {
+        let code = production_code(&src).replace("pub struct GateToken {", "");
+        let n = build.find_iter(&code).count();
+        if rel == "lan/gate.rs" {
+            // may_sweep, plus the unit-test-only constructor.
             assert_eq!(
-                spawn_hits(&code),
-                Vec::<&str>::new(),
-                "{p:?} starts a process"
+                n, 2,
+                "gate.rs builds the token in may_sweep and for_tests only"
             );
+            assert_eq!(code.matches("Ok(GateToken { if_index })").count(), 1);
+            let attr = Regex::new(r"#\[cfg\(test\)\]\s*pub fn for_tests").unwrap();
+            assert!(attr.is_match(&code), "for_tests must be cfg(test)");
+        } else {
+            assert_eq!(n, 0, "{rel} must not build a GateToken");
         }
     }
-    assert!(scanned >= 10, "only scanned {scanned} files");
-}
-
-#[test]
-fn spawn_scanner_negative_controls() {
-    // It must catch every spawn spelling, in production code, and ignore comments and tests.
-    for t in SPAWN_TOKENS {
-        let sample = format!("fn f() {{ {t}(); }}");
-        assert!(spawn_hits(&production_code(&sample)).contains(t), "{t}");
-    }
-    assert!(!spawn_hits(&production_code("fn f() { Command::new(\"/bin/ls\"); }")).is_empty());
-    assert!(spawn_hits(&production_code("// Command::new(\"x\")\nfn f() {}")).is_empty());
-    assert!(spawn_hits(&production_code(
-        "fn f() {}\n#[cfg(test)]\nmod t { fn g() { Command::new(\"x\"); } }"
-    ))
-    .is_empty());
+    // NEGATIVE CONTROL: the matcher sees a forged token anywhere else.
+    assert!(build.is_match("let t = GateToken { if_index: 3 };"));
+    // And the field stays private.
+    let gate = fs::read_to_string(lan_dir().join("gate.rs")).unwrap();
+    assert!(gate.contains("pub struct GateToken {\n    if_index: u16,\n}"));
 }
 
 #[test]
@@ -267,54 +522,35 @@ fn the_bundled_jobs_are_exactly_arp_and_ndp_and_nothing_else_ships() {
 }
 
 #[test]
-fn no_tcp_anywhere_in_the_crate() {
-    // Not just lan/: nothing under src/ opens or accepts a TCP stream.
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut stack = vec![src];
-    let mut scanned = 0;
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).unwrap() {
-            let p = entry.unwrap().path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().is_some_and(|e| e == "rs") {
-                let code = production_code(&fs::read_to_string(&p).unwrap());
-                for t in ["TcpStream", "TcpListener", "Type::STREAM", "Protocol::TCP"] {
-                    assert!(!code.contains(t), "{p:?} uses {t}");
-                }
-                scanned += 1;
-            }
-        }
-    }
-    assert!(scanned >= 10, "only scanned {scanned} files");
-    // NEGATIVE CONTROL: the matcher does flag a TCP use.
-    let sample = production_code("fn f() { let _ = TcpStream::connect(a); }");
-    assert!(sample.contains("TcpStream"));
-}
-
-#[test]
 fn scan_reaches_the_sweep_only_through_the_gate() {
     let files = lan_files();
     let (_, m) = files.iter().find(|(n, _)| n == "mod.rs").unwrap();
     let code = production_code(m);
     assert_eq!(code.matches("run_sweep(").count(), 1, "one call site");
     assert_eq!(code.matches("NetSink::new(").count(), 1, "one sink");
-    // The call sits inside `if let Ok(if_index) = decision`, and `decision` comes from may_sweep.
+    // The call sits inside `if let Ok(token) = decision`, and `decision` comes from may_sweep.
     let decision = code
         .find("let decision = gate::may_sweep(")
         .expect("gate call");
-    let guard = code.find("if let Ok(if_index) = decision").expect("guard");
+    let guard = code.find("if let Ok(token) = decision").expect("guard");
     let call = code.find("run_sweep(").unwrap();
     assert!(decision < guard && guard < call);
-    // Nothing outside lan/ constructs a sink or runs a sweep.
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    for entry in fs::read_dir(&src).unwrap() {
-        let p = entry.unwrap().path();
-        if p.is_file() && p.extension().is_some_and(|e| e == "rs") {
-            let s = production_code(&fs::read_to_string(&p).unwrap());
-            assert!(!s.contains("run_sweep"), "{p:?} must not sweep");
-            assert!(!s.contains("NetSink"), "{p:?} must not build a sink");
+    // Nothing outside src/lan constructs a sink or runs a sweep (every directory under src/).
+    for (rel, src) in rs_files(&src_dir()) {
+        if rel.starts_with("lan/") {
+            continue;
         }
+        let s = production_code(&src);
+        assert!(!s.contains("run_sweep"), "{rel} must not sweep");
+        assert!(!s.contains("NetSink"), "{rel} must not build a sink");
+    }
+    // And inside lan/, only mod.rs (and sweep.rs itself) mention them.
+    for (name, src) in lan_files() {
+        if name == "mod.rs" || name == "sweep.rs" {
+            continue;
+        }
+        let s = production_code(&src);
+        assert!(!s.contains("run_sweep") && !s.contains("NetSink"), "{name}");
     }
 }
 
@@ -348,7 +584,12 @@ fn mdns_listener_exposes_no_send_surface() {
         "it must join both groups to receive"
     );
     // Receive-only: no send tokens and no way to set an outgoing interface or TTL either.
-    assert!(hits(&code, TRANSMIT_TOKENS).is_empty());
+    assert!(pattern_hits(&code, SEND_PATTERNS).is_empty());
+    assert_eq!(
+        code.matches("Socket::new(").count(),
+        2,
+        "exactly the two receive sockets"
+    );
     for opt in ["set_multicast_if", "set_multicast_hops", "set_ttl"] {
         assert!(
             !code.contains(opt),

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-use super::gate::Subnet;
+use super::gate::{GateToken, Subnet};
 
 /// `ff02::1`: every IPv6 node on the link.
 pub const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
@@ -106,7 +106,9 @@ pub struct NetSink {
 }
 
 impl NetSink {
-    pub fn new(if_index: u16) -> io::Result<NetSink> {
+    /// Needs the [`GateToken`] that only [`super::gate::may_sweep`] hands out.
+    pub fn new(token: GateToken) -> io::Result<NetSink> {
+        let if_index = token.if_index();
         let icmp = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::ICMPV6))?;
         icmp.set_multicast_if_v6(u32::from(if_index))?;
         icmp.set_multicast_hops_v6(1)?;
@@ -373,7 +375,7 @@ mod tests {
         {
             // SAFETY: the argument is a valid NUL-terminated string.
             let lo = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
-            let mut sink = match NetSink::new(lo as u16) {
+            let mut sink = match NetSink::new(GateToken::for_tests(lo as u16)) {
                 Ok(s) => s,
                 Err(e) => {
                     println!("sweep_loopback: socket error kind={:?}", e.kind());

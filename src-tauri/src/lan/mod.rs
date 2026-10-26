@@ -465,9 +465,9 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
         now,
     );
     let mut swept = SweepLog::default();
-    if let Ok(if_index) = decision {
-        if let Ok(mut sink) = sweep::NetSink::new(if_index) {
-            let stats = sweep::run_sweep(&mut sink, if_index, link.subnet.as_ref());
+    if let Ok(token) = decision {
+        if let Ok(mut sink) = sweep::NetSink::new(token) {
+            let stats = sweep::run_sweep(&mut sink, token.if_index(), link.subnet.as_ref());
             swept = SweepLog {
                 ran: true,
                 sent_v6: stats.sent_v6,

@@ -160,16 +160,37 @@ pub fn cadence_ok(force: bool, last: Option<Millis>, now: Millis) -> Result<(), 
     }
 }
 
+/// Proof that [`may_sweep`] said yes. The only way to get one is [`may_sweep`] (the field is
+/// private and nothing else in this module builds one), and [`super::sweep::NetSink::new`]
+/// requires one, so no code path can open a transmitting socket without passing the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateToken {
+    if_index: u16,
+}
+
+impl GateToken {
+    /// The Wi-Fi interface the gate approved.
+    pub fn if_index(&self) -> u16 {
+        self.if_index
+    }
+
+    /// Unit tests only (not compiled into the app or into integration tests).
+    #[cfg(test)]
+    pub fn for_tests(if_index: u16) -> GateToken {
+        GateToken { if_index }
+    }
+}
+
 /// Gate plus cadence: the single decision point `lan::scan` consults before it transmits.
 pub fn may_sweep(
     input: &GateInput,
     force: bool,
     last: Option<Millis>,
     now: Millis,
-) -> Result<u16, SweepRefusal> {
+) -> Result<GateToken, SweepRefusal> {
     let if_index = sweep_gate(input)?;
     cadence_ok(force, last, now)?;
-    Ok(if_index)
+    Ok(GateToken { if_index })
 }
 
 #[cfg(test)]
