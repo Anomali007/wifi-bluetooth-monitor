@@ -30,8 +30,8 @@ mod views;
 
 pub use agent_queries::{OpenError, OpenMode, StoreCounts, BUSY_TIMEOUT};
 pub use proposals::{
-    AddedBy, AuditEntry, NewAudit, NewProposal, Proposal, ProposalStatus, MAX_PENDING_PER_TOOL,
-    MAX_PENDING_PROPOSALS, PROPOSAL_TTL_MS,
+    AddedBy, AuditEntry, DirectAdd, DirectMineRemove, NewAudit, NewProposal, Proposal,
+    ProposalStatus, MAX_PENDING_PER_TOOL, MAX_PENDING_PROPOSALS, PROPOSAL_TTL_MS,
 };
 pub use settings_sync::STALE_SETTINGS;
 

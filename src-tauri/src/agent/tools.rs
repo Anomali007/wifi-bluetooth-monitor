@@ -20,8 +20,8 @@
 use super::output;
 use super::{parse_since, status, AgentError, Ctx};
 use crate::labels::{mine_kind_label, quote};
-use crate::model::{Alert, Millis, MineKind, WatchKind, WatchMatch, WatchlistEntry};
-use crate::store::{AddedBy, NewAudit, NewProposal, OpenMode, Store};
+use crate::model::{Alert, Millis, MineKind, WatchKind, WatchMatch};
+use crate::store::{DirectAdd, DirectMineRemove, NewProposal, OpenMode, Store};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -800,56 +800,46 @@ const MAX_WATCHLIST_RULES: usize = 50;
 /// Most direct (unreviewed) agent edits per rolling hour.
 const MAX_DIRECT_EDITS_PER_HOUR: usize = 10;
 
-fn check_direct_rate(store: &Store, now: Millis) -> Result<(), AgentError> {
-    if store.count_direct_edits_since(now - 3_600_000)? >= MAX_DIRECT_EDITS_PER_HOUR {
-        return Err(AgentError::Failed(format!(
-            "too many direct edits in the last hour (limit {MAX_DIRECT_EDITS_PER_HOUR}); a person \
-             can review them under Settings, Agent requests"
-        )));
-    }
-    Ok(())
-}
-
 fn tool_mine_remove(ctx: &Ctx, a: &Args) -> ToolResult {
     let (kind, id_hash) = mine_args(a)?;
     let mut store = open_edit(ctx)?;
-    let row = store
-        .list_mine_with_source()?
-        .into_iter()
-        .find(|(m, _)| m.kind == kind && m.id_hash == id_hash);
-    let Some((entry, by)) = row else {
-        return Ok(json!({"removed": false}));
-    };
-    if by != AddedBy::Agent {
-        // A person's mark: dropping it lowers a protection, so a person decides.
-        return propose(
+    // One transaction decides: a row an agent itself wrote is removed (and audited) at once;
+    // anything a person made or approved is turned into a proposal instead.
+    let outcome = store.agent_remove_mine(
+        kind,
+        &id_hash,
+        (ctx.now)(),
+        |entry| {
+            format!(
+                "Removed a {} that an agent had marked from Mine{}.",
+                mine_kind_label(kind),
+                entry
+                    .label
+                    .as_deref()
+                    .map(|l| format!(" ({})", quote(l)))
+                    .unwrap_or_default()
+            )
+        },
+        MAX_DIRECT_EDITS_PER_HOUR,
+    )?;
+    match outcome {
+        DirectMineRemove::Absent => Ok(json!({"removed": false})),
+        DirectMineRemove::Removed(_) => Ok(json!({"removed": true})),
+        DirectMineRemove::NotAgent => propose(
             ctx,
             &mut store,
             "mine_remove",
             json!({"kind": kind, "idHash": id_hash}),
-        );
+        ),
+        DirectMineRemove::RateLimited => Err(rate_limited()),
     }
-    let now = (ctx.now)();
-    check_direct_rate(&store, now)?;
-    store.remove_mine(kind, &id_hash)?;
-    let summary = format!(
-        "Removed a {} that an agent had marked from Mine{}.",
-        mine_kind_label(kind),
-        entry
-            .label
-            .as_deref()
-            .map(|l| format!(" ({})", quote(l)))
-            .unwrap_or_default()
-    );
-    store.record_audit(&NewAudit {
-        at: now,
-        tool: "mine_remove",
-        via: "direct",
-        proposal_id: None,
-        summary: &summary,
-        undo: &json!({"op": "mineRestore", "entry": entry, "addedBy": by.as_str()}),
-    })?;
-    Ok(json!({"removed": true}))
+}
+
+fn rate_limited() -> AgentError {
+    AgentError::Failed(format!(
+        "too many direct edits in the last hour (limit {MAX_DIRECT_EDITS_PER_HOUR}); a person \
+         can review them under Settings, Agent requests"
+    ))
 }
 
 fn tool_trusted_list(ctx: &Ctx, _a: &Args) -> ToolResult {
@@ -901,20 +891,7 @@ fn tool_watchlist_add(ctx: &Ctx, a: &Args) -> ToolResult {
         .unwrap_or(WatchMatch::Contains);
     let pattern = clean_text("pattern", &a.require_string("pattern")?, 64)?;
     let mut store = open_edit(ctx)?;
-    let existing: Option<WatchlistEntry> = store.list_watchlist()?.into_iter().find(|w| {
-        w.kind == kind && w.match_mode == mode && w.pattern.eq_ignore_ascii_case(&pattern)
-    });
-    if let Some(w) = existing {
-        return Ok(json!({"added": false, "watch": w}));
-    }
     let now: Millis = (ctx.now)();
-    if store.list_watchlist()?.len() >= MAX_WATCHLIST_RULES {
-        return Err(AgentError::Failed(format!(
-            "the watchlist already has {MAX_WATCHLIST_RULES} rules; a person can remove some in Settings"
-        )));
-    }
-    check_direct_rate(&store, now)?;
-    let w = store.add_watchlist(kind, &pattern, mode, now)?;
     let summary = format!(
         "Added a watchlist rule: {} {} {}.",
         match kind {
@@ -927,15 +904,24 @@ fn tool_watchlist_add(ctx: &Ctx, a: &Args) -> ToolResult {
         },
         quote(&pattern)
     );
-    store.record_audit(&NewAudit {
-        at: now,
-        tool: "watchlist_add",
-        via: "direct",
-        proposal_id: None,
-        summary: &summary,
-        undo: &json!({"op": "watchlistRemove", "entry": w}),
-    })?;
-    Ok(json!({"added": true, "watch": w}))
+    // The duplicate check, the cap, the hourly limit, the insert and the audit row are one
+    // transaction, so parallel calls cannot each pass the checks and together exceed them.
+    match store.agent_add_watchlist(
+        kind,
+        &pattern,
+        mode,
+        now,
+        &summary,
+        MAX_WATCHLIST_RULES,
+        MAX_DIRECT_EDITS_PER_HOUR,
+    )? {
+        DirectAdd::Added(w) => Ok(json!({"added": true, "watch": w})),
+        DirectAdd::Existing(w) => Ok(json!({"added": false, "watch": w})),
+        DirectAdd::CapReached => Err(AgentError::Failed(format!(
+            "the watchlist already has {MAX_WATCHLIST_RULES} rules; a person can remove some in Settings"
+        ))),
+        DirectAdd::RateLimited => Err(rate_limited()),
+    }
 }
 
 fn tool_watchlist_remove(ctx: &Ctx, a: &Args) -> ToolResult {

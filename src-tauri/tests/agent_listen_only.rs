@@ -453,11 +453,10 @@ const ALLOWED_STORE_METHODS: &[&str] = &[
     "ssid_subject_names",
     // the proposal inbox and the audit log
     "create_proposal",
-    "count_direct_edits_since",
     "record_audit",
-    // the two direct edits (they can only add alerts)
-    "add_watchlist",
-    "remove_mine",
+    // the two direct edits, each ONE transaction (check + change + audit)
+    "agent_add_watchlist",
+    "agent_remove_mine",
 ];
 
 /// Allowed in `agent/status.rs` only: the app's own status publisher (`status::publish`, which

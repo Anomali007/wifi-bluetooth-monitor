@@ -8,8 +8,8 @@
 //! `agent_audit` records every change an agent made, directly or through an approved proposal,
 //! with `added_by = agent`, and carries what is needed to undo it.
 
-use super::{Store, StoreResult};
-use crate::model::Millis;
+use super::{from_json, to_json, Store, StoreResult};
+use crate::model::{Millis, MineEntry, MineKind, WatchKind, WatchMatch, WatchlistEntry};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -109,6 +109,25 @@ fn dedupe_key(args: &Value) -> String {
         m.remove("label");
     }
     serde_json::to_string(&v).unwrap_or_default()
+}
+
+/// What an agent's direct `watchlist_add` did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DirectAdd {
+    Added(WatchlistEntry),
+    Existing(WatchlistEntry),
+    CapReached,
+    RateLimited,
+}
+
+/// What an agent's direct `mine_remove` did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DirectMineRemove {
+    Removed(MineEntry),
+    Absent,
+    /// The row was made or approved by a person: not removed.
+    NotAgent,
+    RateLimited,
 }
 
 /// One applied agent change, as recorded.
@@ -269,19 +288,123 @@ impl Store {
 
     /// Append to the audit log. Returns the entry id.
     pub fn record_audit(&mut self, e: &NewAudit<'_>) -> StoreResult<i64> {
-        self.conn.execute(
-            "INSERT INTO agent_audit (at, tool, via, added_by, proposal_id, summary, undo)
-             VALUES (?1, ?2, ?3, 'agent', ?4, ?5, ?6)",
-            params![
-                e.at,
-                e.tool,
-                e.via,
-                e.proposal_id,
-                e.summary,
-                serde_json::to_string(e.undo).unwrap_or_default()
-            ],
+        insert_audit(&self.conn, e)
+    }
+
+    /// An agent's direct `watchlist_add`, atomically: the duplicate check, the rule cap, the
+    /// hourly direct-edit limit, the insert and its audit row are ONE `BEGIN IMMEDIATE`
+    /// transaction, so parallel callers cannot each pass the check and together exceed it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_add_watchlist(
+        &mut self,
+        kind: WatchKind,
+        pattern: &str,
+        mode: WatchMatch,
+        now: Millis,
+        summary: &str,
+        max_rules: usize,
+        max_direct_per_hour: usize,
+    ) -> StoreResult<DirectAdd> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rules = read_watchlist(&tx)?;
+        if let Some(w) = rules.iter().find(|w| {
+            w.kind == kind && w.match_mode == mode && w.pattern.eq_ignore_ascii_case(pattern)
+        }) {
+            return Ok(DirectAdd::Existing(w.clone()));
+        }
+        if rules.len() >= max_rules {
+            return Ok(DirectAdd::CapReached);
+        }
+        if direct_edits_since(&tx, now - 3_600_000)? >= max_direct_per_hour {
+            return Ok(DirectAdd::RateLimited);
+        }
+        tx.execute(
+            "INSERT INTO watchlist (kind, pattern, match_mode, added_at) VALUES (?1, ?2, ?3, ?4)",
+            params![to_json(&kind)?, pattern, to_json(&mode)?, now],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let w = WatchlistEntry {
+            id: tx.last_insert_rowid(),
+            kind,
+            pattern: pattern.to_string(),
+            match_mode: mode,
+            added_at: now,
+        };
+        insert_audit(
+            &tx,
+            &NewAudit {
+                at: now,
+                tool: "watchlist_add",
+                via: "direct",
+                proposal_id: None,
+                summary,
+                undo: &serde_json::json!({"op": "watchlistRemove", "entry": w}),
+            },
+        )?;
+        tx.commit()?;
+        Ok(DirectAdd::Added(w))
+    }
+
+    /// An agent's direct `mine_remove`, atomically, and ONLY for a row an agent itself wrote:
+    /// the lookup, the hourly limit, a `DELETE ... AND added_by = 'agent'` and the audit row are
+    /// one `BEGIN IMMEDIATE` transaction. A row a person made or approved is reported as
+    /// [`DirectMineRemove::NotAgent`] and left alone (the caller turns it into a proposal).
+    pub fn agent_remove_mine(
+        &mut self,
+        kind: MineKind,
+        id_hash: &str,
+        now: Millis,
+        summary: impl FnOnce(&MineEntry) -> String,
+        max_direct_per_hour: usize,
+    ) -> StoreResult<DirectMineRemove> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(Option<String>, Millis, Option<String>, String)> = tx
+            .query_row(
+                "SELECT label, added_at, ssid, added_by FROM mine WHERE kind = ?1 AND id_hash = ?2",
+                params![to_json(&kind)?, id_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((label, added_at, ssid, by)) = row else {
+            return Ok(DirectMineRemove::Absent);
+        };
+        if AddedBy::parse(&by) != AddedBy::Agent {
+            return Ok(DirectMineRemove::NotAgent);
+        }
+        if direct_edits_since(&tx, now - 3_600_000)? >= max_direct_per_hour {
+            return Ok(DirectMineRemove::RateLimited);
+        }
+        let entry = MineEntry {
+            kind,
+            id_hash: id_hash.to_string(),
+            label,
+            ssid,
+            added_at,
+        };
+        let n = tx.execute(
+            "DELETE FROM mine WHERE kind = ?1 AND id_hash = ?2 AND added_by = 'agent'",
+            params![to_json(&kind)?, id_hash],
+        )?;
+        if n == 0 {
+            return Ok(DirectMineRemove::NotAgent);
+        }
+        let text = summary(&entry);
+        insert_audit(
+            &tx,
+            &NewAudit {
+                at: now,
+                tool: "mine_remove",
+                via: "direct",
+                proposal_id: None,
+                summary: &text,
+                undo: &serde_json::json!({"op": "mineRestore", "entry": entry, "addedBy": "agent"}),
+            },
+        )?;
+        tx.commit()?;
+        Ok(DirectMineRemove::Removed(entry))
     }
 
     /// Newest first.
@@ -357,6 +480,57 @@ impl Store {
         )?;
         Ok(n == 1)
     }
+}
+
+fn insert_audit(conn: &rusqlite::Connection, e: &NewAudit<'_>) -> StoreResult<i64> {
+    conn.execute(
+        "INSERT INTO agent_audit (at, tool, via, added_by, proposal_id, summary, undo)
+         VALUES (?1, ?2, ?3, 'agent', ?4, ?5, ?6)",
+        params![
+            e.at,
+            e.tool,
+            e.via,
+            e.proposal_id,
+            e.summary,
+            serde_json::to_string(e.undo).unwrap_or_default()
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn direct_edits_since(conn: &rusqlite::Connection, since: Millis) -> StoreResult<usize> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM agent_audit WHERE via = 'direct' AND at >= ?1",
+        [since],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
+}
+
+fn read_watchlist(conn: &rusqlite::Connection) -> StoreResult<Vec<WatchlistEntry>> {
+    let mut q =
+        conn.prepare("SELECT id, kind, pattern, match_mode, added_at FROM watchlist ORDER BY id")?;
+    let rows = q.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Millis>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, kind, pattern, mode, added_at) = row?;
+        out.push(WatchlistEntry {
+            id,
+            kind: from_json(&kind)?,
+            pattern,
+            match_mode: from_json(&mode)?,
+            added_at,
+        });
+    }
+    Ok(out)
 }
 
 fn audit_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEntry> {

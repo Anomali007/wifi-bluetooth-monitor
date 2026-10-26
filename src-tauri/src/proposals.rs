@@ -310,7 +310,7 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
             hashes.sort();
             state = format!(
                 "trusted_add|{ssid}|{:?}|{hashes:?}|{:?}|{:?}|{}",
-                c.modes.iter().map(|m| m.strength()).collect::<Vec<_>>(),
+                c.modes, // the exact modes: WPA2 and WPA2 Enterprise share a strength but are not the same
                 c.groups,
                 c.alert,
                 c.already
@@ -435,9 +435,10 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
                 match row {
                     Some((m, by)) => {
                         state = format!(
-                            "mine_remove|{kind:?}|{hash}|{:?}|{:?}|{}",
+                            "mine_remove|{kind:?}|{hash}|{:?}|{:?}|{}|{}",
                             m.label,
                             m.ssid,
+                            m.added_at,
                             by.as_str()
                         );
                         warnings.push(match kind {
@@ -469,8 +470,8 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
                     let subject = alert_subject_ssid(store, a.kind, &a.subject_hash);
                     let latest = store.latest_scan_at()?.unwrap_or(0);
                     state = format!(
-                        "dismiss_alert|{id}|{:?}|{}|{}",
-                        a.kind, a.subject_hash, a.dismissed
+                        "dismiss_alert|{id}|{:?}|{:?}|{}|{}",
+                        a.kind, a.severity, a.subject_hash, a.dismissed
                     );
                     if a.last_seen >= latest {
                         warnings.push(
@@ -684,6 +685,13 @@ fn describe_mine_add(
             }
         }
     };
+    // What apply also reads: whether a row already exists (then nothing is written) and
+    // whether the device is still known.
+    let exists = store
+        .list_mine_with_source()?
+        .iter()
+        .any(|(m, _)| m.kind == kind && m.id_hash == hash);
+    state.push_str(&format!("|exists={exists}|blocked={}", blocked.is_some()));
     Ok(format!("Mark this {what} as yours{label_clause}."))
 }
 

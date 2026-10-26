@@ -24,21 +24,23 @@ pub fn is_unsafe_char(c: char) -> bool {
                 | 0x061C
                 | 0x06DD
                 | 0x070F
+                | 0x0890..=0x0891
                 | 0x08E2
                 | 0x180E
                 | 0x200B..=0x200F
                 | 0x202A..=0x202E
                 | 0x2060..=0x2064
-                | 0x2066..=0x206F
+                | 0x2065..=0x206F
                 | 0xFEFF
-                | 0xFFF9..=0xFFFB
+                | 0xFFF0..=0xFFFB
                 | 0x110BD
                 | 0x110CD
                 | 0x13430..=0x1343F
                 | 0x1BCA0..=0x1BCA3
                 | 0x1D173..=0x1D17A
-                // the whole Tags block, assigned or not
-                | 0xE0000..=0xE007F
+                // the whole Tags block and the variation selectors supplement after it
+                // (Default_Ignorable_Code_Point covers E0000..E0FFF, assigned or not)
+                | 0xE0000..=0xE0FFF
                 // Zl, Zp
                 | 0x2028
                 | 0x2029
@@ -58,7 +60,6 @@ pub fn is_unsafe_char(c: char) -> bool {
                 | 0x17B5
                 | 0x180B..=0x180F
                 | 0xFE00..=0xFE0F
-                | 0xE0100..=0xE01EF
         )
         || (u & 0xFFFE) == 0xFFFE
 }
@@ -206,6 +207,69 @@ mod tests {
             strip_unsafe("Caf\u{E9} \u{4E2D}\u{6587}-5G"),
             "Caf\u{E9} \u{4E2D}\u{6587}-5G"
         );
+    }
+
+    /// Unicode 16 Default_Ignorable_Code_Point and general category Cf, embedded so that a
+    /// character added to either in a later version (or one this filter forgot) fails here.
+    #[test]
+    fn every_default_ignorable_and_format_character_is_unsafe() {
+        const DEFAULT_IGNORABLE: &[(u32, u32)] = &[
+            (0x00AD, 0x00AD),
+            (0x034F, 0x034F),
+            (0x061C, 0x061C),
+            (0x115F, 0x1160),
+            (0x17B4, 0x17B5),
+            (0x180B, 0x180F),
+            (0x200B, 0x200F),
+            (0x202A, 0x202E),
+            (0x2060, 0x206F),
+            (0x3164, 0x3164),
+            (0xFE00, 0xFE0F),
+            (0xFEFF, 0xFEFF),
+            (0xFFA0, 0xFFA0),
+            (0xFFF0, 0xFFF8),
+            (0x1BCA0, 0x1BCA3),
+            (0x1D173, 0x1D17A),
+            (0xE0000, 0xE0FFF),
+        ];
+        const CF: &[(u32, u32)] = &[
+            (0x00AD, 0x00AD),
+            (0x0600, 0x0605),
+            (0x061C, 0x061C),
+            (0x06DD, 0x06DD),
+            (0x070F, 0x070F),
+            (0x0890, 0x0891),
+            (0x08E2, 0x08E2),
+            (0x180E, 0x180E),
+            (0x200B, 0x200F),
+            (0x202A, 0x202E),
+            (0x2060, 0x2064),
+            (0x2066, 0x206F),
+            (0xFEFF, 0xFEFF),
+            (0xFFF9, 0xFFFB),
+            (0x110BD, 0x110BD),
+            (0x110CD, 0x110CD),
+            (0x13430, 0x1343F),
+            (0x1BCA0, 0x1BCA3),
+            (0x1D173, 0x1D17A),
+            (0xE0001, 0xE0001),
+            (0xE0020, 0xE007F),
+        ];
+        let mut checked = 0;
+        for (what, list) in [("Default_Ignorable", DEFAULT_IGNORABLE), ("Cf", CF)] {
+            for (lo, hi) in list.iter().copied() {
+                for u in lo..=hi {
+                    let c = char::from_u32(u).unwrap();
+                    assert!(is_unsafe_char(c), "{what}: U+{u:04X} is not filtered");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 4000, "FLOOR: only {checked} code points checked");
+        // NEGATIVE CONTROL: ordinary characters are not.
+        for c in ['A', 'z', '0', '-', ' ', '\u{E9}', '\u{4E2D}', '\u{435}'] {
+            assert!(!is_unsafe_char(c), "{c:?}");
+        }
     }
 
     #[test]
