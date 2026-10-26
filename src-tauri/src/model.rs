@@ -469,6 +469,12 @@ pub struct MineEntry {
     pub kind: MineKind,
     pub id_hash: String,
     pub label: Option<String>,
+    /// The network name that went with a `WifiAp`/`WifiGroup` mark when it was made. The sweep
+    /// gate requires the joined network to carry the same name, because a cloned BSSID (or any
+    /// BSSID in the same radio group) shares the hash but not necessarily the name. `None` for
+    /// other kinds and for marks made before this field existed (those do not allow a sweep).
+    #[serde(default)]
+    pub ssid: Option<String>,
     pub added_at: Millis,
 }
 
@@ -742,6 +748,7 @@ mod tests {
             kind: MineKind::WifiGroup,
             id_hash: "ef".repeat(32),
             label: None,
+            ssid: None,
             added_at: 9,
         };
         assert_eq!(

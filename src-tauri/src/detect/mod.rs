@@ -1357,6 +1357,7 @@ mod tests {
             kind,
             id_hash,
             label: None,
+            ssid: None,
             added_at: T0,
         }
     }

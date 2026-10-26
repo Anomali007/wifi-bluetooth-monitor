@@ -535,6 +535,21 @@ fn scan_reaches_the_sweep_only_through_the_gate() {
     let guard = code.find("if let Ok(token) = decision").expect("guard");
     let call = code.find("run_sweep(").unwrap();
     assert!(decision < guard && guard < call);
+    // The sweep is started only through `run_gated_sweep`, which needs the gate's token and
+    // re-checks the network while it runs; scan calls it once, inside the guard.
+    assert_eq!(
+        code.matches("run_gated_sweep(").count(),
+        1,
+        "one call site"
+    );
+    let gated_call = code.find("run_gated_sweep(&mut").expect("call site");
+    assert!(guard < gated_call);
+    let sig = Regex::new(r"fn run_gated_sweep<[^>]*>\(\s*sink: &mut S,\s*token: gate::GateToken,")
+        .unwrap();
+    assert!(
+        sig.is_match(&code),
+        "run_gated_sweep must take the GateToken"
+    );
     // Nothing outside src/lan constructs a sink or runs a sweep (every directory under src/).
     for (rel, src) in rs_files(&src_dir()) {
         if rel.starts_with("lan/") {

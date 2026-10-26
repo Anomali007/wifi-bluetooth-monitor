@@ -91,6 +91,7 @@ mod tests {
             kind: MineKind::WifiAp,
             id_hash: "ap-1".into(),
             label: None,
+            ssid: None,
             added_at,
         }
     }
@@ -212,6 +213,7 @@ mod tests {
                         kind: MineKind::Lan,
                         id_hash: "new".into(),
                         label: None,
+                        ssid: None,
                         added_at: T0,
                     },
                 ],
@@ -296,6 +298,7 @@ mod tests {
                         kind: MineKind::Lan,
                         id_hash: newcomer.into(),
                         label: None,
+                        ssid: None,
                         added_at: T0,
                     },
                 ],
@@ -317,6 +320,7 @@ mod tests {
                     kind: MineKind::Lan,
                     id_hash: host_key.into(),
                     label: None,
+                    ssid: None,
                     added_at: T0,
                 },
             ],

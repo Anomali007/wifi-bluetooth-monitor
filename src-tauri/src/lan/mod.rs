@@ -53,6 +53,27 @@ fn now_ms() -> Millis {
     crate::pipeline::now_ms()
 }
 
+/// Re-reads the sweep setting and the Mine list while a sweep is running (they are snapshots in
+/// [`LanInputs`]). `None` from the closure means they could not be read, which stops the sweep.
+#[derive(Clone)]
+pub struct LiveInputs(std::sync::Arc<dyn Fn() -> Option<(bool, Vec<MineEntry>)> + Send + Sync>);
+
+impl LiveInputs {
+    pub fn new(f: impl Fn() -> Option<(bool, Vec<MineEntry>)> + Send + Sync + 'static) -> Self {
+        LiveInputs(std::sync::Arc::new(f))
+    }
+
+    fn read(&self) -> Option<(bool, Vec<MineEntry>)> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for LiveInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LiveInputs")
+    }
+}
+
 /// Everything [`scan`] needs, so the signature can stay frozen while the inputs grow.
 #[derive(Debug, Clone)]
 pub struct LanInputs {
@@ -61,6 +82,8 @@ pub struct LanInputs {
     pub mine: Vec<MineEntry>,
     /// The user pressed "Sweep now". Still subject to the sweep gate.
     pub force_sweep: bool,
+    /// Re-reads the setting and Mine during a sweep. `None` = the snapshots above are final.
+    pub live: Option<LiveInputs>,
 }
 
 /// State kept between cycles (sweep cadence). Lives in `AppState`.
@@ -120,6 +143,12 @@ fn gate_for<'a>(link: &Link, inputs: &LanInputs, key: Option<&'a str>) -> GateIn
             &inputs.mine,
             link.bssid_hash.as_deref(),
             link.group_id.as_deref(),
+        ),
+        ssid_ok: gate::ap_ssid_matches(
+            &inputs.mine,
+            link.bssid_hash.as_deref(),
+            link.group_id.as_deref(),
+            link.ssid.as_deref(),
         ),
         if_index: link.if_index,
     }
@@ -485,13 +514,16 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
     let mut swept = SweepLog::default();
     if let Ok(token) = decision {
         if let Ok(mut sink) = sweep::NetSink::new(token) {
-            let stats = sweep::run_sweep(&mut sink, token.if_index(), link.subnet.as_ref());
+            let stats = run_gated_sweep(&mut sink, token, &link, inputs, || {
+                net::read_link(&inputs.salt)
+            });
             swept = SweepLog {
                 ran: true,
                 sent_v6: stats.sent_v6,
                 sent_v4: stats.sent_v4,
                 failed: stats.failed,
                 v4_skipped: stats.v4_skip.is_some(),
+                aborted: stats.aborted,
             };
             state.record_sweep(key.as_deref(), now);
             std::thread::sleep(NEIGHBOR_SETTLE);
@@ -528,7 +560,7 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
     let mc = mdns::listener_counts();
     // Counts only: never a name, address or hash.
     log::info!(
-        "lan: network identified={}, nd6 rows={} (wifi {}), arp rows={}, mdns sources={}, devices={} (neighbor {}, announced {}, both {}; with mac {}, vendor {}, name {}), sweep ran={} sent v6={} v4={} failed={} v4 skipped={}, helper setting={} status={:?}, ndp read={} lines={} rows={} wifi={}, arp read={} lines={} rows={} wifi={}, failed={}, mdns bound v4={} v6={}, bind failures={}, datagrams={}",
+        "lan: network identified={}, nd6 rows={} (wifi {}), arp rows={}, mdns sources={}, devices={} (neighbor {}, announced {}, both {}; with mac {}, vendor {}, name {}), sweep ran={} sent v6={} v4={} failed={} v4 skipped={} aborted={}, helper setting={} status={:?}, ndp read={} lines={} rows={} wifi={}, arp read={} lines={} rows={} wifi={}, failed={}, mdns bound v4={} v6={}, bind failures={}, datagrams={}",
         key.is_some(),
         obs.neighbors.len(),
         obs.neighbors.iter().filter(|e| on_if(e.if_index)).count(),
@@ -546,6 +578,7 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
         swept.sent_v4,
         swept.failed,
         swept.v4_skipped,
+        swept.aborted,
         inputs.settings.lan_neighbor_helper,
         helper::status(),
         tools.ndp_ran,
@@ -565,6 +598,77 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
     Ok(LanScanOutcome { network, devices })
 }
 
+/// What a sweep was approved on. Any difference mid-run stops it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SweepBasis {
+    bssid_hash: Option<String>,
+    group_id: Option<String>,
+    ssid: Option<String>,
+    subnet: Option<gate::Subnet>,
+    if_index: Option<u16>,
+}
+
+impl SweepBasis {
+    fn of(link: &Link) -> SweepBasis {
+        SweepBasis {
+            bssid_hash: link.bssid_hash.clone(),
+            group_id: link.group_id.clone(),
+            ssid: link.ssid.clone(),
+            subnet: link.subnet,
+            if_index: link.if_index,
+        }
+    }
+}
+
+/// Whether a running sweep may continue: the link is the one it started on AND the gate still
+/// says yes with the current setting and Mine list.
+fn sweep_may_continue(
+    basis: &SweepBasis,
+    now_link: &Link,
+    setting_on: bool,
+    mine: &[MineEntry],
+    inputs: &LanInputs,
+) -> bool {
+    if SweepBasis::of(now_link) != *basis {
+        return false;
+    }
+    let fresh = LanInputs {
+        settings: Settings {
+            lan_active_sweep: setting_on,
+            ..inputs.settings.clone()
+        },
+        mine: mine.to_vec(),
+        live: None,
+        ..inputs.clone()
+    };
+    let key = key_of(now_link);
+    gate::sweep_gate(&gate_for(now_link, &fresh, key.as_deref())).is_ok()
+}
+
+/// Run the sweep the gate just approved (`token`), re-reading the link (`read_link`) and the
+/// setting/Mine (`inputs.live`) every [`sweep::RECHECK_EVERY`] sends and stopping on any change.
+fn run_gated_sweep<S: sweep::SweepSink>(
+    sink: &mut S,
+    token: gate::GateToken,
+    link: &Link,
+    inputs: &LanInputs,
+    mut read_link: impl FnMut() -> Link,
+) -> sweep::SweepStats {
+    let basis = SweepBasis::of(link);
+    let mut still_ok = || {
+        let now_link = read_link();
+        let (setting_on, mine) = match &inputs.live {
+            Some(live) => match live.read() {
+                Some(v) => v,
+                None => return false,
+            },
+            None => (inputs.settings.lan_active_sweep, inputs.mine.clone()),
+        };
+        sweep_may_continue(&basis, &now_link, setting_on, &mine, inputs)
+    };
+    sweep::run_sweep(sink, token.if_index(), link.subnet.as_ref(), &mut still_ok)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct SweepLog {
     ran: bool,
@@ -572,6 +676,7 @@ struct SweepLog {
     sent_v4: usize,
     failed: usize,
     v4_skipped: bool,
+    aborted: bool,
 }
 
 /// The currently joined network without touching the LAN: no sweep, no table reads.
@@ -650,6 +755,7 @@ mod tests {
             },
             mine,
             force_sweep: false,
+            live: None,
         }
     }
 
@@ -658,6 +764,7 @@ mod tests {
             kind: MineKind::WifiAp,
             id_hash: hash.into(),
             label: None,
+            ssid: Some("Net-A".into()),
             added_at: 1,
         }
     }
@@ -778,13 +885,171 @@ mod tests {
     }
 
     #[test]
+    fn a_cloned_bssid_with_a_different_name_is_mine_by_hash_but_never_swept() {
+        // L2: same BSSID hash, different SSID than the one saved with the mark.
+        let st = LanState::default();
+        let mut l = link();
+        l.ssid = Some("Net-X".into());
+        let inp = inputs(true, vec![mine_ap("ap-1")]);
+        let n = build_info(&l, &inp, &st);
+        assert!(n.is_mine, "the hash still matches");
+        assert!(!n.sweep_enabled, "but the name does not");
+        let key = key_of(&l);
+        let d = gate::may_sweep(&gate_for(&l, &inp, key.as_deref()), true, None, 1_000);
+        assert_eq!(d.unwrap_err(), SweepRefusal::SsidMismatch);
+        // NEGATIVE CONTROL: the real network (saved name) sweeps.
+        let n = build_info(&link(), &inp, &st);
+        assert!(n.is_mine && n.sweep_enabled);
+        // A mark with no saved name never sweeps (made before names were stored).
+        let mut legacy = mine_ap("ap-1");
+        legacy.ssid = None;
+        let n = build_info(&link(), &inputs(true, vec![legacy]), &st);
+        assert!(n.is_mine && !n.sweep_enabled);
+    }
+
+    // -- L1: the sweep re-checks the network while it runs ------------------------------------
+
+    #[derive(Default)]
+    struct Rec {
+        echoes: usize,
+        udp: usize,
+    }
+
+    impl sweep::SweepSink for Rec {
+        fn send_echo(
+            &mut self,
+            _to: std::net::SocketAddrV6,
+            _packet: &[u8],
+        ) -> std::io::Result<()> {
+            self.echoes += 1;
+            Ok(())
+        }
+        fn send_udp(&mut self, _to: std::net::SocketAddrV4) -> std::io::Result<()> {
+            self.udp += 1;
+            Ok(())
+        }
+        fn pace(&mut self) {}
+    }
+
+    /// The standard link on a private /24 (the sweep refuses public ranges, TEST-NET included).
+    fn sweepable() -> Link {
+        let mut l = link();
+        l.subnet = Some(Subnet {
+            addr: Ipv4Addr::new(192, 168, 77, 7),
+            prefix: 24,
+        });
+        l
+    }
+
+    /// Run a gated sweep on the standard fake /24 link. `change_at` = which re-read (1-based)
+    /// first returns `changed`. Counts sends and re-reads. Nothing touches a real socket.
+    fn gated(
+        changed: Link,
+        change_at: usize,
+        live: Option<LiveInputs>,
+    ) -> (Rec, sweep::SweepStats, usize) {
+        let mut inp = inputs(true, vec![mine_ap("ap-1")]);
+        inp.live = live;
+        let l = sweepable();
+        let mut rec = Rec::default();
+        let mut reads = 0;
+        let stats = run_gated_sweep(&mut rec, gate::GateToken::for_tests(11), &l, &inp, || {
+            reads += 1;
+            if reads >= change_at {
+                changed.clone()
+            } else {
+                sweepable()
+            }
+        });
+        (rec, stats, reads)
+    }
+
+    #[test]
+    fn an_unchanged_network_sweeps_to_the_end_rechecking_along_the_way() {
+        let (rec, stats, reads) = gated(sweepable(), usize::MAX, None);
+        assert!(!stats.aborted);
+        assert_eq!((rec.echoes, rec.udp), (1, 253));
+        assert_eq!(reads, 254 / sweep::RECHECK_EVERY, "re-read every 16 sends");
+    }
+
+    #[test]
+    fn a_changed_bssid_ssid_group_or_subnet_stops_the_sweep_at_the_next_check() {
+        let mut other_bssid = sweepable();
+        other_bssid.bssid_hash = Some("ap-2".into());
+        let mut other_ssid = sweepable();
+        other_ssid.ssid = Some("Net-X".into());
+        let mut other_group = sweepable();
+        other_group.group_id = Some("g-9".into());
+        let mut other_subnet = sweepable();
+        other_subnet.subnet = Some(Subnet {
+            addr: Ipv4Addr::new(198, 51, 100, 7),
+            prefix: 24,
+        });
+        let mut gone = sweepable();
+        gone.bssid_hash = None;
+        gone.ssid = None;
+        for (name, changed) in [
+            ("bssid", other_bssid),
+            ("ssid", other_ssid),
+            ("group", other_group),
+            ("subnet", other_subnet),
+            ("left the network", gone),
+        ] {
+            let (rec, stats, reads) = gated(changed, 1, None);
+            assert!(stats.aborted, "{name}");
+            assert_eq!(reads, 1, "{name}: stops at the first re-read");
+            assert_eq!(
+                rec.echoes + rec.udp,
+                sweep::RECHECK_EVERY,
+                "{name}: 16 sends, no more"
+            );
+        }
+        // A change that appears later stops it later, not at the start.
+        let mut late = sweepable();
+        late.bssid_hash = Some("ap-2".into());
+        let (rec, stats, _) = gated(late, 3, None);
+        assert!(stats.aborted);
+        assert_eq!(rec.echoes + rec.udp, 3 * sweep::RECHECK_EVERY);
+    }
+
+    #[test]
+    fn switching_the_setting_off_or_unmarking_the_network_mid_sweep_stops_it() {
+        let live = |on: bool, mine: Vec<MineEntry>| {
+            Some(LiveInputs::new(move || Some((on, mine.clone()))))
+        };
+        // Setting turned off.
+        let (rec, stats, _) = gated(sweepable(), usize::MAX, live(false, vec![mine_ap("ap-1")]));
+        assert!(stats.aborted);
+        assert_eq!(rec.echoes + rec.udp, sweep::RECHECK_EVERY);
+        // Unmarked.
+        let (_, stats, _) = gated(sweepable(), usize::MAX, live(true, vec![]));
+        assert!(stats.aborted);
+        // Re-marked under another name.
+        let mut renamed = mine_ap("ap-1");
+        renamed.ssid = Some("Net-Z".into());
+        let (_, stats, _) = gated(sweepable(), usize::MAX, live(true, vec![renamed]));
+        assert!(stats.aborted);
+        // Unreadable: fail closed.
+        let (_, stats, _) = gated(sweepable(), usize::MAX, Some(LiveInputs::new(|| None)));
+        assert!(stats.aborted);
+        // NEGATIVE CONTROL: the same live source, unchanged, runs to the end.
+        let (rec, stats, _) = gated(sweepable(), usize::MAX, live(true, vec![mine_ap("ap-1")]));
+        assert!(!stats.aborted);
+        assert_eq!(rec.udp, 253);
+    }
+
+    #[test]
     fn alternating_networks_cannot_reset_a_networks_sweep_cadence() {
         // L3: sweep A, then B, then ask about A again moments later.
         let mut st = LanState::default();
         let now = 1_000_000;
         st.record_sweep(Some("net-a"), now);
         st.record_sweep(Some("net-b"), now + 1_000);
-        assert_eq!(st.last_sweep_for(Some("net-a")), Some(now), "A is remembered");
+        assert_eq!(
+            st.last_sweep_for(Some("net-a")),
+            Some(now),
+            "A is remembered"
+        );
         assert_eq!(st.last_sweep_for(Some("net-b")), Some(now + 1_000));
         let gate_in = |last| gate::cadence_ok(false, last, now + 2_000);
         assert_eq!(
@@ -1221,6 +1486,7 @@ mod tests {
                 kind: MineKind::Lan,
                 id_hash: hk.clone(),
                 label: Some("My Laptop".into()),
+                ssid: None,
                 added_at: 110,
             })
             .unwrap();

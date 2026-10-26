@@ -245,6 +245,7 @@ mod tests {
             kind,
             id_hash: id.into(),
             label: None,
+            ssid: None,
             added_at: T0,
         };
         c.mine = vec![

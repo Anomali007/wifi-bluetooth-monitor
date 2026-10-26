@@ -74,6 +74,18 @@ async fn run_lan(app: &AppHandle, force_sweep: bool) -> Option<LanScanOutcome> {
         settings,
         mine,
         force_sweep,
+        // A running sweep re-reads the setting and Mine from the store and stops if they change.
+        live: Some(lan::LiveInputs::new({
+            let app = app.clone();
+            move || {
+                let state = app.state::<AppState>();
+                let store = state.store.lock().ok()?;
+                Some((
+                    store.get_settings().ok()?.lan_active_sweep,
+                    store.list_mine().ok()?,
+                ))
+            }
+        })),
     };
     let lan_state = Arc::clone(&state.lan);
     let joined = tauri::async_runtime::spawn_blocking(move || {
@@ -305,6 +317,7 @@ pub async fn add_mine(
     kind: MineKind,
     id_hash: String,
     label: Option<String>,
+    ssid: Option<String>,
 ) -> Result<MineEntry, String> {
     let mut store = state.store.lock().map_err(lock_err)?;
     let entry = MineEntry {
@@ -313,6 +326,10 @@ pub async fn add_mine(
         label: label
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty()),
+        // Only access-point marks carry a name; an empty one counts as none.
+        ssid: ssid
+            .filter(|_| matches!(kind, MineKind::WifiAp | MineKind::WifiGroup))
+            .filter(|n| !n.is_empty()),
         added_at: pipeline::now_ms(),
     };
     store.add_mine(&entry).map_err(|e| e.to_string())?;
@@ -383,6 +400,7 @@ pub async fn get_current_network(state: State<'_, AppState>) -> Result<NetworkIn
         settings,
         mine,
         force_sweep: false,
+        live: None,
     };
     // try_lock: a sweep holds this lock for ~12 s and the Network page polls this command, so
     // never queue behind it; a default state only loses the "last sweep" timestamp.
@@ -411,6 +429,7 @@ pub async fn sweep_now(app: AppHandle) -> Result<Vec<LanDevice>, String> {
         settings,
         mine,
         force_sweep: true,
+        live: None,
     };
     let lan_state = Arc::clone(&state.lan);
     let refusal = tauri::async_runtime::spawn_blocking(move || {

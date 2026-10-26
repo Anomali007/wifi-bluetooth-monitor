@@ -97,6 +97,7 @@ fn negative_controls_stay_silent() {
             kind: MineKind::WifiGroup,
             id_hash: group.clone(),
             label: None,
+            ssid: None,
             added_at: 1,
         })
         .unwrap();

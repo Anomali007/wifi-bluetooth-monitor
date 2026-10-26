@@ -167,6 +167,7 @@ fn ingest_with_lan_outcome_and_v2_state_runs_and_stays_quiet() {
             kind: MineKind::WifiAp,
             id_hash: hash_identifier(&salt(), "02:00:00:00:00:01"),
             label: Some("Router-A".into()),
+            ssid: None,
             added_at: 1,
         })
         .unwrap();

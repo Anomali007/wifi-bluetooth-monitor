@@ -151,13 +151,24 @@ pub struct SweepStats {
     pub failed: usize,
     /// Why the IPv4 pass did not run, when it did not.
     pub v4_skip: Option<V4Skip>,
+    /// The run stopped early because the network or the setting changed under it.
+    pub aborted: bool,
 }
+
+/// Sends between checks that the joined network and the setting are unchanged.
+pub const RECHECK_EVERY: usize = 16;
 
 /// Send exactly one echo request to `ff02::1` on interface `if_index`, then one zero-byte UDP
 /// datagram to port 9 of each IPv4 host in `subnet` (when there is one and it qualifies). A
 /// failed send is counted, not retried.
-pub fn run_sweep<S: SweepSink>(sink: &mut S, if_index: u16, subnet: Option<&Subnet>) -> SweepStats {
+pub fn run_sweep<S: SweepSink>(
+    sink: &mut S,
+    if_index: u16,
+    subnet: Option<&Subnet>,
+    still_ok: &mut dyn FnMut() -> bool,
+) -> SweepStats {
     let mut stats = SweepStats::default();
+    let mut attempts = 1usize;
     let to = SocketAddrV6::new(ALL_NODES, 0, 0, u32::from(if_index));
     match sink.send_echo(to, &echo_request(1)) {
         Ok(()) => stats.sent_v6 = 1,
@@ -173,6 +184,13 @@ pub fn run_sweep<S: SweepSink>(sink: &mut S, if_index: u16, subnet: Option<&Subn
                 if i > 0 {
                     sink.pace();
                 }
+                // Every RECHECK_EVERY sends, ask whether the network and the setting are still
+                // what the sweep was approved on; stop at once if not.
+                if attempts % RECHECK_EVERY == 0 && !still_ok() {
+                    stats.aborted = true;
+                    break;
+                }
+                attempts += 1;
                 match sink.send_udp(SocketAddrV4::new(host, DISCARD_PORT)) {
                     Ok(()) => stats.sent_v4 += 1,
                     Err(_) => stats.failed += 1,
@@ -227,7 +245,7 @@ mod tests {
     #[test]
     fn one_echo_request_to_all_nodes_on_the_wifi_interface() {
         let mut rec = Recorder::default();
-        let stats = run_sweep(&mut rec, 11, None);
+        let stats = run_sweep(&mut rec, 11, None, &mut || true);
         assert_eq!(
             stats,
             SweepStats {
@@ -248,7 +266,7 @@ mod tests {
     #[test]
     fn one_echo_plus_one_udp_per_host_on_a_slash_24() {
         let mut rec = Recorder::default();
-        let stats = run_sweep(&mut rec, 11, Some(&subnet(7, 24)));
+        let stats = run_sweep(&mut rec, 11, Some(&subnet(7, 24)), &mut || true);
         // 254 hosts, minus ourselves (.7).
         assert_eq!(rec.udp.len(), 253);
         assert_eq!(rec.echoes.len(), 1);
@@ -278,7 +296,7 @@ mod tests {
             addr: Ipv4Addr::new(10, 0, 0, 9),
             prefix: 23,
         };
-        let stats = run_sweep(&mut rec, 11, Some(&s23));
+        let stats = run_sweep(&mut rec, 11, Some(&s23), &mut || true);
         assert_eq!(rec.udp.len(), 510 - 1);
         assert_eq!(stats.v4_skip, None);
 
@@ -287,7 +305,7 @@ mod tests {
             addr: Ipv4Addr::new(10, 0, 0, 9),
             prefix: 22,
         };
-        let stats = run_sweep(&mut rec, 11, Some(&s22));
+        let stats = run_sweep(&mut rec, 11, Some(&s22), &mut || true);
         assert_eq!(rec.udp.len(), 0, "zero UDP when larger than a /23");
         assert_eq!(rec.echoes.len(), 1, "the ICMPv6 echo still goes out");
         assert_eq!(stats.v4_skip, Some(V4Skip::TooLarge));
@@ -298,7 +316,7 @@ mod tests {
             addr: Ipv4Addr::new(10, 1, 2, 3),
             prefix: 8,
         };
-        run_sweep(&mut rec, 11, Some(&s8));
+        run_sweep(&mut rec, 11, Some(&s8), &mut || true);
         assert!(rec.udp.is_empty());
     }
 
@@ -309,7 +327,7 @@ mod tests {
             addr: Ipv4Addr::new(198, 51, 100, 7),
             prefix: 24,
         };
-        let stats = run_sweep(&mut rec, 11, Some(&public));
+        let stats = run_sweep(&mut rec, 11, Some(&public), &mut || true);
         assert!(rec.udp.is_empty());
         assert_eq!(stats.v4_skip, Some(V4Skip::NotPrivate));
         for a in [
@@ -330,7 +348,7 @@ mod tests {
                 addr: Ipv4Addr::new(192, 168, 77, 1),
                 prefix,
             };
-            run_sweep(&mut rec, 11, Some(&s));
+            run_sweep(&mut rec, 11, Some(&s), &mut || true);
             assert!(rec.udp.is_empty(), "/{prefix}");
             assert_eq!(rec.echoes.len(), 1);
         }
@@ -342,7 +360,7 @@ mod tests {
             fail: true,
             ..Default::default()
         };
-        let stats = run_sweep(&mut rec, 11, Some(&subnet(7, 30)));
+        let stats = run_sweep(&mut rec, 11, Some(&subnet(7, 30)), &mut || true);
         // One echo attempt, and one attempt per IPv4 host, each counted as a failure.
         assert_eq!(rec.echoes.len(), 1, "no retry");
         assert_eq!(stats.sent_v6 + stats.sent_v4, 0);
@@ -359,7 +377,7 @@ mod tests {
         assert_eq!(rec.echoes.len(), 2);
         for if_index in [1u16, 4, 11, 65535] {
             let mut rec = Recorder::default();
-            run_sweep(&mut rec, if_index, Some(&subnet(7, 24)));
+            run_sweep(&mut rec, if_index, Some(&subnet(7, 24)), &mut || true);
             assert_eq!(rec.echoes.len(), 1);
             assert_eq!(rec.echoes[0].0.scope_id(), u32::from(if_index));
         }
@@ -382,11 +400,30 @@ mod tests {
                     return;
                 }
             };
-            let stats = run_sweep(&mut sink, lo as u16, None);
+            let stats = run_sweep(&mut sink, lo as u16, None, &mut || true);
             println!(
                 "sweep_loopback: sent_v6={} failed={}",
                 stats.sent_v6, stats.failed
             );
         }
+    }
+
+    #[test]
+    fn the_sweep_asks_every_sixteen_sends_and_stops_when_told() {
+        // The echo is send 1, so the first question comes after UDP send 15.
+        let mut asked = 0;
+        let mut rec = Recorder::default();
+        let stats = run_sweep(&mut rec, 11, Some(&subnet(7, 24)), &mut || {
+            asked += 1;
+            asked < 3
+        });
+        assert!(stats.aborted);
+        assert_eq!(asked, 3);
+        assert_eq!(rec.echoes.len() + rec.udp.len(), 3 * RECHECK_EVERY);
+        // NEGATIVE CONTROL: answering yes every time sends everything and never aborts.
+        let mut rec = Recorder::default();
+        let stats = run_sweep(&mut rec, 11, Some(&subnet(7, 24)), &mut || true);
+        assert!(!stats.aborted);
+        assert_eq!(rec.udp.len(), 253);
     }
 }

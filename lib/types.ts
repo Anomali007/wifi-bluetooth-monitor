@@ -213,6 +213,11 @@ export interface MineEntry {
   kind: MineKind;
   idHash: string;
   label: string | null;
+  /**
+   * The network name saved with a wifiAp/wifiGroup mark. The active sweep also requires the
+   * joined network to carry this name. Absent on other kinds and on marks made before it existed.
+   */
+  ssid?: string | null;
   addedAt: Millis;
 }
 

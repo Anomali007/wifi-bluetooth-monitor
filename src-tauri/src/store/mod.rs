@@ -315,6 +315,9 @@ impl Store {
             }
             Some(_) => {}
         }
+        // Idempotent and independent of the schema version: the network name saved with an
+        // access-point mark (the sweep gate checks it).
+        add_column_if_missing(&tx, "mine", "ssid", "TEXT")?;
         tx.commit()?;
         Ok(())
     }
@@ -721,7 +724,7 @@ impl Store {
     /// Everything marked mine, oldest first.
     pub fn list_mine(&self) -> StoreResult<Vec<MineEntry>> {
         let mut q = self.conn.prepare(
-            "SELECT kind, id_hash, label, added_at FROM mine ORDER BY added_at, id_hash",
+            "SELECT kind, id_hash, label, added_at, ssid FROM mine ORDER BY added_at, id_hash",
         )?;
         let rows = q.query_map([], |r| {
             Ok((
@@ -729,15 +732,17 @@ impl Store {
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, Millis>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (kind, id_hash, label, added_at) = row?;
+            let (kind, id_hash, label, added_at, ssid) = row?;
             out.push(MineEntry {
                 kind: from_json(&kind)?,
                 id_hash,
                 label,
+                ssid,
                 added_at,
             });
         }
@@ -747,9 +752,10 @@ impl Store {
     /// Mark something mine. Marking it again updates the label and keeps `added_at`.
     pub fn add_mine(&mut self, e: &MineEntry) -> StoreResult<()> {
         self.conn.execute(
-            "INSERT INTO mine (kind, id_hash, label, added_at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(kind, id_hash) DO UPDATE SET label = excluded.label",
-            params![to_json(&e.kind)?, e.id_hash, e.label, e.added_at],
+            "INSERT INTO mine (kind, id_hash, label, added_at, ssid) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(kind, id_hash) DO UPDATE SET label = excluded.label,
+                 ssid = COALESCE(excluded.ssid, ssid)",
+            params![to_json(&e.kind)?, e.id_hash, e.label, e.added_at, e.ssid],
         )?;
         Ok(())
     }
@@ -1316,6 +1322,7 @@ mod tests {
             kind,
             id_hash: id.into(),
             label: None,
+            ssid: None,
             added_at: at,
         }
     }
@@ -1753,5 +1760,55 @@ mod tests {
         let p = d.path().join("a").join("b");
         Store::open(&p).unwrap();
         assert!(p.join(DB_FILE).exists());
+    }
+
+    #[test]
+    fn a_mine_mark_keeps_its_ssid_and_a_remark_without_one_does_not_erase_it() {
+        let (_d, mut s) = open();
+        let mut e = MineEntry {
+            kind: MineKind::WifiAp,
+            id_hash: "b1".into(),
+            label: None,
+            ssid: Some("Net-A".into()),
+            added_at: 10,
+        };
+        s.add_mine(&e).unwrap();
+        assert_eq!(s.list_mine().unwrap()[0].ssid.as_deref(), Some("Net-A"));
+        // Re-marking with only a new label keeps the saved name.
+        e.ssid = None;
+        e.label = Some("Home".into());
+        s.add_mine(&e).unwrap();
+        let got = &s.list_mine().unwrap()[0];
+        assert_eq!(
+            (got.label.as_deref(), got.ssid.as_deref()),
+            (Some("Home"), Some("Net-A"))
+        );
+        // Re-marking from another network name replaces it.
+        e.ssid = Some("Net-B".into());
+        s.add_mine(&e).unwrap();
+        assert_eq!(s.list_mine().unwrap()[0].ssid.as_deref(), Some("Net-B"));
+    }
+
+    #[test]
+    fn an_older_mine_table_gains_the_ssid_column_and_its_marks_have_no_name() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES (4);
+                 CREATE TABLE mine (kind TEXT NOT NULL, id_hash TEXT NOT NULL, label TEXT,
+                   added_at INTEGER NOT NULL, PRIMARY KEY (kind, id_hash));
+                 INSERT INTO mine VALUES ('\"wifiAp\"', 'old', NULL, 5);",
+            )
+            .unwrap();
+        }
+        let mut s = Store::open(dir.path()).unwrap();
+        let got = s.list_mine().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].ssid, None, "a pre-existing mark has no saved name");
+        // Migrating again changes nothing.
+        s.migrate().unwrap();
+        assert_eq!(s.list_mine().unwrap().len(), 1);
     }
 }

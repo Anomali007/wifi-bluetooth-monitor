@@ -55,6 +55,7 @@ fn mine_ap(store: &mut Store, at: Millis) {
             kind: MineKind::WifiAp,
             id_hash: "ap-1".into(),
             label: None,
+            ssid: None,
             added_at: at,
         })
         .unwrap();
@@ -148,6 +149,7 @@ fn marking_a_device_mine_silences_it() {
             kind: MineKind::Lan,
             id_hash: "new".into(),
             label: Some("My device".into()),
+            ssid: None,
             added_at: t0,
         })
         .unwrap();
@@ -287,6 +289,7 @@ fn marking_a_hostname_keyed_device_mine_silences_it() {
             kind: MineKind::Lan,
             id_hash: new.clone(),
             label: Some("My device".into()),
+            ssid: None,
             added_at: t0,
         })
         .unwrap();
@@ -332,6 +335,7 @@ fn a_stranger_announcing_a_mine_hostname_does_not_inherit_mine() {
             kind: MineKind::Lan,
             id_hash: hk.clone(),
             label: Some("My Laptop".into()),
+            ssid: None,
             added_at: t0,
         })
         .unwrap();
