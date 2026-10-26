@@ -78,7 +78,11 @@ pub fn fetch(
     slot: &mut Option<(SystemTime, String)>,
 ) -> Result<String, Freshness> {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Some(mut f) = open_checked(path, false) else {
+        *slot = None;
+        return Err(Freshness::Missing);
+    };
+    let Ok(meta) = f.metadata() else {
         *slot = None;
         return Err(Freshness::Missing);
     };
@@ -91,20 +95,17 @@ pub fn fetch(
         *slot = None;
         return Err(Freshness::Stale);
     }
-    let mut text = String::new();
-    if let Ok(mut f) = std::fs::File::open(path) {
-        let len = meta.len();
-        if len > MAX_READ {
-            let _ = f.seek(SeekFrom::Start(len - MAX_READ));
-        }
-        let mut bytes = Vec::new();
-        let _ = f.take(MAX_READ).read_to_end(&mut bytes);
-        text = String::from_utf8_lossy(&bytes).into_owned();
-        if len > MAX_READ {
-            // Drop the partial first line.
-            if let Some(i) = text.find('\n') {
-                text.drain(..=i);
-            }
+    let len = meta.len();
+    if len > MAX_READ {
+        let _ = f.seek(SeekFrom::Start(len - MAX_READ));
+    }
+    let mut bytes = Vec::new();
+    let _ = (&mut f).take(MAX_READ).read_to_end(&mut bytes);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if len > MAX_READ {
+        // Drop the partial first line.
+        if let Some(i) = text.find('\n') {
+            text.drain(..=i);
         }
     }
     if !text.trim().is_empty() {
@@ -165,9 +166,11 @@ impl super::systools::Runner for FileRunner {
     }
 }
 
-/// Make the data folder private (0700) so the output files, which launchd creates readable,
-/// cannot be listed or read by other accounts; bound the files left over from a closed app.
+/// Create the data folder if needed and make it private (0700) so the output files, which
+/// launchd creates readable, cannot be listed or read by other accounts; bound the files left
+/// over from a closed app. Call this BEFORE anything is created inside it (the database).
 pub fn prepare_dir(dir: &Path) {
+    let _ = std::fs::create_dir_all(dir);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -197,27 +200,64 @@ pub fn apply(on: bool) {
 /// At launch: make the registration match the setting (the setting is the source of truth).
 pub fn reconcile(on: bool, dir: &Path) {
     let st = status();
-    match (on, st) {
-        (true, HelperStatus::Off) => apply(true),
-        (false, HelperStatus::Enabled | HelperStatus::NeedsApproval) => apply(false),
-        (false, _) => delete_outputs(dir),
-        _ => {}
+    if on && st == HelperStatus::Unavailable {
+        log::info!("lan: helper unavailable in this build (the bundled plists are not for this user's data folder)");
+    }
+    match launch_action(on, st) {
+        Action::Register => apply(true),
+        Action::Unregister => apply(false),
+        Action::Nothing if !on => delete_outputs(dir),
+        Action::Nothing => {}
     }
 }
 
-/// Empty a file in place (launchd holds it open, so truncate rather than delete).
+/// Whether a file at an output path is one we may read and empty: a regular file, owned by
+/// this user, with a single link. Anything else (a planted symlink target's owner, a hard link
+/// to someone else's file) is treated as missing, never truncated.
+pub fn is_ours(regular: bool, uid: u32, euid: u32, nlink: u64) -> bool {
+    regular && uid == euid && nlink == 1
+}
+
+/// Open an output file without following a final symlink or blocking on a FIFO, then check
+/// (on the open descriptor, so there is no race) that it is [`is_ours`]. `None` = treat as missing.
+#[cfg(unix)]
+fn open_checked(path: &Path, write: bool) -> Option<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(!write)
+        .write(write)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let m = f.metadata().ok()?;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    is_ours(m.is_file(), m.uid(), euid, m.nlink()).then_some(f)
+}
+
+#[cfg(not(unix))]
+fn open_checked(path: &Path, write: bool) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(!write)
+        .write(write)
+        .open(path)
+        .ok()
+}
+
+/// Empty a file in place (launchd holds it open, so truncate rather than delete). A link,
+/// FIFO, or file that is not ours is left alone.
 pub fn truncate(path: &Path) {
-    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+    if let Some(f) = open_checked(path, true) {
         let _ = f.set_len(0);
     }
 }
 
 /// Truncate a file that has grown past [`MAX_FILE`], whatever its age.
 pub fn cap(path: &Path) {
-    if std::fs::metadata(path)
-        .map(|m| m.len() > MAX_FILE)
-        .unwrap_or(false)
-    {
+    let big = open_checked(path, false)
+        .and_then(|f| f.metadata().ok())
+        .is_some_and(|m| m.len() > MAX_FILE);
+    if big {
         truncate(path);
     }
 }
@@ -226,6 +266,113 @@ pub fn cap(path: &Path) {
 pub fn delete_outputs(dir: &Path) {
     for n in [ARP_OUT, NDP_OUT] {
         let _ = std::fs::remove_file(dir.join(n));
+    }
+}
+
+// -- Bundle check (M4) ----------------------------------------------------------------------
+
+/// Whether the plists bundled with this build point at THIS user's data folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleCheck {
+    /// Both plists write to this user's data folder.
+    Match,
+    /// A plist writes somewhere else: the build was made by another user (the plists bake in
+    /// the builder's home folder), so the jobs could never deliver output to this app.
+    Mismatch,
+    /// No bundled plists to read (an unbundled run or an old build).
+    Missing,
+}
+
+/// The `StandardOutPath` string of a launchd plist, XML-unescaped.
+pub fn standard_out_path(plist: &str) -> Option<String> {
+    let after =
+        &plist[plist.find("<key>StandardOutPath</key>")? + "<key>StandardOutPath</key>".len()..];
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")? + start;
+    Some(
+        after[start..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Compare both bundled plists' `StandardOutPath` with where this user's app writes.
+pub fn check_bundle(plist_dir: &Path, data_dir: &Path) -> BundleCheck {
+    let mut mismatch = false;
+    for (plist, out) in [(ARP_PLIST, ARP_OUT), (NDP_PLIST, NDP_OUT)] {
+        let Ok(text) = std::fs::read_to_string(plist_dir.join(plist)) else {
+            return BundleCheck::Missing;
+        };
+        let Some(path) = standard_out_path(&text) else {
+            return BundleCheck::Missing;
+        };
+        if Path::new(&path) != data_dir.join(out) {
+            mismatch = true;
+        }
+    }
+    if mismatch {
+        BundleCheck::Mismatch
+    } else {
+        BundleCheck::Match
+    }
+}
+
+/// `Contents/Library/LaunchAgents` of the running bundle (`Contents/MacOS/<exe>` -> up two).
+pub fn bundled_plist_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.parent()?.join("Library").join("LaunchAgents"))
+}
+
+/// True when the bundled plists belong to this user (the only case in which the jobs can work).
+fn bundle_usable() -> bool {
+    match (bundled_plist_dir(), data_dir()) {
+        (Some(p), Some(d)) => check_bundle(&p, d) == BundleCheck::Match,
+        _ => false,
+    }
+}
+
+// -- Lifecycle (L6) ---------------------------------------------------------------------------
+
+/// What to do with the registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Register,
+    Unregister,
+    Nothing,
+}
+
+/// At launch: make the registration match the setting (the setting is the source of truth).
+pub fn launch_action(on: bool, st: HelperStatus) -> Action {
+    match (on, st) {
+        (true, HelperStatus::Off) => Action::Register,
+        (false, HelperStatus::Enabled | HelperStatus::NeedsApproval) => Action::Unregister,
+        _ => Action::Nothing,
+    }
+}
+
+/// On quit: unregister whatever is registered, so the launchd jobs stop appending to the data
+/// folder while the app is closed.
+pub fn quit_action(st: HelperStatus) -> Action {
+    match st {
+        HelperStatus::Enabled | HelperStatus::NeedsApproval => Action::Unregister,
+        HelperStatus::Off | HelperStatus::Unavailable => Action::Nothing,
+    }
+}
+
+/// The app is quitting: stop the launchd jobs (and delete what they wrote) so nothing keeps
+/// appending to the data folder while the app is closed. The setting stays on; the next
+/// launch registers again.
+pub fn on_quit() {
+    if quit_action(status()) == Action::Unregister {
+        if let Err(e) = unregister() {
+            log::info!("lan: helper unregister on quit failed: {e}");
+        }
+    }
+    if let Some(dir) = data_dir() {
+        delete_outputs(dir);
     }
 }
 
@@ -299,7 +446,26 @@ mod sm {
 }
 
 #[cfg(target_os = "macos")]
-pub use sm::{open_login_items, register, status, unregister};
+pub use sm::{open_login_items, unregister};
+
+/// Registration state. A build whose plists point at another user's data folder reports
+/// [`HelperStatus::Unavailable`] ("Unavailable in this build") instead of registering jobs
+/// that could never deliver output here.
+#[cfg(target_os = "macos")]
+pub fn status() -> HelperStatus {
+    if !bundle_usable() {
+        return HelperStatus::Unavailable;
+    }
+    sm::status()
+}
+
+#[cfg(target_os = "macos")]
+pub fn register() -> Result<HelperStatus, String> {
+    if !bundle_usable() {
+        return Err("unavailable in this build".to_string());
+    }
+    sm::register()
+}
 
 #[cfg(not(target_os = "macos"))]
 pub fn status() -> HelperStatus {
@@ -481,5 +647,193 @@ mod tests {
         write(d.path(), NDP_OUT, &huge, Duration::ZERO, now);
         cap(&d.path().join(NDP_OUT));
         assert_eq!(std::fs::metadata(d.path().join(NDP_OUT)).unwrap().len(), 0);
+    }
+
+    // -- M4: the bundled plists must be this user's -------------------------------------------
+
+    fn plist_for(out: &str) -> String {
+        format!("<plist><dict><key>StandardOutPath</key><string>{out}</string></dict></plist>")
+    }
+
+    fn write_plists(dir: &Path, data: &str) {
+        std::fs::write(dir.join(ARP_PLIST), plist_for(&format!("{data}/{ARP_OUT}"))).unwrap();
+        std::fs::write(dir.join(NDP_PLIST), plist_for(&format!("{data}/{NDP_OUT}"))).unwrap();
+    }
+
+    #[test]
+    fn standard_out_path_is_read_and_xml_unescaped() {
+        assert_eq!(
+            standard_out_path(&plist_for("/Users/a &amp; b/x.out")).as_deref(),
+            Some("/Users/a & b/x.out")
+        );
+        assert_eq!(standard_out_path("<plist></plist>"), None);
+    }
+
+    #[test]
+    fn a_bundle_built_for_another_users_home_is_unavailable_here() {
+        let plists = tempfile::tempdir().unwrap();
+        let mine = tempfile::tempdir().unwrap();
+        write_plists(
+            plists.path(),
+            "/Users/builder-a/Library/Application Support/x",
+        );
+        assert_eq!(
+            check_bundle(plists.path(), mine.path()),
+            BundleCheck::Mismatch,
+            "plists bake in the builder's data folder"
+        );
+        // NEGATIVE CONTROL: plists rendered for this very data folder match.
+        write_plists(plists.path(), mine.path().to_str().unwrap());
+        assert_eq!(check_bundle(plists.path(), mine.path()), BundleCheck::Match);
+        // One plist wrong is still a mismatch.
+        std::fs::write(
+            plists.path().join(NDP_PLIST),
+            plist_for(&format!("/Users/builder-a/{NDP_OUT}")),
+        )
+        .unwrap();
+        assert_eq!(
+            check_bundle(plists.path(), mine.path()),
+            BundleCheck::Mismatch
+        );
+        // No plists at all (an unbundled run).
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            check_bundle(empty.path(), mine.path()),
+            BundleCheck::Missing
+        );
+    }
+
+    #[test]
+    fn the_rendered_template_path_shape_matches_the_runtime_expectation() {
+        // The template substitutes DATA_DIR + "/neighbors-*.out"; the runtime compares the same.
+        for (file, out) in [
+            ("com.anomali007.wifibtmonitor.arp.plist.in", ARP_OUT),
+            ("com.anomali007.wifibtmonitor.ndp.plist.in", NDP_OUT),
+        ] {
+            let t = std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("helper")
+                    .join(file),
+            )
+            .unwrap();
+            let rendered = t.replace("@DATA_DIR@", "/Users/synthetic/data");
+            assert_eq!(
+                standard_out_path(&rendered).as_deref(),
+                Some(format!("/Users/synthetic/data/{out}").as_str())
+            );
+        }
+    }
+
+    // -- L6: quit and launch ------------------------------------------------------------------
+
+    #[test]
+    fn quitting_unregisters_a_running_item_and_launch_registers_it_again() {
+        assert_eq!(quit_action(HelperStatus::Enabled), Action::Unregister);
+        assert_eq!(quit_action(HelperStatus::NeedsApproval), Action::Unregister);
+        // NEGATIVE CONTROLS: nothing to undo when it is not registered.
+        assert_eq!(quit_action(HelperStatus::Off), Action::Nothing);
+        assert_eq!(quit_action(HelperStatus::Unavailable), Action::Nothing);
+        // Setting on + unregistered at launch (because we unregistered on quit) = register.
+        assert_eq!(launch_action(true, HelperStatus::Off), Action::Register);
+        assert_eq!(launch_action(true, HelperStatus::Enabled), Action::Nothing);
+        assert_eq!(
+            launch_action(false, HelperStatus::Enabled),
+            Action::Unregister
+        );
+        assert_eq!(
+            launch_action(true, HelperStatus::Unavailable),
+            Action::Nothing
+        );
+    }
+
+    // -- L4: never follow a planted link, never truncate someone else's file --------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_output_file_is_missing_and_its_target_is_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        let target = victim.path().join("precious.txt");
+        std::fs::write(&target, "keep me").unwrap();
+        let link = d.path().join(ARP_OUT);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let now = SystemTime::now();
+        let mut slot = None;
+        assert_eq!(fetch(&link, now, &mut slot), Err(Freshness::Missing));
+        // Whatever the age, the target keeps its bytes (stale path, cap path and truncate).
+        let old = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap();
+        old.set_modified(now - MAX_AGE - Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(fetch(&link, now, &mut slot), Err(Freshness::Missing));
+        truncate(&link);
+        cap(&link);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+        // NEGATIVE CONTROL: a regular file at the same path is read normally.
+        std::fs::remove_file(&link).unwrap();
+        write(d.path(), ARP_OUT, ARP, Duration::from_secs(5), now);
+        assert!(fetch(&link, now, &mut None).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_output_file_is_missing_and_the_other_name_is_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let precious = other.path().join("precious.txt");
+        std::fs::write(&precious, ARP).unwrap();
+        let out = d.path().join(NDP_OUT);
+        std::fs::hard_link(&precious, &out).unwrap();
+        let now = SystemTime::now();
+        assert_eq!(fetch(&out, now, &mut None), Err(Freshness::Missing));
+        truncate(&out);
+        assert_eq!(std::fs::read_to_string(&precious).unwrap(), ARP);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_in_place_of_the_output_file_does_not_block_the_scan() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join(ARP_OUT);
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = fetch(&fifo, SystemTime::now(), &mut None);
+            let _ = tx.send(r);
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("fetch blocked on a FIFO");
+        assert_eq!(got, Err(Freshness::Missing));
+    }
+
+    #[test]
+    fn only_a_regular_single_link_file_of_ours_is_trusted() {
+        assert!(is_ours(true, 501, 501, 1));
+        assert!(!is_ours(false, 501, 501, 1), "not a regular file");
+        assert!(!is_ours(true, 0, 501, 1), "owned by someone else");
+        assert!(!is_ours(true, 501, 501, 2), "hard-linked elsewhere");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_dir_creates_and_locks_the_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("data");
+        prepare_dir(&dir);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        // Loose permissions on an existing folder are tightened.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_dir(&dir);
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 }

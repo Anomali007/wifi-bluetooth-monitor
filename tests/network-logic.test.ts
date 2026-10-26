@@ -118,7 +118,8 @@ describe("helperStatusLine", () => {
     expect(helperStatusLine("enabled", true)).toMatch(/^On/);
     expect(helperStatusLine("needsApproval", true)).toMatch(/Login Items/);
     expect(helperStatusLine("off", false)).toBe("Off.");
-    expect(helperStatusLine("unavailable", true)).toMatch(/Not available/);
+    expect(helperStatusLine("unavailable", true)).toMatch(/^Unavailable in this build/);
+    expect(helperStatusLine("unavailable", true)).toMatch(/user who built/);
     // NEGATIVE CONTROL: a pending toggle is not reported as on.
     expect(helperStatusLine("off", true)).toMatch(/Save/);
     expect(helperStatusLine("off", true)).not.toMatch(/^On/);

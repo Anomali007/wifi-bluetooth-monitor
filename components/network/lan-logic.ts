@@ -66,6 +66,6 @@ export function helperStatusLine(status: HelperStatus | null, wanted: boolean): 
   if (status === "enabled") return "On: the background item is running.";
   if (status === "needsApproval")
     return "Needs your approval: turn it on in System Settings, General, Login Items.";
-  if (status === "unavailable") return "Not available in this build.";
+  if (status === "unavailable") return "Unavailable in this build: the background item only runs for the user who built this app.";
   return wanted ? "Press Save to turn it on." : "Off.";
 }
