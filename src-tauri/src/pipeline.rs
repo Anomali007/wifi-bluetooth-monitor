@@ -153,7 +153,7 @@ pub struct Notice {
 /// cannot bury a real alert or spam the user.
 pub fn plan_notifications(alerts: &[Alert]) -> Vec<Notice> {
     let mut ordered: Vec<&Alert> = alerts.iter().collect();
-    ordered.sort_by(|a, b| b.severity.cmp(&a.severity)); // stable: ties keep their order
+    ordered.sort_by_key(|a| std::cmp::Reverse(a.severity)); // stable: ties keep their order
     let high = ordered
         .iter()
         .filter(|a| a.severity == Severity::High)

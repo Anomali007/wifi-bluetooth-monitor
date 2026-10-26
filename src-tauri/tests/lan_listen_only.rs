@@ -463,6 +463,7 @@ fn the_sink_needs_a_gate_token_only_may_sweep_can_build() {
     );
     // Construction sites of the token (struct literal with its private field).
     let build = Regex::new(r"GateToken\s*\{\s*if_index").unwrap();
+    let attr = Regex::new(r"#\[cfg\(test\)\]\s*pub fn for_tests").unwrap();
     for (rel, src) in rs_files(&src_dir()) {
         let code = production_code(&src).replace("pub struct GateToken {", "");
         let n = build.find_iter(&code).count();
@@ -473,7 +474,6 @@ fn the_sink_needs_a_gate_token_only_may_sweep_can_build() {
                 "gate.rs builds the token in may_sweep and for_tests only"
             );
             assert_eq!(code.matches("Ok(GateToken { if_index })").count(), 1);
-            let attr = Regex::new(r"#\[cfg\(test\)\]\s*pub fn for_tests").unwrap();
             assert!(attr.is_match(&code), "for_tests must be cfg(test)");
         } else {
             assert_eq!(n, 0, "{rel} must not build a GateToken");

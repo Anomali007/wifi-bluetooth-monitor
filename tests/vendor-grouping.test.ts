@@ -50,9 +50,16 @@ describe("rowsFrom", () => {
     expect(rows[0].vendor).toBe("Vendor-A");
     expect(rows[0].detail).toContain("1 device · 2 radios");
     expect(rows[0].detail).toContain("ch 36, 6");
-    expect(rows[0].mine).toEqual({ kind: "wifiGroup", idHash: "g1", rotatingAddress: false });
+    // The mark carries the network name (the sweep checks it), taken from the strongest radio.
+    expect(rows[0].mine).toEqual({
+      kind: "wifiGroup",
+      idHash: "g1",
+      rotatingAddress: false,
+      ssid: "Net-2",
+    });
     expect(rows[1].radios).toBe(1);
     expect(rows[1].detail).not.toContain("radios");
     expect(rows[1].mine?.kind).toBe("wifiAp");
+    expect(rows[1].mine?.ssid).toBe("Net-3");
   });
 });
