@@ -57,7 +57,7 @@ export default function WatchlistSection() {
   }
 
   return (
-    <section className="space-y-3 rounded-xl border bg-card p-4 shadow">
+    <section id="watchlist" className="scroll-mt-4 space-y-3 rounded-xl border bg-card p-4 shadow">
       <h2 className="font-semibold">Watchlist</h2>
       <p className="text-sm text-muted-foreground">
         Get an alert when a network name or hardware vendor you list shows up.
@@ -91,6 +91,7 @@ export default function WatchlistSection() {
         }}
       >
         <select
+          id="watchlist-kind"
           aria-label="Watch for"
           value={kind}
           onChange={(ev) => setKind(ev.target.value as WatchKind)}
@@ -103,6 +104,7 @@ export default function WatchlistSection() {
           ))}
         </select>
         <select
+          id="watchlist-match"
           aria-label="Match mode"
           value={match}
           onChange={(ev) => setMatch(ev.target.value as WatchMatch)}
@@ -115,6 +117,7 @@ export default function WatchlistSection() {
           ))}
         </select>
         <input
+          id="watchlist-pattern"
           aria-label="Pattern"
           value={pattern}
           onChange={(ev) => setPattern(ev.target.value)}

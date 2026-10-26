@@ -125,6 +125,76 @@ try {
   await page.getByText(/Net-Z/).first().waitFor();
   check("watchlist: entry added and listed", true);
 
+  // Search palette: nav button and shortcuts open it, keyboard picks a setting, focus is restored
+  await page.goto(`${base}/`);
+  await page.getByText(/Last scan/).waitFor();
+  const searchBtn = page.getByRole("button", { name: /Search/ });
+  await searchBtn.click();
+  const box = page.getByRole("dialog").getByRole("combobox");
+  await box.waitFor();
+  check("palette opens from the nav button", await page.getByRole("dialog", { name: "Search" }).isVisible());
+  check("palette input has focus on open", await box.evaluate((el) => el === document.activeElement));
+  await page.keyboard.press("Escape");
+  await page.getByRole("dialog").waitFor({ state: "detached" });
+  await page.waitForFunction(() => document.activeElement?.textContent?.includes("Search"));
+  check("Esc closes the palette and restores focus to the nav button", await searchBtn.evaluate((el) => el === document.activeElement));
+  await page.keyboard.press("Control+k");
+  await box.waitFor();
+  check("Ctrl+K opens the palette", true);
+  await page.keyboard.press("Control+k");
+  await page.getByRole("dialog").waitFor({ state: "detached" });
+  await page.evaluate(() => document.activeElement instanceof HTMLElement && document.activeElement.blur());
+  await page.keyboard.press("/");
+  await box.waitFor();
+  check("/ opens the palette when nothing is focused", true);
+
+  await box.fill("zzqxj");
+  await page.getByText("No results").waitFor();
+  check("nonsense query shows no results", (await page.getByRole("option").count()) === 0);
+
+  await box.fill("arp");
+  await page.getByRole("option").first().waitFor();
+  check(
+    "arp finds Read the full device list first",
+    (await page.getByRole("option").first().innerText()).startsWith("Read the full device list"),
+  );
+  check(
+    "combobox points at the active option",
+    (await box.getAttribute("aria-activedescendant")) === (await page.getByRole("option").first().getAttribute("id")),
+  );
+  await box.fill("sweep");
+  await page.getByRole("option").first().waitFor();
+  check(
+    "sweep finds only the setting; no Sweep now action",
+    (await page.getByRole("option").filter({ hasText: "Sweep now" }).count()) === 0 &&
+      (await page.getByRole("option").first().innerText()).startsWith("Find quiet devices"),
+  );
+  await box.fill("scan");
+  await page.getByRole("option").nth(1).waitFor();
+  await page.keyboard.press("ArrowDown");
+  const second = await page.getByRole("option").nth(1).getAttribute("id");
+  check("ArrowDown moves the active option", (await box.getAttribute("aria-activedescendant")) === second);
+  await box.fill("retention");
+  await page.getByRole("option").first().waitFor();
+  await page.keyboard.press("Enter");
+  await page.getByRole("dialog").waitFor({ state: "detached" });
+  await page.waitForURL(/\/settings#/);
+  const hash = new URL(page.url()).hash.slice(1);
+  await page.waitForFunction((id) => document.getElementById(id) === document.activeElement, hash);
+  check(`Enter on a setting opens /settings#${hash} and focuses it`, hash === "retention-hours" || hash === "place-retention-days");
+  await page.waitForFunction(() => document.querySelector(".search-highlight") !== null);
+  check("the landed setting is highlighted", true);
+  await shot(page, "search-landed");
+
+  // Data result: a network name opens the dashboard row
+  await page.keyboard.press("Control+k");
+  await box.fill("Net-A");
+  await page.getByRole("option").first().waitFor();
+  check("data results are grouped", (await page.getByRole("group").count()) > 0);
+  await page.keyboard.press("Enter");
+  await page.waitForFunction(() => document.querySelector("tr[id^='row-'].search-highlight") !== null);
+  check("a Wi-Fi result lands on its row", true);
+
   // Routes resolve
   for (const r of ["/alerts", "/history", "/settings", "/network"]) {
     const resp = await page.goto(`${base}${r}`);

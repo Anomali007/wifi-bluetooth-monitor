@@ -32,7 +32,7 @@ export default function PlacesSection({ draft, set }: SectionProps) {
   };
 
   return (
-    <section className="space-y-3 rounded-xl border bg-card p-4 shadow">
+    <section id="places" className="scroll-mt-4 space-y-3 rounded-xl border bg-card p-4 shadow">
       <h2 className="font-semibold">Places</h2>
       <p className="text-sm text-muted-foreground">
         Places are remembered as a set of nearby Wi-Fi hashes, never as
@@ -65,6 +65,7 @@ export default function PlacesSection({ draft, set }: SectionProps) {
         </ul>
       )}
       <NumberField
+        id="place-retention-days"
         label="Keep places and network devices for (days)"
         min={1}
         value={draft.placeRetentionDays}
@@ -88,7 +89,7 @@ function PlaceRow({
   const [draft, setDraft] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   return (
-    <li className="flex flex-wrap items-center justify-between gap-2 text-sm">
+    <li id={`place-${place.id}`} className="flex flex-wrap items-center justify-between gap-2 text-sm">
       <span>
         {placeName(place)}{" "}
         <span className="text-muted-foreground">
@@ -107,6 +108,7 @@ function PlaceRow({
         ) : (
           <>
             <input
+              data-search-exempt="per-row rename field"
               value={draft}
               onChange={(ev) => setDraft(ev.target.value)}
               aria-label="Place name"
