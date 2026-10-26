@@ -45,4 +45,5 @@ objc2-core-location = "0.3"
 objc2-service-management = { version = "0.3", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 
 [dev-dependencies]
+regex = "1.13.1"
 tempfile = "3"

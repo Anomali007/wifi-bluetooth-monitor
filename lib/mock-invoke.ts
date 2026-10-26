@@ -388,7 +388,7 @@ let places: Place[] = [
 ];
 
 let mine: MineEntry[] = [
-  { kind: "wifiGroup", idHash: H_GROUP_A, label: "Router-A", addedAt: Date.now() - 2 * DAY },
+  { kind: "wifiGroup", idHash: H_GROUP_A, label: "Router-A", ssid: "Net-A", addedAt: Date.now() - 2 * DAY },
 ];
 
 let watchlist: WatchlistEntry[] = [
@@ -524,11 +524,16 @@ export async function mockInvoke<T>(
       const raw = args?.label as string | null | undefined;
       const existing = mine.find((m) => m.kind === kind && m.idHash === idHash);
       const label = raw && raw.trim() ? raw.trim() : null;
+      // Like the backend: only access-point marks carry a name, and a re-mark without one keeps it.
+      const rawSsid = args?.ssid as string | null | undefined;
+      const ssid =
+        (kind === "wifiAp" || kind === "wifiGroup") && rawSsid ? rawSsid : null;
       if (existing) {
         existing.label = label;
+        if (ssid) existing.ssid = ssid;
         return { ...existing } as T;
       }
-      const entry: MineEntry = { kind, idHash, label, addedAt: Date.now() };
+      const entry: MineEntry = { kind, idHash, label, ssid, addedAt: Date.now() };
       mine = [...mine, entry];
       return { ...entry } as T;
     }

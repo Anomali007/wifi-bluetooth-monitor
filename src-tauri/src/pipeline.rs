@@ -7,7 +7,7 @@ use crate::detect::{self, DetectContext};
 use crate::lan::{self, LanScanOutcome};
 use crate::model::{
     Alert, AlertKind, BleObservation, Millis, PermissionState, PermissionStatus, ScanError,
-    ScanErrorCode, ScanResult, ScanSource, WifiObservation,
+    ScanErrorCode, ScanResult, ScanSource, Severity, WifiObservation,
 };
 use crate::places;
 use crate::store::{Store, StoreResult};
@@ -134,5 +134,107 @@ pub fn notification_text(alert: &Alert) -> (&'static str, &'static str) {
             "New device on your network",
             "A device you have not seen before joined a network you marked as yours. Open the app for details.",
         ),
+    }
+}
+
+/// OS notifications per scan cycle before the rest collapse into one "N more alerts" summary.
+pub const MAX_NOTIFICATIONS_PER_CYCLE: usize = 3;
+
+/// One OS notification to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub title: String,
+    pub body: String,
+}
+
+/// The notifications for a cycle's new alerts: High-severity alerts first (never dropped, never
+/// summarised), then the rest in order until [`MAX_NOTIFICATIONS_PER_CYCLE`] are used, then one
+/// summary for whatever is left. A flood of spoofed devices or watchlisted names therefore
+/// cannot bury a real alert or spam the user.
+pub fn plan_notifications(alerts: &[Alert]) -> Vec<Notice> {
+    let mut ordered: Vec<&Alert> = alerts.iter().collect();
+    ordered.sort_by_key(|a| std::cmp::Reverse(a.severity)); // stable: ties keep their order
+    let high = ordered
+        .iter()
+        .filter(|a| a.severity == Severity::High)
+        .count();
+    let shown = high.max(MAX_NOTIFICATIONS_PER_CYCLE).min(ordered.len());
+    let mut out: Vec<Notice> = ordered[..shown]
+        .iter()
+        .map(|a| {
+            let (t, b) = notification_text(a);
+            Notice {
+                title: t.into(),
+                body: b.into(),
+            }
+        })
+        .collect();
+    let rest = ordered.len() - shown;
+    if rest > 0 {
+        out.push(Notice {
+            title: "More alerts".into(),
+            body: format!("{rest} more alerts were raised. Open the app for details."),
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::*;
+
+    fn alert(kind: AlertKind, sev: Severity, n: usize) -> Alert {
+        Alert {
+            id: format!("id{n}"),
+            kind,
+            severity: sev,
+            title: format!("t{n}"),
+            detail: String::new(),
+            first_seen: 0,
+            last_seen: 0,
+            subject_hash: format!("s{n}"),
+            dismissed: false,
+        }
+    }
+
+    #[test]
+    fn a_flood_of_new_alerts_produces_a_capped_number_of_notifications() {
+        let alerts: Vec<Alert> = (0..510)
+            .map(|n| alert(AlertKind::NewLanDevice, Severity::Medium, n))
+            .collect();
+        let plan = plan_notifications(&alerts);
+        assert_eq!(plan.len(), MAX_NOTIFICATIONS_PER_CYCLE + 1);
+        let last = plan.last().unwrap();
+        assert!(last
+            .body
+            .contains(&format!("{}", 510 - MAX_NOTIFICATIONS_PER_CYCLE)));
+        // NEGATIVE CONTROL: at or under the cap there is no summary.
+        let few = plan_notifications(&alerts[..MAX_NOTIFICATIONS_PER_CYCLE]);
+        assert_eq!(few.len(), MAX_NOTIFICATIONS_PER_CYCLE);
+        assert!(few.iter().all(|n| n.title == "New device on your network"));
+    }
+
+    #[test]
+    fn high_severity_alerts_are_never_the_ones_dropped_from_notification() {
+        // The High alerts come LAST in the input, where a naive "first N" would drop them.
+        let mut alerts: Vec<Alert> = (0..50)
+            .map(|n| alert(AlertKind::Watchlist, Severity::Medium, n))
+            .collect();
+        alerts.push(alert(AlertKind::EvilTwin, Severity::High, 900));
+        alerts.push(alert(AlertKind::OpenLookalike, Severity::High, 901));
+        let plan = plan_notifications(&alerts);
+        assert!(plan
+            .iter()
+            .any(|n| n.title == "Possible evil-twin Wi-Fi network"));
+        assert!(plan
+            .iter()
+            .any(|n| n.title == "Open network imitating a trusted one"));
+        assert!(plan.len() <= MAX_NOTIFICATIONS_PER_CYCLE + 1);
+        // Even more High alerts than the cap: all of them are shown, none summarised away.
+        let many_high: Vec<Alert> = (0..5)
+            .map(|n| alert(AlertKind::EvilTwin, Severity::High, n))
+            .collect();
+        let plan = plan_notifications(&many_high);
+        assert_eq!(plan.len(), 5);
     }
 }

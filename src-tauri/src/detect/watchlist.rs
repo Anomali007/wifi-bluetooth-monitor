@@ -168,6 +168,7 @@ mod tests {
             kind,
             id_hash: id.to_string(),
             label: None,
+            ssid: None,
             added_at: 0,
         }
     }

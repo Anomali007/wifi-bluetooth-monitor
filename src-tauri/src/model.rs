@@ -469,6 +469,12 @@ pub struct MineEntry {
     pub kind: MineKind,
     pub id_hash: String,
     pub label: Option<String>,
+    /// The network name that went with a `WifiAp`/`WifiGroup` mark when it was made. The sweep
+    /// gate requires the joined network to carry the same name, because a cloned BSSID (or any
+    /// BSSID in the same radio group) shares the hash but not necessarily the name. `None` for
+    /// other kinds and for marks made before this field existed (those do not allow a sweep).
+    #[serde(default)]
+    pub ssid: Option<String>,
     pub added_at: Millis,
 }
 
@@ -523,6 +529,10 @@ pub struct LanDevice {
     /// both (merged across scans when stored). `None` only for rows from before v4.
     #[serde(default)]
     pub source: Option<LanSource>,
+    /// Filled when listing, never persisted: the label of a Mine device whose mDNS hostname
+    /// this device also announced. Only a hint to confirm by hand; it never makes a device Mine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub possibly_same_as: Option<String>,
 }
 
 /// Where a LAN device came from. A device only ever heard announcing has no hardware address
@@ -738,6 +748,7 @@ mod tests {
             kind: MineKind::WifiGroup,
             id_hash: "ef".repeat(32),
             label: None,
+            ssid: None,
             added_at: 9,
         };
         assert_eq!(
@@ -769,6 +780,7 @@ mod tests {
             ip: Some("192.0.2.10".into()),
             mine: false,
             source: Some(LanSource::Both),
+            possibly_same_as: None,
         };
         roundtrip(&dev);
         roundtrip(&NetworkInfo::default());

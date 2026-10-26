@@ -94,7 +94,79 @@ pub fn evaluate_with(
     if t.new_lan_device {
         lan::new_lan_device(history, settings, ctx, now, &mut out);
     }
-    out.finish()
+    coalesce_floods(out.finish())
+}
+
+/// Alerts per kind (for the kinds a nearby stranger can multiply at will) kept individually per
+/// evaluation; the rest merge into ONE summary alert.
+pub const MAX_FLOOD_ALERTS_PER_KIND: usize = 5;
+
+/// Kinds one nearby transmitter can multiply: ~500 spoofed LAN devices, or beacon spam of
+/// watchlisted names. Everything else is bounded by what the user actually has.
+const FLOODABLE: [AlertKind; 2] = [AlertKind::NewLanDevice, AlertKind::Watchlist];
+
+/// Merge the alerts of each floodable kind beyond [`MAX_FLOOD_ALERTS_PER_KIND`] into one summary
+/// alert. The oldest alerts stay individual (so the kept set is stable from cycle to cycle and
+/// a growing flood does not re-announce itself); High-severity alerts are never merged. The
+/// summary has a fixed subject, so its changing count updates it in place instead of creating
+/// a new alert.
+pub fn coalesce_floods(alerts: Vec<Alert>) -> Vec<Alert> {
+    let mut out = Vec::with_capacity(alerts.len());
+    let mut mergeable: BTreeMap<&'static str, Vec<Alert>> = BTreeMap::new();
+    for a in alerts {
+        if FLOODABLE.contains(&a.kind) && a.severity < Severity::High {
+            mergeable.entry(kind_tag(a.kind)).or_default().push(a);
+        } else {
+            out.push(a);
+        }
+    }
+    for (tag, mut group) in mergeable {
+        if group.len() <= MAX_FLOOD_ALERTS_PER_KIND {
+            out.extend(group);
+            continue;
+        }
+        group.sort_by(|a, b| {
+            a.first_seen
+                .cmp(&b.first_seen)
+                .then_with(|| a.subject_hash.cmp(&b.subject_hash))
+        });
+        let rest = group.split_off(MAX_FLOOD_ALERTS_PER_KIND);
+        let kind = group[0].kind;
+        let subject = subject_key("floodSummary", tag);
+        let (title, detail) = match kind {
+            AlertKind::NewLanDevice => (
+                format!("{} more new devices on your network", rest.len()),
+                "Many devices appeared at once, so they are grouped here instead of listed one by one. This can happen when something is announcing many fake devices.".to_string(),
+            ),
+            _ => (
+                format!("{} more watchlist matches", rest.len()),
+                "Many matches appeared at once, so they are grouped here instead of listed one by one. This can happen when something is broadcasting many look-alike network names.".to_string(),
+            ),
+        };
+        out.extend(group);
+        out.push(Alert {
+            id: alert_id(kind, &subject),
+            kind,
+            severity: rest
+                .iter()
+                .map(|a| a.severity)
+                .max()
+                .unwrap_or(Severity::Medium),
+            title,
+            detail,
+            first_seen: rest.iter().map(|a| a.first_seen).min().unwrap_or(0),
+            last_seen: rest.iter().map(|a| a.last_seen).max().unwrap_or(0),
+            subject_hash: subject,
+            dismissed: false,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| kind_tag(a.kind).cmp(kind_tag(b.kind)))
+            .then_with(|| a.subject_hash.cmp(&b.subject_hash))
+    });
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,6 +1357,7 @@ mod tests {
             kind,
             id_hash,
             label: None,
+            ssid: None,
             added_at: T0,
         }
     }
@@ -1421,5 +1494,85 @@ mod tests {
     #[test]
     fn empty_history_and_default_settings_yield_nothing() {
         assert!(evaluate(&History::default(), &Settings::default(), 0).is_empty());
+    }
+
+    // -- M2: flood coalescing ---------------------------------------------------------
+
+    fn flood_alert(kind: AlertKind, sev: Severity, n: usize) -> Alert {
+        let subject = subject_key("test", &format!("{n}"));
+        Alert {
+            id: alert_id(kind, &subject),
+            kind,
+            severity: sev,
+            title: format!("t{n}"),
+            detail: "d".into(),
+            first_seen: 1_000 + n as Millis,
+            last_seen: 1_000 + n as Millis,
+            subject_hash: subject,
+            dismissed: false,
+        }
+    }
+
+    #[test]
+    fn a_synthetic_flood_of_lan_and_watchlist_alerts_collapses_to_a_cap_plus_one_summary() {
+        for kind in [AlertKind::NewLanDevice, AlertKind::Watchlist] {
+            let mut v: Vec<Alert> = (0..510)
+                .map(|n| flood_alert(kind, Severity::Medium, n))
+                .collect();
+            // A different kind is never touched.
+            v.push(flood_alert(AlertKind::EvilTwin, Severity::High, 9_999));
+            let out = coalesce_floods(v);
+            let of_kind: Vec<_> = out.iter().filter(|a| a.kind == kind).collect();
+            assert_eq!(of_kind.len(), MAX_FLOOD_ALERTS_PER_KIND + 1, "{kind:?}");
+            let summary = of_kind
+                .iter()
+                .find(|a| a.subject_hash == subject_key("floodSummary", kind_tag(kind)))
+                .expect("one summary alert");
+            assert!(summary
+                .title
+                .contains(&format!("{}", 510 - MAX_FLOOD_ALERTS_PER_KIND)));
+            assert_eq!(
+                out.iter().filter(|a| a.kind == AlertKind::EvilTwin).count(),
+                1
+            );
+            // Stable across cycles: same input, same kept set and same summary subject.
+            let again: Vec<_> = coalesce_floods(
+                (0..510)
+                    .map(|n| flood_alert(kind, Severity::Medium, n))
+                    .collect(),
+            );
+            assert_eq!(
+                again
+                    .iter()
+                    .map(|a| &a.subject_hash)
+                    .collect::<BTreeSet<_>>(),
+                of_kind
+                    .iter()
+                    .map(|a| &a.subject_hash)
+                    .collect::<BTreeSet<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn coalescing_never_swallows_a_high_severity_alert_and_leaves_small_batches_alone() {
+        let mut v: Vec<Alert> = (0..40)
+            .map(|n| flood_alert(AlertKind::Watchlist, Severity::Medium, n))
+            .collect();
+        v.push(flood_alert(AlertKind::Watchlist, Severity::High, 500));
+        v.push(flood_alert(AlertKind::Watchlist, Severity::High, 501));
+        let out = coalesce_floods(v);
+        let high: Vec<_> = out
+            .iter()
+            .filter(|a| a.severity == Severity::High)
+            .collect();
+        assert_eq!(high.len(), 2, "both High alerts survive individually");
+        // NEGATIVE CONTROL: at or under the cap nothing is merged and no summary appears.
+        let small: Vec<Alert> = (0..MAX_FLOOD_ALERTS_PER_KIND)
+            .map(|n| flood_alert(AlertKind::NewLanDevice, Severity::Medium, n))
+            .collect();
+        let out = coalesce_floods(small.clone());
+        assert_eq!(out.len(), small.len());
+        assert!(small.iter().all(|a| out.contains(a)));
     }
 }
