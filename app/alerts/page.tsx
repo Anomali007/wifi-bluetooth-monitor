@@ -22,7 +22,7 @@ export default function AlertsPage() {
       ) : (
         <ul className="space-y-3">
           {alerts.map((a) => (
-            <li key={a.id} className="rounded-xl border bg-card p-4 shadow">
+            <li key={a.id} id={`alert-${a.id}`} className="rounded-xl border bg-card p-4 shadow">
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <span

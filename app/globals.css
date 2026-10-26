@@ -80,3 +80,25 @@ body {
     @apply bg-background text-foreground;
   }
 }
+
+/* Search result landing: a ring that fades out. Static (no motion) when the user prefers it. */
+@keyframes search-highlight-fade {
+  from {
+    box-shadow: 0 0 0 3px hsl(var(--ring));
+    background-color: hsl(var(--accent));
+  }
+  to {
+    box-shadow: 0 0 0 3px transparent;
+    background-color: transparent;
+  }
+}
+.search-highlight {
+  border-radius: var(--radius);
+  animation: search-highlight-fade 2s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .search-highlight {
+    animation: none;
+    box-shadow: 0 0 0 3px hsl(var(--ring));
+  }
+}

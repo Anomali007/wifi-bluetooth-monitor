@@ -39,7 +39,7 @@ export default function MineSection() {
   };
 
   return (
-    <section className="space-y-3 rounded-xl border bg-card p-4 shadow">
+    <section id="mine" className="scroll-mt-4 space-y-3 rounded-xl border bg-card p-4 shadow">
       <h2 className="font-semibold">Mine</h2>
       <p className="text-sm text-muted-foreground">
         Access points, Bluetooth devices and network devices you marked as yours
@@ -92,6 +92,7 @@ function MineRow({
         ) : (
           <>
             <input
+              data-search-exempt="per-row rename field"
               value={draft}
               onChange={(ev) => setDraft(ev.target.value)}
               aria-label="Label"

@@ -1,7 +1,9 @@
 "use client";
 
+import { Search } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { OPEN_PALETTE_EVENT } from "@/components/command-palette";
 import { cn } from "@/lib/utils";
 import { useMonitor } from "./monitor-provider";
 
@@ -39,7 +41,18 @@ export default function Nav() {
             )}
           </Link>
         ))}
-        <span className="ml-auto text-xs text-muted-foreground">
+        <button
+          type="button"
+          aria-haspopup="dialog"
+          aria-keyshortcuts="Meta+K Control+K /"
+          onClick={() => window.dispatchEvent(new Event(OPEN_PALETTE_EVENT))}
+          className="ml-auto flex items-center gap-2 rounded-md border bg-background px-3 py-1.5 text-sm text-muted-foreground hover:bg-accent"
+        >
+          <Search className="h-4 w-4" aria-hidden="true" />
+          Search
+          <kbd className="rounded border bg-muted px-1.5 text-xs">&#8984;K</kbd>
+        </button>
+        <span className="ml-3 hidden text-xs text-muted-foreground lg:inline">
           Listen-only unless you turn on the sweep
         </span>
       </div>
