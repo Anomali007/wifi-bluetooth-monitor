@@ -19,6 +19,8 @@ export function sweepBlockedReason(
   if (!network.isMine) {
     return "This access point is not marked as yours. Mark it as mine first.";
   }
+  // Marked, but the backend knows the sweep will still refuse (name not saved, hidden, changed).
+  if (network.sweepNote) return network.sweepNote;
   return null;
 }
 

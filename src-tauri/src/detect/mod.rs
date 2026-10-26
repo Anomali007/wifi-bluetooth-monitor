@@ -94,53 +94,85 @@ pub fn evaluate_with(
     if t.new_lan_device {
         lan::new_lan_device(history, settings, ctx, now, &mut out);
     }
-    coalesce_floods(out.finish())
+    coalesce_floods(out.finish(), &protected_subjects(settings, ctx))
 }
 
-/// Alerts per kind (for the kinds a nearby stranger can multiply at will) kept individually per
-/// evaluation; the rest merge into ONE summary alert.
+/// Alerts per kind kept individually per evaluation; the rest merge into ONE summary alert.
 pub const MAX_FLOOD_ALERTS_PER_KIND: usize = 5;
 
-/// Kinds one nearby transmitter can multiply: ~500 spoofed LAN devices, or beacon spam of
-/// watchlisted names. Everything else is bounded by what the user actually has.
-const FLOODABLE: [AlertKind; 2] = [AlertKind::NewLanDevice, AlertKind::Watchlist];
-
-/// Merge the alerts of each floodable kind beyond [`MAX_FLOOD_ALERTS_PER_KIND`] into one summary
-/// alert. The oldest alerts stay individual (so the kept set is stable from cycle to cycle and
-/// a growing flood does not re-announce itself); High-severity alerts are never merged. The
-/// summary has a fixed subject, so its changing count updates it in place instead of creating
-/// a new alert.
-pub fn coalesce_floods(alerts: Vec<Alert>) -> Vec<Alert> {
-    let mut out = Vec::with_capacity(alerts.len());
-    let mut mergeable: BTreeMap<&'static str, Vec<Alert>> = BTreeMap::new();
-    for a in alerts {
-        if FLOODABLE.contains(&a.kind) && a.severity < Severity::High {
-            mergeable.entry(kind_tag(a.kind)).or_default().push(a);
-        } else {
-            out.push(a);
+/// Subjects of alerts about networks the user owns: trusted networks and access points marked
+/// Mine (by the name saved with the mark). Their alerts take the individual slots first.
+pub fn protected_subjects(settings: &Settings, ctx: &DetectContext) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = settings
+        .trusted_networks
+        .iter()
+        .map(|t| subject_key("ssid", &fold_ssid(&t.ssid)))
+        .collect();
+    for m in &ctx.mine {
+        if matches!(m.kind, MineKind::WifiAp | MineKind::WifiGroup) {
+            if let Some(ssid) = &m.ssid {
+                out.insert(subject_key("ssid", &fold_ssid(ssid)));
+            }
         }
     }
-    for (tag, mut group) in mergeable {
+    out
+}
+
+/// The fixed subject of the flood summary for `kind`.
+pub fn flood_summary_subject(kind: AlertKind) -> String {
+    subject_key("floodSummary", kind_tag(kind))
+}
+
+/// The count in a flood summary's title ("505 more ..."), or `None` for any other alert.
+pub fn flood_summary_count(a: &Alert) -> Option<usize> {
+    if a.subject_hash != flood_summary_subject(a.kind) {
+        return None;
+    }
+    a.title.split_whitespace().next()?.parse().ok()
+}
+
+/// Merge the alerts of each kind beyond [`MAX_FLOOD_ALERTS_PER_KIND`] into one summary alert,
+/// whatever their severity: one nearby transmitter can multiply any of them (hundreds of
+/// open/secured SSID pairs make hundreds of High evil-twin alerts). Individual slots go first to
+/// alerts about `protected` subjects (the user's own networks), then by severity, then the
+/// oldest (so the kept set is stable from cycle to cycle and a growing flood does not
+/// re-announce itself). The summary has a fixed subject, so its changing count updates it in
+/// place, and it keeps the highest severity it absorbed.
+pub fn coalesce_floods(alerts: Vec<Alert>, protected: &BTreeSet<String>) -> Vec<Alert> {
+    let mut out = Vec::with_capacity(alerts.len());
+    let mut groups: BTreeMap<&'static str, Vec<Alert>> = BTreeMap::new();
+    for a in alerts {
+        groups.entry(kind_tag(a.kind)).or_default().push(a);
+    }
+    for (tag, mut group) in groups {
         if group.len() <= MAX_FLOOD_ALERTS_PER_KIND {
             out.extend(group);
             continue;
         }
         group.sort_by(|a, b| {
-            a.first_seen
-                .cmp(&b.first_seen)
+            protected
+                .contains(&b.subject_hash)
+                .cmp(&protected.contains(&a.subject_hash))
+                .then_with(|| b.severity.cmp(&a.severity))
+                .then_with(|| a.first_seen.cmp(&b.first_seen))
                 .then_with(|| a.subject_hash.cmp(&b.subject_hash))
         });
         let rest = group.split_off(MAX_FLOOD_ALERTS_PER_KIND);
         let kind = group[0].kind;
         let subject = subject_key("floodSummary", tag);
+        let n = rest.len();
         let (title, detail) = match kind {
             AlertKind::NewLanDevice => (
-                format!("{} more new devices on your network", rest.len()),
+                format!("{n} more new devices on your network"),
                 "Many devices appeared at once, so they are grouped here instead of listed one by one. This can happen when something is announcing many fake devices.".to_string(),
             ),
-            _ => (
-                format!("{} more watchlist matches", rest.len()),
+            AlertKind::Watchlist => (
+                format!("{n} more watchlist matches"),
                 "Many matches appeared at once, so they are grouped here instead of listed one by one. This can happen when something is broadcasting many look-alike network names.".to_string(),
+            ),
+            _ => (
+                format!("{n} more alerts of the same kind"),
+                "Many alerts of one kind appeared at once, so they are grouped here instead of listed one by one. This can happen when something nearby is broadcasting many fake networks or devices. Your own networks are listed separately.".to_string(),
             ),
         };
         out.extend(group);
@@ -163,6 +195,11 @@ pub fn coalesce_floods(alerts: Vec<Alert>) -> Vec<Alert> {
     out.sort_by(|a, b| {
         b.severity
             .cmp(&a.severity)
+            .then_with(|| {
+                protected
+                    .contains(&b.subject_hash)
+                    .cmp(&protected.contains(&a.subject_hash))
+            })
             .then_with(|| kind_tag(a.kind).cmp(kind_tag(b.kind)))
             .then_with(|| a.subject_hash.cmp(&b.subject_hash))
     });
@@ -1527,7 +1564,7 @@ mod tests {
                 .collect();
             // A different kind is never touched.
             v.push(flood_alert(AlertKind::EvilTwin, Severity::High, 9_999));
-            let out = coalesce_floods(v);
+            let out = coalesce_floods(v, &BTreeSet::new());
             let of_kind: Vec<_> = out.iter().filter(|a| a.kind == kind).collect();
             assert_eq!(of_kind.len(), MAX_FLOOD_ALERTS_PER_KIND + 1, "{kind:?}");
             let summary = of_kind
@@ -1546,6 +1583,7 @@ mod tests {
                 (0..510)
                     .map(|n| flood_alert(kind, Severity::Medium, n))
                     .collect(),
+                &BTreeSet::new(),
             );
             assert_eq!(
                 again
@@ -1567,7 +1605,7 @@ mod tests {
             .collect();
         v.push(flood_alert(AlertKind::Watchlist, Severity::High, 500));
         v.push(flood_alert(AlertKind::Watchlist, Severity::High, 501));
-        let out = coalesce_floods(v);
+        let out = coalesce_floods(v, &BTreeSet::new());
         let high: Vec<_> = out
             .iter()
             .filter(|a| a.severity == Severity::High)
@@ -1577,8 +1615,80 @@ mod tests {
         let small: Vec<Alert> = (0..MAX_FLOOD_ALERTS_PER_KIND)
             .map(|n| flood_alert(AlertKind::NewLanDevice, Severity::Medium, n))
             .collect();
-        let out = coalesce_floods(small.clone());
+        let out = coalesce_floods(small.clone(), &BTreeSet::new());
         assert_eq!(out.len(), small.len());
         assert!(small.iter().all(|a| out.contains(a)));
+    }
+
+    #[test]
+    fn a_high_severity_flood_is_capped_per_kind_and_the_summary_stays_high() {
+        let v: Vec<Alert> = (0..300)
+            .map(|n| flood_alert(AlertKind::EvilTwin, Severity::High, n))
+            .collect();
+        let out = coalesce_floods(v, &BTreeSet::new());
+        assert_eq!(out.len(), MAX_FLOOD_ALERTS_PER_KIND + 1);
+        let summary = out
+            .iter()
+            .find(|a| a.subject_hash == subject_key("floodSummary", kind_tag(AlertKind::EvilTwin)))
+            .expect("summary");
+        assert_eq!(summary.severity, Severity::High);
+        assert!(summary
+            .title
+            .contains(&format!("{}", 300 - MAX_FLOOD_ALERTS_PER_KIND)));
+    }
+
+    #[test]
+    fn an_attack_on_a_trusted_or_mine_network_is_never_the_alert_folded_away() {
+        let home = subject_key("ssid", &fold_ssid("Home-Net"));
+        let mut v: Vec<Alert> = (0..300)
+            .map(|n| flood_alert(AlertKind::EvilTwin, Severity::High, n))
+            .collect();
+        // The real one is the NEWEST, so any oldest-first rule would fold it.
+        let mut real = flood_alert(AlertKind::EvilTwin, Severity::High, 9_000);
+        real.subject_hash = home.clone();
+        v.push(real);
+        let protected: BTreeSet<String> = [home.clone()].into();
+        let out = coalesce_floods(v.clone(), &protected);
+        assert!(
+            out.iter().any(|a| a.subject_hash == home),
+            "kept individually"
+        );
+        // NEGATIVE CONTROL: unprotected, it is folded like any other.
+        let out = coalesce_floods(v, &BTreeSet::new());
+        assert!(!out.iter().any(|a| a.subject_hash == home));
+    }
+
+    #[test]
+    fn protected_subjects_come_from_trusted_networks_and_named_mine_marks() {
+        let mut settings = Settings::default();
+        settings.trusted_networks.push(TrustedNetwork {
+            ssid: "Trusted-Net".into(),
+            known_bssid_hashes: vec![],
+            expected_security: Security::Wpa2Personal,
+        });
+        let ctx = DetectContext {
+            mine: vec![
+                MineEntry {
+                    kind: MineKind::WifiAp,
+                    id_hash: "b1".into(),
+                    label: None,
+                    ssid: Some("Mine-Net".into()),
+                    added_at: 1,
+                },
+                MineEntry {
+                    kind: MineKind::Ble,
+                    id_hash: "x".into(),
+                    label: None,
+                    ssid: Some("Ignored".into()),
+                    added_at: 1,
+                },
+            ],
+            ..DetectContext::default()
+        };
+        let p = protected_subjects(&settings, &ctx);
+        assert!(p.contains(&subject_key("ssid", &fold_ssid("Trusted-Net"))));
+        assert!(p.contains(&subject_key("ssid", &fold_ssid("Mine-Net"))));
+        assert!(!p.contains(&subject_key("ssid", &fold_ssid("Ignored"))));
+        assert_eq!(p.len(), 2);
     }
 }

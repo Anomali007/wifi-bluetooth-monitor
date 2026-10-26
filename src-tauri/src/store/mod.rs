@@ -549,11 +549,42 @@ impl Store {
         for a in alerts {
             let kind = to_json(&a.kind)?;
             let sev = to_json(&a.severity)?;
+            // A dismissed flood summary whose overflow has grown is news again: un-dismiss it
+            // and announce it once more (otherwise one dismissal silences every later flood).
+            let grew = match crate::detect::flood_summary_count(a) {
+                Some(new_n) => {
+                    let old: Option<(String, bool)> = tx
+                        .query_row(
+                            "SELECT title, dismissed FROM alerts WHERE kind = ?1 AND subject_hash = ?2",
+                            params![kind, a.subject_hash],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?;
+                    old.is_some_and(|(title, dismissed)| {
+                        dismissed
+                            && title
+                                .split_whitespace()
+                                .next()
+                                .and_then(|w| w.parse::<usize>().ok())
+                                .is_some_and(|old_n| new_n > old_n)
+                    })
+                }
+                None => false,
+            };
             let updated = tx.execute(
                 "UPDATE alerts SET last_seen = MAX(last_seen, ?1), severity = ?2, title = ?3, detail = ?4
                  WHERE kind = ?5 AND subject_hash = ?6",
                 params![a.last_seen, sev, a.title, a.detail, kind, a.subject_hash],
             )?;
+            if grew {
+                tx.execute(
+                    "UPDATE alerts SET dismissed = 0 WHERE kind = ?1 AND subject_hash = ?2",
+                    params![kind, a.subject_hash],
+                )?;
+                let mut n = a.clone();
+                n.dismissed = false;
+                created.push(n);
+            }
             if updated == 0 {
                 tx.execute(
                     "INSERT INTO alerts (id, kind, severity, title, detail, first_seen, last_seen, subject_hash, dismissed)
@@ -911,6 +942,17 @@ impl Store {
             params![to_json(&e.kind)?, e.id_hash, e.label, e.added_at, by.as_str(), e.ssid],
         )?;
         Ok(())
+    }
+
+    /// [`Store::add_mine`], then the entry as stored: a re-mark without a network name keeps
+    /// the saved one, and the caller (the UI's list) must see that rather than its own input.
+    pub fn mark_mine(&mut self, e: &MineEntry) -> StoreResult<MineEntry> {
+        self.add_mine(e)?;
+        Ok(self
+            .list_mine()?
+            .into_iter()
+            .find(|m| m.kind == e.kind && m.id_hash == e.id_hash)
+            .unwrap_or_else(|| e.clone()))
     }
 
     /// Unmark. Unknown entry is not an error.
@@ -2062,5 +2104,72 @@ mod tests {
             s.migrate().unwrap();
             assert_eq!(s.list_mine().unwrap().len(), 1);
         }
+    }
+
+    fn summary(count: usize) -> Alert {
+        let kind = AlertKind::NewLanDevice;
+        let subject = crate::detect::flood_summary_subject(kind);
+        Alert {
+            id: format!("sum-{count}"),
+            kind,
+            severity: Severity::Medium,
+            title: format!("{count} more new devices on your network"),
+            detail: "grouped".into(),
+            first_seen: 1,
+            last_seen: 2,
+            subject_hash: subject,
+            dismissed: false,
+        }
+    }
+
+    #[test]
+    fn a_dismissed_flood_summary_comes_back_only_when_the_overflow_grows() {
+        let (_d, mut s) = open();
+        assert_eq!(s.upsert_alerts(&[summary(10)]).unwrap().len(), 1);
+        let id = s.get_alerts(true).unwrap()[0].id.clone();
+        s.dismiss_alert(&id).unwrap();
+        // Same overflow, or a smaller one: stays dismissed and silent.
+        assert!(s.upsert_alerts(&[summary(10)]).unwrap().is_empty());
+        assert!(s.upsert_alerts(&[summary(7)]).unwrap().is_empty());
+        assert!(s.get_alerts(false).unwrap().is_empty(), "still dismissed");
+        // More devices than before: un-dismissed and announced again.
+        let again = s.upsert_alerts(&[summary(25)]).unwrap();
+        assert_eq!(again.len(), 1, "re-notified");
+        let shown = s.get_alerts(false).unwrap();
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].title.starts_with("25 "));
+        // NEGATIVE CONTROL: an ordinary alert that is dismissed stays dismissed when it repeats.
+        let mut a = summary(1);
+        a.subject_hash = "plain".into();
+        a.title = "5 not a summary".into();
+        s.upsert_alerts(&[a.clone()]).unwrap();
+        s.dismiss_alert(&a.id).unwrap();
+        a.title = "50 not a summary".into();
+        assert!(s.upsert_alerts(&[a]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn renaming_a_mark_returns_the_stored_entry_with_its_saved_ssid() {
+        let (_d, mut s) = open();
+        let mut e = MineEntry {
+            kind: MineKind::WifiGroup,
+            id_hash: "g1".into(),
+            label: Some("Router".into()),
+            ssid: Some("Net-A".into()),
+            added_at: 5,
+        };
+        s.mark_mine(&e).unwrap();
+        // The rename sends no ssid and a later added_at.
+        e.label = Some("Router (renamed)".into());
+        e.ssid = None;
+        e.added_at = 99;
+        let back = s.mark_mine(&e).unwrap();
+        assert_eq!(
+            back.ssid.as_deref(),
+            Some("Net-A"),
+            "ssid carried through the rename"
+        );
+        assert_eq!(back.label.as_deref(), Some("Router (renamed)"));
+        assert_eq!(back.added_at, 5, "added_at is kept");
     }
 }

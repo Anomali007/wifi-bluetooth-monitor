@@ -167,6 +167,9 @@ pub fn notification_text(alert: &Alert) -> (&'static str, &'static str) {
 /// OS notifications per scan cycle before the rest collapse into one "N more alerts" summary.
 pub const MAX_NOTIFICATIONS_PER_CYCLE: usize = 3;
 
+/// Notifications per cycle even counting High-severity ones; the rest become one summary.
+pub const MAX_NOTIFICATIONS_HARD_CAP: usize = 10;
+
 /// One OS notification to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
@@ -174,8 +177,7 @@ pub struct Notice {
     pub body: String,
 }
 
-/// The notifications for a cycle's new alerts: High-severity alerts first (never dropped, never
-/// summarised), then the rest in order until [`MAX_NOTIFICATIONS_PER_CYCLE`] are used, then one
+/// The notifications for a cycle's new alerts: High-severity alerts first (up to the hard cap), then the rest in order until [`MAX_NOTIFICATIONS_PER_CYCLE`] are used, then one
 /// summary for whatever is left. A flood of spoofed devices or watchlisted names therefore
 /// cannot bury a real alert or spam the user.
 pub fn plan_notifications(alerts: &[Alert]) -> Vec<Notice> {
@@ -185,7 +187,9 @@ pub fn plan_notifications(alerts: &[Alert]) -> Vec<Notice> {
         .iter()
         .filter(|a| a.severity == Severity::High)
         .count();
-    let shown = high.max(MAX_NOTIFICATIONS_PER_CYCLE).min(ordered.len());
+    let shown = high
+        .clamp(MAX_NOTIFICATIONS_PER_CYCLE, MAX_NOTIFICATIONS_HARD_CAP)
+        .min(ordered.len());
     let mut out: Vec<Notice> = ordered[..shown]
         .iter()
         .map(|a| {
@@ -257,11 +261,21 @@ mod notify_tests {
             .iter()
             .any(|n| n.title == "Open network imitating a trusted one"));
         assert!(plan.len() <= MAX_NOTIFICATIONS_PER_CYCLE + 1);
-        // Even more High alerts than the cap: all of them are shown, none summarised away.
-        let many_high: Vec<Alert> = (0..5)
+        // A few High alerts (under the hard cap) are all shown, none summarised away.
+        let few_high: Vec<Alert> = (0..5)
             .map(|n| alert(AlertKind::EvilTwin, Severity::High, n))
             .collect();
-        let plan = plan_notifications(&many_high);
-        assert_eq!(plan.len(), 5);
+        assert_eq!(plan_notifications(&few_high).len(), 5);
+        // A High flood is capped too: the hard cap, then ONE summary.
+        let flood: Vec<Alert> = (0..300)
+            .map(|n| alert(AlertKind::EvilTwin, Severity::High, n))
+            .collect();
+        let plan = plan_notifications(&flood);
+        assert_eq!(plan.len(), MAX_NOTIFICATIONS_HARD_CAP + 1);
+        assert!(plan
+            .last()
+            .unwrap()
+            .body
+            .contains(&format!("{}", 300 - MAX_NOTIFICATIONS_HARD_CAP)));
     }
 }

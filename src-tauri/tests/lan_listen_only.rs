@@ -486,6 +486,271 @@ fn the_sink_needs_a_gate_token_only_may_sweep_can_build() {
     assert!(gate.contains("pub struct GateToken {\n    if_index: u16,\n}"));
 }
 
+// -- N3: other ways to reach the network or run code ------------------------------------------
+
+/// Direct dependencies that can talk HTTP, open a shell, or start a process.
+const DENIED_CRATES: &[&str] = &[
+    "reqwest",
+    "ureq",
+    "hyper",
+    "hyper-util",
+    "isahc",
+    "surf",
+    "attohttpc",
+    "curl",
+    "tauri-plugin-http",
+    "tauri-plugin-shell",
+    "tauri-plugin-process",
+    "tauri-plugin-opener",
+    "tauri-plugin-websocket",
+    "tungstenite",
+    "tokio-tungstenite",
+    "duct",
+    "subprocess",
+    "xshell",
+    "async-process",
+    "cmd_lib",
+];
+
+/// tokio features that add sockets or processes.
+const DENIED_TOKIO_FEATURES: &[&str] = &["net", "process", "full"];
+
+/// Crate names declared under any `[...dependencies]` table, plus tokio's features.
+fn declared_crates(cargo_toml: &str) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
+    let mut tokio_features = Vec::new();
+    let mut in_deps = false;
+    for line in cargo_toml.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_deps = l
+                .trim_matches(|c| c == '[' || c == ']')
+                .ends_with("dependencies");
+            continue;
+        }
+        if !in_deps || l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        if let Some((name, rest)) = l.split_once('=') {
+            let name = name.trim().to_string();
+            if name == "tokio" {
+                if let Some(f) = rest.split("features").nth(1) {
+                    let inner = f.split('[').nth(1).and_then(|x| x.split(']').next());
+                    for feat in inner.unwrap_or("").split(',') {
+                        tokio_features.push(feat.trim().trim_matches('"').to_string());
+                    }
+                }
+            }
+            names.push(name);
+        }
+    }
+    (names, tokio_features)
+}
+
+fn dependency_violations(cargo_toml: &str) -> Vec<String> {
+    let (names, features) = declared_crates(cargo_toml);
+    let mut bad: Vec<String> = names
+        .into_iter()
+        .filter(|n| DENIED_CRATES.contains(&n.as_str()))
+        .map(|n| format!("dependency {n}"))
+        .collect();
+    bad.extend(
+        features
+            .into_iter()
+            .filter(|f| DENIED_TOKIO_FEATURES.contains(&f.as_str()))
+            .map(|f| format!("tokio feature {f}")),
+    );
+    bad
+}
+
+#[test]
+fn no_http_shell_or_process_crate_is_a_dependency() {
+    let toml =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
+    let (names, features) = declared_crates(&toml);
+    // FLOOR: the parser actually found the manifest's dependencies.
+    assert!(
+        names.len() >= 10,
+        "parsed only {} dependencies",
+        names.len()
+    );
+    assert!(names.iter().any(|n| n == "socket2") && features.iter().any(|f| f == "rt"));
+    assert_eq!(dependency_violations(&toml), Vec::<String>::new());
+    // The capability file grants nothing that shells out, fetches or opens.
+    let caps =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/default.json"))
+            .unwrap();
+    for banned in ["shell:", "http:", "process:", "opener:", "websocket:"] {
+        assert!(!caps.contains(banned), "capability {banned}");
+    }
+    // NEGATIVE CONTROLS: each denied crate, in any dependency table, and the tokio features.
+    for c in DENIED_CRATES {
+        for table in [
+            "dependencies",
+            "build-dependencies",
+            "target.'cfg(unix)'.dependencies",
+        ] {
+            let t = format!("[{table}]\n{c} = \"1\"\n");
+            assert!(
+                !dependency_violations(&t).is_empty(),
+                "missed {c} in [{table}]"
+            );
+        }
+    }
+    for f in DENIED_TOKIO_FEATURES {
+        let t = format!(
+            "[dependencies]\ntokio = {{ version = \"1\", features = [\"rt\", \"{f}\"] }}\n"
+        );
+        assert!(!dependency_violations(&t).is_empty(), "missed tokio {f}");
+    }
+    // And a dev-dependency table is parsed too, but an ordinary crate is fine.
+    assert!(dependency_violations("[dev-dependencies]\ntempfile = \"3\"\n").is_empty());
+}
+
+#[test]
+fn build_rs_generates_no_code() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let b = fs::read_to_string(root.join("build.rs")).unwrap();
+    assert_eq!(
+        build_rs_violations(&production_code(&b)),
+        Vec::<String>::new()
+    );
+    // NEGATIVE CONTROLS
+    for bad in [
+        "fn main() { std::fs::write(\"src/gen.rs\", \"x\").unwrap(); }",
+        "fn main() { let _ = std::fs::File::create(\"src/x.rs\"); }",
+        "fn main() { let p = std::env::var(\"OUT_DIR\"); }",
+        "fn main() { std::process::Command::new(\"sh\"); }",
+        "fn main() { println!(\"cargo:rustc-env=X=1\"); }",
+    ] {
+        assert!(!build_rs_violations(bad).is_empty(), "missed {bad}");
+    }
+    assert!(build_rs_violations("fn main() { tauri_build::build() }").is_empty());
+    // Nothing pulls generated code in: the include!/#[path bans below cover the other end.
+}
+
+fn build_rs_violations(code: &str) -> Vec<String> {
+    let mut bad = Vec::new();
+    for pat in [
+        r"fs::write",
+        r"File::create",
+        r"OpenOptions",
+        r"OUT_DIR",
+        r"Command",
+        r"cargo:rustc-env",
+        r"cargo:rustc-cfg",
+        r"\bsrc\b",
+    ] {
+        if Regex::new(pat).unwrap().is_match(code) {
+            bad.push(pat.to_string());
+        }
+    }
+    bad
+}
+
+/// Ways to pull in code or reach the OS that the text scan could otherwise not see. None is
+/// used by the crate; add an explicit allowlist entry here if one ever must be.
+const CODE_ESCAPE_PATTERNS: &[&str] = &[
+    r"include!\s*\(",
+    r"#\s*\[\s*path\b",
+    r#"extern\s+"C""#,
+    r"transmute",
+    r"libc::syscall",
+    r"\bsyscall\s*\(",
+    r"reqwest|ureq|hyper::|isahc|attohttpc|surf::|curl::",
+    r"tauri_plugin_(shell|http|process|opener|websocket)",
+    r"\.shell\(\)",
+    r"\.opener\(\)",
+];
+
+/// Explicit allowlist: (file, pattern) pairs that are known and reviewed. Empty today.
+const CODE_ESCAPE_ALLOWED: &[(&str, &str)] = &[];
+
+fn escape_violations(root: &Path) -> Vec<String> {
+    let mut bad = Vec::new();
+    for (rel, src) in rs_files(root) {
+        let code = production_code(&src);
+        for p in CODE_ESCAPE_PATTERNS {
+            if CODE_ESCAPE_ALLOWED.contains(&(rel.as_str(), *p)) {
+                continue;
+            }
+            if Regex::new(p).unwrap().is_match(&code) {
+                bad.push(format!("{rel}: /{p}/"));
+            }
+        }
+        if rel == "lan/sweep.rs" {
+            // A plain file or socket write has no business in the sweep: it sends only through
+            // the two send_to sites.
+            for p in [
+                r"\.write\(",
+                r"write_all\(",
+                r"write_vectored",
+                r"\bwrite!\(",
+            ] {
+                if Regex::new(p).unwrap().is_match(&code) {
+                    bad.push(format!("{rel}: /{p}/"));
+                }
+            }
+        }
+    }
+    bad
+}
+
+#[test]
+fn no_code_inclusion_ffi_or_http_shell_use_anywhere_in_src() {
+    assert_eq!(escape_violations(&src_dir()), Vec::<String>::new());
+    // NEGATIVE CONTROLS: each spelling, outside src/lan and inside it.
+    let samples = [
+        "fn f() { reqwest::get(u); }",
+        "fn f() { ureq::get(u); }",
+        "fn f() { hyper::Client::new(); }",
+        "fn f() { app.shell().command(\"sh\"); }",
+        "use tauri_plugin_shell::ShellExt;",
+        "include!(\"gen.rs\");",
+        "#[path = \"other.rs\"]\nmod m;",
+        "extern \"C\" { fn sendto(); }",
+        "fn f() { unsafe { std::mem::transmute::<u8, i8>(1) }; }",
+        "fn f() { unsafe { libc::syscall(1) }; }",
+    ];
+    for s in samples {
+        for rel in ["commands.rs", "lan/arp.rs"] {
+            let t = tree(&[(rel, s)]);
+            assert!(
+                !escape_violations(t.path()).is_empty(),
+                "missed `{s}` in {rel}"
+            );
+        }
+    }
+    // Test-only code is ignored; production code behind an early cfg(test) is not.
+    let t = tree(&[(
+        "commands.rs",
+        "fn f() {}\n#[cfg(test)]\nmod tests { fn g() { reqwest::get(u); } }\n",
+    )]);
+    assert!(escape_violations(t.path()).is_empty());
+    let t = tree(&[(
+        "commands.rs",
+        "#[cfg(test)]\nfn helper() {}\nfn go() { include!(\"x.rs\"); }\n",
+    )]);
+    assert!(!escape_violations(t.path()).is_empty());
+    // sweep.rs: a socket or file write is caught there (and only there).
+    for w in [
+        "f.write(b\"x\")",
+        "f.write_all(b\"x\")",
+        "f.write_vectored(&b)",
+    ] {
+        let t = tree(&[("lan/sweep.rs", &format!("fn f() {{ {w}; }}"))]);
+        assert!(
+            !escape_violations(t.path()).is_empty(),
+            "missed {w} in sweep.rs"
+        );
+        let t = tree(&[("lan/helper.rs", &format!("fn f() {{ {w}; }}"))]);
+        assert!(
+            escape_violations(t.path()).is_empty(),
+            "{w} is fine outside sweep.rs"
+        );
+    }
+}
+
 #[test]
 fn the_bundled_jobs_are_exactly_arp_and_ndp_and_nothing_else_ships() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

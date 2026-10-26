@@ -603,6 +603,9 @@ pub struct NetworkInfo {
     /// Why no neighbor table could be read (Apple's `arp`/`ndp` unavailable), so the page can
     /// say it is showing announced devices only. `None` when neighbors were readable.
     pub neighbor_note: Option<String>,
+    /// Why a sweep will not run although the setting is on and the access point is Mine (a mark
+    /// without a saved network name, a hidden name, a different name). `None` otherwise.
+    pub sweep_note: Option<String>,
 }
 
 impl Default for NetworkInfo {
@@ -618,6 +621,7 @@ impl Default for NetworkInfo {
             mode: LanMode::Passive,
             last_sweep_at: None,
             neighbor_note: None,
+            sweep_note: None,
         }
     }
 }

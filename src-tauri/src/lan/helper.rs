@@ -166,19 +166,38 @@ impl super::systools::Runner for FileRunner {
     }
 }
 
-/// Create the data folder if needed and make it private (0700) so the output files, which
-/// launchd creates readable, cannot be listed or read by other accounts; bound the files left
-/// over from a closed app. Call this BEFORE anything is created inside it (the database).
-pub fn prepare_dir(dir: &Path) {
-    let _ = std::fs::create_dir_all(dir);
+/// Whether the data folder is acceptable: a real directory (not a symlink to one) owned by us.
+pub fn dir_ok(is_dir: bool, is_symlink: bool, uid: u32, euid: u32) -> bool {
+    is_dir && !is_symlink && uid == euid
+}
+
+/// Create the data folder if needed, check it is a real directory owned by this user (a
+/// symlinked or foreign folder could redirect the database and the launchd output files), and
+/// make it private (0700) so the output files, which launchd creates readable, cannot be listed
+/// or read by other accounts; bound the files left over from a closed app. Call this BEFORE
+/// anything is created inside it (the database), and do not open the database on `Err`.
+pub fn prepare_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create the data folder: {e}"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let m = std::fs::symlink_metadata(dir)
+            .map_err(|e| format!("cannot inspect the data folder: {e}"))?;
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        if !dir_ok(m.is_dir(), m.file_type().is_symlink(), m.uid(), euid) {
+            return Err(
+                "the data folder is not a real directory owned by this user (a link or another account's folder)"
+                    .to_string(),
+            );
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot make the data folder private: {e}"))?;
     }
     set_data_dir(dir);
     cap(&dir.join(ARP_OUT));
     cap(&dir.join(NDP_OUT));
+    Ok(())
 }
 
 /// Turn the background item on or off, deleting the output files when off.
@@ -825,15 +844,46 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("data");
-        prepare_dir(&dir);
+        prepare_dir(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         // Loose permissions on an existing folder are tightened.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        prepare_dir(&dir);
+        prepare_dir(&dir).unwrap();
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn only_a_real_directory_of_ours_is_an_acceptable_data_folder() {
+        assert!(dir_ok(true, false, 501, 501));
+        assert!(!dir_ok(true, true, 501, 501), "a symlink");
+        assert!(!dir_ok(false, false, 501, 501), "not a directory");
+        assert!(!dir_ok(true, false, 0, 501), "someone else's");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_or_file_data_folder_is_refused_and_nothing_is_chmodded() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(prepare_dir(&link).is_err());
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the link's target was not touched"
+        );
+        let file = base.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(prepare_dir(&file).is_err());
+        // NEGATIVE CONTROL: the real folder is accepted.
+        assert!(prepare_dir(&real).is_ok());
     }
 }

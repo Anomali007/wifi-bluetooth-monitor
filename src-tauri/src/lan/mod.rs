@@ -35,7 +35,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use crate::model::{
-    hash_identifier, LanDevice, LanMode, LanSource, Millis, MineEntry, NetworkInfo, Salt,
+    hash_identifier, LanDevice, LanMode, LanSource, Millis, MineEntry, MineKind, NetworkInfo, Salt,
     ScanError, Settings,
 };
 use crate::store::{Store, StoreResult};
@@ -164,6 +164,7 @@ fn build_info(link: &Link, inputs: &LanInputs, state: &LanState) -> NetworkInfo 
     let gate_in = gate_for(link, inputs, key.as_deref());
     let sweep_enabled = gate::sweep_gate(&gate_in).is_ok();
     let last_sweep_at = state.last_sweep_for(key.as_deref());
+    let note = sweep_note(link, inputs, &gate_in);
     NetworkInfo {
         ssid: link.ssid.clone(),
         bssid_hash: link.bssid_hash.clone(),
@@ -179,7 +180,34 @@ fn build_info(link: &Link, inputs: &LanInputs, state: &LanState) -> NetworkInfo 
         last_sweep_at,
         network_key: key,
         neighbor_note: state.neighbor_note.clone(),
+        sweep_note: note,
     }
+}
+
+/// Why a sweep will not run on a network the user marked, when the setting is on: said on the
+/// status line instead of only after pressing "Sweep now".
+fn sweep_note(link: &Link, inputs: &LanInputs, gate_in: &GateInput) -> Option<String> {
+    if !gate_in.setting_on || !gate_in.ap_is_mine || gate_in.ssid_ok {
+        return None;
+    }
+    let note = if link.ssid.is_none() {
+        "The network name is hidden (Location access may be missing), so the sweep cannot check it against your mark."
+    } else {
+        let saved_name = inputs.mine.iter().any(|m| {
+            let same = match m.kind {
+                MineKind::WifiAp => link.bssid_hash.as_deref() == Some(m.id_hash.as_str()),
+                MineKind::WifiGroup => link.group_id.as_deref() == Some(m.id_hash.as_str()),
+                _ => false,
+            };
+            same && m.ssid.is_some()
+        });
+        if saved_name {
+            "This network's name is not the one saved when you marked this access point as yours, so the sweep will not run."
+        } else {
+            "This access point was marked as yours before network names were saved. Mark it as mine again to allow the sweep."
+        }
+    };
+    Some(note.to_string())
 }
 
 /// The key a device with no known hardware address is stored under: a salted hash of its mDNS
@@ -744,7 +772,6 @@ pub fn record(store: &mut Store, outcome: &LanScanOutcome, _now: Millis) -> Stor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::MineKind;
     use gate::Subnet;
     use mdns::{Announcement, Heard};
 
@@ -1042,6 +1069,32 @@ mod tests {
         let (rec, stats, _) = gated(sweepable(), usize::MAX, live(true, vec![mine_ap("ap-1")]));
         assert!(!stats.aborted);
         assert_eq!(rec.udp, 253);
+    }
+
+    #[test]
+    fn the_network_status_says_why_a_marked_network_will_not_sweep() {
+        let st = LanState::default();
+        let note =
+            |l: &Link, m: Vec<MineEntry>, on: bool| build_info(l, &inputs(on, m), &st).sweep_note;
+        // Legacy mark (no saved name).
+        let mut legacy = mine_ap("ap-1");
+        legacy.ssid = None;
+        let n = note(&link(), vec![legacy.clone()], true).expect("a reason");
+        assert!(n.contains("Mark it as mine again"), "{n}");
+        // Hidden network name (no Location access).
+        let mut hidden = link();
+        hidden.ssid = None;
+        let n = note(&hidden, vec![mine_ap("ap-1")], true).expect("a reason");
+        assert!(n.contains("hidden"), "{n}");
+        // Different name than the one saved.
+        let mut other = link();
+        other.ssid = Some("Net-X".into());
+        let n = note(&other, vec![mine_ap("ap-1")], true).expect("a reason");
+        assert!(n.contains("not the one saved"), "{n}");
+        // NEGATIVE CONTROLS: a good mark, the setting off, and an unmarked network say nothing.
+        assert_eq!(note(&link(), vec![mine_ap("ap-1")], true), None);
+        assert_eq!(note(&link(), vec![legacy], false), None);
+        assert_eq!(note(&link(), vec![], true), None);
     }
 
     #[test]

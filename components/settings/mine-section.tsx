@@ -101,7 +101,12 @@ function MineRow({
             <button
               onClick={() =>
                 guard(async () => {
-                  await mineStore.mark(entry.kind, entry.idHash, cleanLabel(draft));
+                  await mineStore.mark(
+                    entry.kind,
+                    entry.idHash,
+                    cleanLabel(draft),
+                    entry.ssid ?? null,
+                  );
                   setDraft(null);
                 })
               }

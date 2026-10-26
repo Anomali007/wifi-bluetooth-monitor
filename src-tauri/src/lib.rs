@@ -77,7 +77,11 @@ pub fn run() {
             }
             let dir = app.path().app_data_dir()?;
             // Lock the folder (0700) BEFORE the database is created inside it.
-            lan::helper::prepare_dir(&dir);
+            if let Err(e) = lan::helper::prepare_dir(&dir) {
+                // Refuse to start rather than put the database in a folder we cannot trust.
+                log::error!("data folder refused: {e}");
+                return Err(e.into());
+            }
             let store = store::Store::open(&dir)?;
             let settings = store.get_settings().ok();
             let notify = settings.as_ref().map(|s| s.notify).unwrap_or(true);
