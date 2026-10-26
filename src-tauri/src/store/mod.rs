@@ -791,6 +791,17 @@ impl Store {
         Ok(())
     }
 
+    /// [`Store::add_mine`], then the entry as stored: a re-mark without a network name keeps
+    /// the saved one, and the caller (the UI's list) must see that rather than its own input.
+    pub fn mark_mine(&mut self, e: &MineEntry) -> StoreResult<MineEntry> {
+        self.add_mine(e)?;
+        Ok(self
+            .list_mine()?
+            .into_iter()
+            .find(|m| m.kind == e.kind && m.id_hash == e.id_hash)
+            .unwrap_or_else(|| e.clone()))
+    }
+
     /// Unmark. Unknown entry is not an error.
     pub fn remove_mine(&mut self, kind: MineKind, id_hash: &str) -> StoreResult<()> {
         self.conn.execute(
@@ -1883,5 +1894,30 @@ mod tests {
         s.dismiss_alert(&a.id).unwrap();
         a.title = "50 not a summary".into();
         assert!(s.upsert_alerts(&[a]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn renaming_a_mark_returns_the_stored_entry_with_its_saved_ssid() {
+        let (_d, mut s) = open();
+        let mut e = MineEntry {
+            kind: MineKind::WifiGroup,
+            id_hash: "g1".into(),
+            label: Some("Router".into()),
+            ssid: Some("Net-A".into()),
+            added_at: 5,
+        };
+        s.mark_mine(&e).unwrap();
+        // The rename sends no ssid and a later added_at.
+        e.label = Some("Router (renamed)".into());
+        e.ssid = None;
+        e.added_at = 99;
+        let back = s.mark_mine(&e).unwrap();
+        assert_eq!(
+            back.ssid.as_deref(),
+            Some("Net-A"),
+            "ssid carried through the rename"
+        );
+        assert_eq!(back.label.as_deref(), Some("Router (renamed)"));
+        assert_eq!(back.added_at, 5, "added_at is kept");
     }
 }

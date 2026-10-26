@@ -332,8 +332,7 @@ pub async fn add_mine(
             .filter(|n| !n.is_empty()),
         added_at: pipeline::now_ms(),
     };
-    store.add_mine(&entry).map_err(|e| e.to_string())?;
-    Ok(entry)
+    store.mark_mine(&entry).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

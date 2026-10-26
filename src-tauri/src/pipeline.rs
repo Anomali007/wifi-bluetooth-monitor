@@ -161,8 +161,7 @@ pub fn plan_notifications(alerts: &[Alert]) -> Vec<Notice> {
         .filter(|a| a.severity == Severity::High)
         .count();
     let shown = high
-        .min(MAX_NOTIFICATIONS_HARD_CAP)
-        .max(MAX_NOTIFICATIONS_PER_CYCLE)
+        .clamp(MAX_NOTIFICATIONS_PER_CYCLE, MAX_NOTIFICATIONS_HARD_CAP)
         .min(ordered.len());
     let mut out: Vec<Notice> = ordered[..shown]
         .iter()
