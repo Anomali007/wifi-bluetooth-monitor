@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import localFont from "next/font/local";
 import "./globals.css";
 import { MonitorProvider } from "@/components/monitor-provider";
+import CommandPalette from "@/components/command-palette";
 import Nav from "@/components/nav";
 
 const geistSans = localFont({
@@ -32,6 +33,7 @@ export default function RootLayout({
       >
         <MonitorProvider>
           <Nav />
+          <CommandPalette />
           <main className="container mx-auto p-4">{children}</main>
         </MonitorProvider>
       </body>

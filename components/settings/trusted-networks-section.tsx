@@ -30,7 +30,7 @@ export default function TrustedNetworksSection({
   const trustedSsids = new Set(draft.trustedNetworks.map((t) => t.ssid));
 
   return (
-    <section className="space-y-3 rounded-xl border bg-card p-4 shadow">
+    <section id="trusted-networks" className="scroll-mt-4 space-y-3 rounded-xl border bg-card p-4 shadow">
       <h2 className="font-semibold">Trusted networks</h2>
       <p className="text-sm text-muted-foreground">
         If a trusted name shows up from unfamiliar hardware or weaker security,
@@ -65,7 +65,7 @@ export default function TrustedNetworksSection({
         ))}
       </ul>
       <div>
-        <h3 className="mb-1 text-sm font-medium">Add from current scan</h3>
+        <h3 id="trusted-add" className="mb-1 text-sm font-medium">Add from current scan</h3>
         {candidates.size === 0 ? (
           <p className="text-sm text-muted-foreground">
             No named networks in the latest scan (Location permission may be

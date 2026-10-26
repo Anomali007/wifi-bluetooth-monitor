@@ -111,7 +111,7 @@ export default function DeviceTable({ rows }: { rows: DeviceRow[] }) {
         </thead>
         <tbody>
           {rows.map((r) => (
-            <tr key={r.key} className="border-b last:border-0">
+            <tr key={r.key} id={`row-${r.key}`} className="border-b last:border-0">
               <td className="p-2">{r.type}</td>
               <td className="p-2">
                 {r.name}

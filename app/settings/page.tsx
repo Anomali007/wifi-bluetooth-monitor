@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMonitor } from "@/components/monitor-provider";
 import AgentRequestsSection from "@/components/settings/agent-requests-section";
 import AlertsSection from "@/components/settings/alerts-section";
@@ -11,6 +11,7 @@ import ScanningSection from "@/components/settings/scanning-section";
 import TrustedNetworksSection from "@/components/settings/trusted-networks-section";
 import WatchlistSection from "@/components/settings/watchlist-section";
 import { STALE_SETTINGS_NOTICE, isStaleSettingsError } from "@/lib/agent-requests";
+import { reveal } from "@/lib/reveal";
 import type { Settings } from "@/lib/types";
 
 export default function SettingsPage() {
@@ -19,6 +20,19 @@ export default function SettingsPage() {
   const [edits, setDraft] = useState<Settings | null>(null);
   const draft = edits ?? settings;
   const [status, setStatus] = useState<string | null>(null);
+
+  // Arriving with #id (a search result, or a pasted link): scroll to it once the page has rendered.
+  const ready = draft !== null;
+  useEffect(() => {
+    if (!ready) return;
+    let id = "";
+    try {
+      id = decodeURIComponent(window.location.hash.slice(1));
+    } catch {
+      return; // malformed escape in a pasted link: ignore it rather than blank the page
+    }
+    return id ? reveal(id) : undefined;
+  }, [ready]);
 
   if (!draft) return <p className="text-sm text-muted-foreground">Loading settings...</p>;
 

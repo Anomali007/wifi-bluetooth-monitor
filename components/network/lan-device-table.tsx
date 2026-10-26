@@ -37,7 +37,7 @@ export default function LanDeviceTable({ devices }: { devices: LanDevice[] }) {
         </thead>
         <tbody>
           {devices.map((d) => (
-            <tr key={`${d.networkKey}-${d.macHash}`} className="border-b last:border-0">
+            <tr key={`${d.networkKey}-${d.macHash}`} id={`lan-${d.networkKey}-${d.macHash}`} className="border-b last:border-0">
               <td className="p-2">
                 {deviceName(d)}
                 {d.possiblySameAs && (

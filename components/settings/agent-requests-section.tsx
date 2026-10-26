@@ -7,7 +7,7 @@ import {
   listAgentProposals,
   undoAgentChange,
 } from "@/lib/api";
-import { AGENT_REQUESTS_ID, expiresIn, toolLabel } from "@/lib/agent-requests";
+import { expiresIn, toolLabel } from "@/lib/agent-requests";
 import { formatDateTime } from "@/lib/format";
 import type { AgentAuditEntry, AgentProposal } from "@/lib/types";
 
@@ -83,7 +83,7 @@ export default function AgentRequestsSection() {
 
   return (
     <section
-      id={AGENT_REQUESTS_ID}
+      id="agent-requests"
       className="scroll-mt-4 space-y-3 rounded-xl border bg-card p-4 shadow"
     >
       <h2 className="font-semibold">Agent requests</h2>

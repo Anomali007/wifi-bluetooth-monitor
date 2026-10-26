@@ -146,7 +146,7 @@ describe("the UI is wired", () => {
   it("the Settings section has the stable id and the page renders it first", () => {
     expect(AGENT_REQUESTS_ID).toBe("agent-requests");
     const section = read("components/settings/agent-requests-section.tsx");
-    expect(section).toContain("id={AGENT_REQUESTS_ID}");
+    expect(section).toContain(`id="${AGENT_REQUESTS_ID}"`);
     expect(section).toContain("Approve");
     expect(section).toContain("Reject");
     expect(section).toContain("Undo");
