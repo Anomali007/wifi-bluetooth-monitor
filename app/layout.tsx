@@ -17,7 +17,7 @@ const geistMono = localFont({
 
 export const metadata: Metadata = {
   title: "Network Security Monitor",
-  description: "Passive, listen-only Wi-Fi and Bluetooth monitor",
+  description: "Passive Wi-Fi and Bluetooth monitor (listen-only unless you turn on the network sweep)",
 };
 
 export default function RootLayout({

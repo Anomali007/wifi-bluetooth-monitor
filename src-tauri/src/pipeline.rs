@@ -3,11 +3,13 @@
 //! Kept free of Tauri types so the whole path can be exercised with synthetic observations
 //! (`tests/pipeline.rs`). The Tauri-facing loop lives in [`crate::commands`].
 
-use crate::detect;
+use crate::detect::{self, DetectContext};
+use crate::lan::{self, LanScanOutcome};
 use crate::model::{
     Alert, AlertKind, BleObservation, Millis, PermissionState, PermissionStatus, ScanError,
-    ScanErrorCode, ScanResult, ScanSource, WifiObservation,
+    ScanErrorCode, ScanResult, ScanSource, Severity, WifiObservation,
 };
+use crate::places;
 use crate::store::{Store, StoreResult};
 
 /// Current Unix time in milliseconds.
@@ -63,11 +65,36 @@ pub fn assemble(
 /// created by this call: those drive events and notifications, so a repeat sighting of the
 /// same condition returns nothing.
 pub fn ingest(store: &mut Store, scan: &ScanResult, now: Millis) -> StoreResult<Vec<Alert>> {
+    ingest_with(store, scan, None, now)
+}
+
+/// [`ingest`] plus this cycle's LAN observation: store the scan, record LAN devices, update
+/// place memory, purge place data by `place_retention_days`, then evaluate with a
+/// [`DetectContext`] built from the store.
+pub fn ingest_with(
+    store: &mut Store,
+    scan: &ScanResult,
+    lan_outcome: Option<&LanScanOutcome>,
+    now: Millis,
+) -> StoreResult<Vec<Alert>> {
     store.insert_scan(scan)?;
     let settings = store.get_settings()?;
+    if let Some(outcome) = lan_outcome {
+        lan::record(store, outcome, now)?;
+    }
+    places::update(store, scan, &settings, now)?;
+    store.purge_places(settings.place_retention_days, now)?;
     let since = now - Millis::from(settings.retention_hours) * 3_600_000;
     let history = store.get_history(since)?;
-    let alerts = detect::evaluate(&history, &settings, now);
+    let ctx = DetectContext {
+        mine: store.list_mine()?,
+        watchlist: store.list_watchlist()?,
+        places: store.list_places()?,
+        place_sightings: store.list_place_sightings()?,
+        lan_devices: store.list_lan_devices(None)?,
+        current_network: lan_outcome.map(|o| o.network.clone()),
+    };
+    let alerts = detect::evaluate_with(&history, &settings, &ctx, now);
     store.upsert_alerts(&alerts)
 }
 
@@ -95,5 +122,133 @@ pub fn notification_text(alert: &Alert) -> (&'static str, &'static str) {
             "New Bluetooth device",
             "A device you have not seen before appeared nearby. Open the app for details.",
         ),
+        AlertKind::FollowedAcrossPlaces => (
+            "Possible device following you",
+            "Something has shown up at more than one of your places. Open the app for details.",
+        ),
+        AlertKind::Watchlist => (
+            "Watchlist match",
+            "Something on your watchlist is nearby. Open the app for details.",
+        ),
+        AlertKind::NewLanDevice => (
+            "New device on your network",
+            "A device you have not seen before joined a network you marked as yours. Open the app for details.",
+        ),
+    }
+}
+
+/// OS notifications per scan cycle before the rest collapse into one "N more alerts" summary.
+pub const MAX_NOTIFICATIONS_PER_CYCLE: usize = 3;
+
+/// Notifications per cycle even counting High-severity ones; the rest become one summary.
+pub const MAX_NOTIFICATIONS_HARD_CAP: usize = 10;
+
+/// One OS notification to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub title: String,
+    pub body: String,
+}
+
+/// The notifications for a cycle's new alerts: High-severity alerts first (up to the hard cap), then the rest in order until [`MAX_NOTIFICATIONS_PER_CYCLE`] are used, then one
+/// summary for whatever is left. A flood of spoofed devices or watchlisted names therefore
+/// cannot bury a real alert or spam the user.
+pub fn plan_notifications(alerts: &[Alert]) -> Vec<Notice> {
+    let mut ordered: Vec<&Alert> = alerts.iter().collect();
+    ordered.sort_by_key(|a| std::cmp::Reverse(a.severity)); // stable: ties keep their order
+    let high = ordered
+        .iter()
+        .filter(|a| a.severity == Severity::High)
+        .count();
+    let shown = high
+        .clamp(MAX_NOTIFICATIONS_PER_CYCLE, MAX_NOTIFICATIONS_HARD_CAP)
+        .min(ordered.len());
+    let mut out: Vec<Notice> = ordered[..shown]
+        .iter()
+        .map(|a| {
+            let (t, b) = notification_text(a);
+            Notice {
+                title: t.into(),
+                body: b.into(),
+            }
+        })
+        .collect();
+    let rest = ordered.len() - shown;
+    if rest > 0 {
+        out.push(Notice {
+            title: "More alerts".into(),
+            body: format!("{rest} more alerts were raised. Open the app for details."),
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::*;
+
+    fn alert(kind: AlertKind, sev: Severity, n: usize) -> Alert {
+        Alert {
+            id: format!("id{n}"),
+            kind,
+            severity: sev,
+            title: format!("t{n}"),
+            detail: String::new(),
+            first_seen: 0,
+            last_seen: 0,
+            subject_hash: format!("s{n}"),
+            dismissed: false,
+        }
+    }
+
+    #[test]
+    fn a_flood_of_new_alerts_produces_a_capped_number_of_notifications() {
+        let alerts: Vec<Alert> = (0..510)
+            .map(|n| alert(AlertKind::NewLanDevice, Severity::Medium, n))
+            .collect();
+        let plan = plan_notifications(&alerts);
+        assert_eq!(plan.len(), MAX_NOTIFICATIONS_PER_CYCLE + 1);
+        let last = plan.last().unwrap();
+        assert!(last
+            .body
+            .contains(&format!("{}", 510 - MAX_NOTIFICATIONS_PER_CYCLE)));
+        // NEGATIVE CONTROL: at or under the cap there is no summary.
+        let few = plan_notifications(&alerts[..MAX_NOTIFICATIONS_PER_CYCLE]);
+        assert_eq!(few.len(), MAX_NOTIFICATIONS_PER_CYCLE);
+        assert!(few.iter().all(|n| n.title == "New device on your network"));
+    }
+
+    #[test]
+    fn high_severity_alerts_are_never_the_ones_dropped_from_notification() {
+        // The High alerts come LAST in the input, where a naive "first N" would drop them.
+        let mut alerts: Vec<Alert> = (0..50)
+            .map(|n| alert(AlertKind::Watchlist, Severity::Medium, n))
+            .collect();
+        alerts.push(alert(AlertKind::EvilTwin, Severity::High, 900));
+        alerts.push(alert(AlertKind::OpenLookalike, Severity::High, 901));
+        let plan = plan_notifications(&alerts);
+        assert!(plan
+            .iter()
+            .any(|n| n.title == "Possible evil-twin Wi-Fi network"));
+        assert!(plan
+            .iter()
+            .any(|n| n.title == "Open network imitating a trusted one"));
+        assert!(plan.len() <= MAX_NOTIFICATIONS_PER_CYCLE + 1);
+        // A few High alerts (under the hard cap) are all shown, none summarised away.
+        let few_high: Vec<Alert> = (0..5)
+            .map(|n| alert(AlertKind::EvilTwin, Severity::High, n))
+            .collect();
+        assert_eq!(plan_notifications(&few_high).len(), 5);
+        // A High flood is capped too: the hard cap, then ONE summary.
+        let flood: Vec<Alert> = (0..300)
+            .map(|n| alert(AlertKind::EvilTwin, Severity::High, n))
+            .collect();
+        let plan = plan_notifications(&flood);
+        assert_eq!(plan.len(), MAX_NOTIFICATIONS_HARD_CAP + 1);
+        assert!(plan
+            .last()
+            .unwrap()
+            .body
+            .contains(&format!("{}", 300 - MAX_NOTIFICATIONS_HARD_CAP)));
     }
 }

@@ -14,12 +14,20 @@ import type {
   Alert,
   BleObservation,
   History,
+  LanDevice,
   Millis,
+  MineEntry,
+  MineKind,
+  NetworkInfo,
   PermissionState,
+  Place,
   ScanError,
   ScanResult,
   ScanSnapshot,
   Settings,
+  WatchKind,
+  WatchMatch,
+  WatchlistEntry,
   WifiObservation,
 } from "./types";
 import { DEFAULT_SETTINGS, EVENT_ALERT, EVENT_SCAN } from "./types";
@@ -54,6 +62,12 @@ const H_PHONE = fakeHash(0xe2);
 const H_BUDS = fakeHash(0xe3);
 const H_WATCH = fakeHash(0xe4);
 const H_NEW = fakeHash(0xe5);
+const H_GROUP_A = fakeHash(0xf1);
+const H_LAN_NET = fakeHash(0xf2);
+const H_LAN_1 = fakeHash(0xf3);
+const H_LAN_2 = fakeHash(0xf4);
+const H_LAN_3 = fakeHash(0xf5);
+const H_PLACE_1 = fakeHash(0xf5);
 
 let settings: Settings = {
   ...DEFAULT_SETTINGS,
@@ -86,6 +100,8 @@ function wifiAt(now: Millis, step: number): WifiObservation[] {
       channel: 36,
       security: "wpa2Personal",
       seenAt: now,
+      vendor: "Vendor-A",
+      groupId: H_GROUP_A,
     },
     {
       ssid: "Net-A",
@@ -94,6 +110,8 @@ function wifiAt(now: Millis, step: number): WifiObservation[] {
       channel: 6,
       security: "wpa2Personal",
       seenAt: now,
+      vendor: "Private address",
+      groupId: H_GROUP_A,
     },
     {
       ssid: "Cafe-Guest",
@@ -102,6 +120,8 @@ function wifiAt(now: Millis, step: number): WifiObservation[] {
       channel: 11,
       security: "wpa2Personal",
       seenAt: now,
+      vendor: "Vendor-A",
+      groupId: null,
     },
     {
       ssid: "Cafe-Guest",
@@ -110,6 +130,8 @@ function wifiAt(now: Millis, step: number): WifiObservation[] {
       channel: 1,
       security: "open",
       seenAt: now,
+      vendor: "Private address",
+      groupId: null,
     },
     {
       ssid: "Home-5G",
@@ -118,6 +140,8 @@ function wifiAt(now: Millis, step: number): WifiObservation[] {
       channel: 149,
       security: "wpa3Personal",
       seenAt: now,
+      vendor: "Vendor-A",
+      groupId: null,
     },
     {
       ssid: "Office-Corp",
@@ -126,11 +150,13 @@ function wifiAt(now: Millis, step: number): WifiObservation[] {
       channel: 44,
       security: "wpa2Enterprise",
       seenAt: now,
+      vendor: "Vendor-A",
+      groupId: null,
     },
   ];
   // Without Location permission macOS withholds SSID and BSSID.
   return denied
-    ? rows.map((r) => ({ ...r, ssid: null, bssidHash: null }))
+    ? rows.map((r) => ({ ...r, ssid: null, bssidHash: null, vendor: null, groupId: null }))
     : rows;
 }
 
@@ -285,6 +311,40 @@ function buildAlerts(): Alert[] {
       dismissed: false,
     },
     {
+      id: "mock-followed",
+      kind: "followedAcrossPlaces",
+      severity: "high",
+      title: "Possible device following you",
+      detail:
+        "A network that appears wherever you go: seen at Home and Place 2, at least 30 minutes apart. This may be a portable access point, or a coincidence.",
+      firstSeen: now - 6 * 60 * MIN,
+      lastSeen: now - 1 * MIN,
+      subjectHash: H_GROUP_A,
+      dismissed: false,
+    },
+    {
+      id: "mock-watchlist",
+      kind: "watchlist",
+      severity: "medium",
+      title: "Watchlist match: Net-A",
+      detail: "A network on your watchlist is nearby (Vendor-A).",
+      firstSeen: now - 2 * 60 * MIN,
+      lastSeen: now - 1 * MIN,
+      subjectHash: H_NET_A,
+      dismissed: false,
+    },
+    {
+      id: "mock-new-lan-device",
+      kind: "newLanDevice",
+      severity: "medium",
+      title: "New device on your network",
+      detail: "A device not seen before appeared on Net-A (Vendor-A).",
+      firstSeen: now - 10 * MIN,
+      lastSeen: now - 1 * MIN,
+      subjectHash: H_LAN_2,
+      dismissed: false,
+    },
+    {
       id: "mock-new-device",
       kind: "newDevice",
       severity: "info",
@@ -304,6 +364,105 @@ const dismissedIds = new Set<string>();
 function allAlerts(): Alert[] {
   if (!alerts) alerts = buildAlerts();
   return alerts.map((a) => ({ ...a, dismissed: dismissedIds.has(a.id) }));
+}
+
+// ---- v2 state: places, Mine, watchlist, LAN (all synthetic) -------------------
+
+const DAY = 24 * 60 * MIN;
+
+let places: Place[] = [
+  {
+    id: 1,
+    label: "Home",
+    members: [H_NET_A, H_NET_A_TWIN, H_HOME],
+    firstSeen: Date.now() - 12 * DAY,
+    lastSeen: Date.now() - 1 * MIN,
+  },
+  {
+    id: 2,
+    label: null,
+    members: [H_CAFE, H_OFFICE, H_PLACE_1],
+    firstSeen: Date.now() - 3 * DAY,
+    lastSeen: Date.now() - 5 * 60 * MIN,
+  },
+];
+
+let mine: MineEntry[] = [
+  { kind: "wifiGroup", idHash: H_GROUP_A, label: "Router-A", ssid: "Net-A", addedAt: Date.now() - 2 * DAY },
+];
+
+let watchlist: WatchlistEntry[] = [
+  { id: 1, kind: "ssid", pattern: "Net-A", match: "contains", addedAt: Date.now() - DAY },
+];
+let nextWatchId = 2;
+
+function currentNetwork(): NetworkInfo {
+  const isMine = mine.some((m) => m.kind === "wifiGroup" && m.idHash === H_GROUP_A);
+  const sweepEnabled = settings.lanActiveSweep && isMine;
+  return {
+    networkKey: H_LAN_NET,
+    ssid: "Net-A",
+    bssidHash: H_NET_A,
+    groupId: H_GROUP_A,
+    subnet: "192.0.2.0/24",
+    isMine,
+    sweepEnabled,
+    mode: sweepEnabled ? "sweep" : "passive",
+    lastSweepAt: sweepEnabled ? Date.now() - 4 * MIN : null,
+    // `/network?noTools=1` previews the "tools unavailable" status line.
+    neighborNote:
+      typeof window !== "undefined" && window.location.search.includes("noTools=1")
+        ? "macOS has no arp tool"
+        : null,
+  };
+}
+
+function lanDevices(networkKey?: string | null): LanDevice[] {
+  const now = Date.now();
+  const all: LanDevice[] = [
+    {
+      networkKey: H_LAN_NET,
+      macHash: H_LAN_1,
+      vendor: "Vendor-A",
+      hostname: "device-1.local",
+      services: ["_http._tcp", "_ipp._tcp"],
+      firstSeen: now - 9 * DAY,
+      lastSeen: now - 1 * MIN,
+      ip: "192.0.2.10",
+      mine: false,
+      source: "both",
+    },
+    {
+      networkKey: H_LAN_NET,
+      macHash: H_LAN_2,
+      vendor: "Private address",
+      hostname: null,
+      services: [],
+      firstSeen: now - 10 * MIN,
+      lastSeen: now - 1 * MIN,
+      ip: "2001:db8::23",
+      mine: false,
+      source: "neighbor",
+    },
+    {
+      networkKey: H_LAN_NET,
+      macHash: H_LAN_3,
+      vendor: null,
+      hostname: "device-3.local",
+      services: ["_airplay._tcp"],
+      firstSeen: now - 2 * DAY,
+      lastSeen: now - 3 * MIN,
+      ip: "192.0.2.41",
+      mine: false,
+      source: "announced",
+    },
+  ];
+  return all
+    .filter((d) => !networkKey || d.networkKey === networkKey)
+    .map((d) => ({
+      ...d,
+      mine: mine.some((m) => m.kind === "lan" && m.idHash === d.macHash),
+    }));
 }
 
 type Listener = (payload: unknown) => void;
@@ -343,6 +502,82 @@ export async function mockInvoke<T>(
       return settings as T;
     case "get_permissions":
       return permissions() as T;
+    case "list_places":
+      return places.map((p) => ({ ...p })) as T;
+    case "rename_place": {
+      const id = Number(args?.id);
+      const raw = args?.label as string | null | undefined;
+      const label = raw && raw.trim() ? raw.trim() : null;
+      const found = places.find((p) => p.id === id);
+      if (!found) throw "no such place";
+      found.label = label;
+      return { ...found } as T;
+    }
+    case "forget_place":
+      places = places.filter((p) => p.id !== Number(args?.id));
+      return undefined as T;
+    case "list_mine":
+      return mine.map((m) => ({ ...m })) as T;
+    case "add_mine": {
+      const kind = args?.kind as MineKind;
+      const idHash = String(args?.idHash);
+      const raw = args?.label as string | null | undefined;
+      const existing = mine.find((m) => m.kind === kind && m.idHash === idHash);
+      const label = raw && raw.trim() ? raw.trim() : null;
+      // Like the backend: only access-point marks carry a name, and a re-mark without one keeps it.
+      const rawSsid = args?.ssid as string | null | undefined;
+      const ssid =
+        (kind === "wifiAp" || kind === "wifiGroup") && rawSsid ? rawSsid : null;
+      if (existing) {
+        existing.label = label;
+        if (ssid) existing.ssid = ssid;
+        return { ...existing } as T;
+      }
+      const entry: MineEntry = { kind, idHash, label, ssid, addedAt: Date.now() };
+      mine = [...mine, entry];
+      return { ...entry } as T;
+    }
+    case "remove_mine":
+      mine = mine.filter(
+        (m) => !(m.kind === args?.kind && m.idHash === args?.idHash),
+      );
+      return undefined as T;
+    case "list_watchlist":
+      return watchlist.map((w) => ({ ...w })) as T;
+    case "add_watchlist": {
+      const pattern = String(args?.pattern ?? "").trim();
+      if (!pattern) throw "watchlist pattern is empty";
+      const entry: WatchlistEntry = {
+        id: nextWatchId++,
+        kind: args?.kind as WatchKind,
+        pattern,
+        match: args?.matchMode as WatchMatch,
+        addedAt: Date.now(),
+      };
+      watchlist = [...watchlist, entry];
+      return { ...entry } as T;
+    }
+    case "remove_watchlist":
+      watchlist = watchlist.filter((w) => w.id !== Number(args?.id));
+      return undefined as T;
+    case "list_lan_devices":
+      return lanDevices(args?.networkKey as string | null | undefined) as T;
+    case "get_current_network":
+      return currentNetwork() as T;
+    case "get_helper_status":
+      return (settings.lanNeighborHelper ? "enabled" : "off") as T;
+    case "open_login_items":
+      return undefined as T;
+    case "sweep_now": {
+      // Same strings as the Rust gate (lan/gate.rs SweepRefusal::message).
+      if (!settings.lanActiveSweep)
+        return Promise.reject("The active sweep is switched off in Settings.");
+      if (!currentNetwork().isMine)
+        return Promise.reject(
+          "This access point is not marked as yours. Mark it as mine first.",
+        );
+      return lanDevices(currentNetwork().networkKey) as T;
+    }
   }
 }
 

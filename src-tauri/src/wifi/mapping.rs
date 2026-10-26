@@ -2,6 +2,7 @@
 //! it is unit-testable with synthetic inputs.
 
 use crate::model::{hash_identifier, Millis, PermissionStatus, Salt, Security, WifiObservation};
+use crate::vendor;
 
 /// Raw `CWSecurity` values (Apple `CoreWLANTypes.h`, `kCWSecurity*`).
 pub(super) mod cw_security {
@@ -84,6 +85,9 @@ pub(super) fn map_network(raw: &RawNetwork, salt: &Salt, seen_at: Millis) -> Wif
             .filter(|c| *c > 0),
         security: map_security(&raw.supported_security),
         seen_at,
+        // Both are computed from the raw BSSID here, before it is dropped.
+        vendor: non_empty(&raw.bssid).and_then(vendor::vendor_for),
+        group_id: non_empty(&raw.bssid).and_then(|b| vendor::group_id(salt, b)),
     }
 }
 

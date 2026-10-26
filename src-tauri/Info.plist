@@ -4,6 +4,8 @@
 <dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>This app listens for nearby Bluetooth Low Energy advertisements to flag possible unwanted trackers. It never connects to or pairs with any device.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>This app reads the list of devices on the Wi-Fi network you are joined to, using only what the network already announces. If you turn on the optional sweep, it sends one empty message to each address on a network you marked as yours. Nothing leaves your Mac.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>macOS only reveals the names (SSIDs) of nearby Wi-Fi networks to apps that have Location access. This app uses that permission solely to read Wi-Fi network names for local analysis; your location is never read, stored or sent anywhere.</string>
 	<key>NSLocationUsageDescription</key>

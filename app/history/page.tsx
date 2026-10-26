@@ -56,7 +56,9 @@ export default function HistoryPage() {
             key,
             type: "Wi-Fi" as const,
             name: w.ssid ?? "(hidden or withheld)",
-            detail: SECURITY_LABEL[w.security],
+            detail: w.vendor
+              ? `${SECURITY_LABEL[w.security]} · ${w.vendor}`
+              : SECURITY_LABEL[w.security],
             scans: 0,
             first: s.scannedAt,
             last: s.scannedAt,

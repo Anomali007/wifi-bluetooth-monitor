@@ -4,6 +4,9 @@
 //! - [`evaluate`] is pure: no I/O, no clock, no randomness. `now` is passed in.
 //! - Rules (each gated by `settings.alert_toggles`): EvilTwin, OpenLookalike,
 //!   TrustedNetworkChanged, PersistentTracker, NewDevice. See the roadmap for definitions.
+//!   v2 adds FollowedAcrossPlaces (`follow`), Watchlist (`watchlist`) and NewLanDevice (`lan`),
+//!   which read the extra state in [`DetectContext`]. [`evaluate`] is the context-free form
+//!   (empty context); the pipeline calls [`evaluate_with`].
 //! - Returned alerts are deduplicated by `(kind, subject_hash)` within the call, with
 //!   `first_seen`/`last_seen` taken from the history. `id` is a stable function of
 //!   `(kind, subject_hash)`, and `dismissed` is always `false`; the store merges repeats
@@ -11,12 +14,40 @@
 //! - PersistentTracker alerts say "possible" and never claim certainty (IDs rotate).
 //! - Subjects are hashes only; no raw identifier appears in `title` or `detail`.
 
+mod follow;
+mod lan;
+mod watchlist;
+
 use crate::model::{
-    Alert, AlertKind, History, Millis, ScanSnapshot, Security, Settings, Severity, TrackerKind,
-    TrustedNetwork, WifiObservation,
+    Alert, AlertKind, History, LanDevice, Millis, MineEntry, MineKind, NetworkInfo, Place,
+    PlaceSighting, ScanSnapshot, Security, Settings, Severity, TrackerKind, TrustedNetwork,
+    WatchlistEntry, WifiObservation,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// State beyond the scan history that the v2 rules read. Built by the pipeline from the store
+/// (and the live LAN outcome); `Default` is "nothing known", under which v2 rules stay silent
+/// and the v1 rules behave exactly as before.
+#[derive(Debug, Clone, Default)]
+pub struct DetectContext {
+    pub mine: Vec<MineEntry>,
+    pub watchlist: Vec<WatchlistEntry>,
+    pub places: Vec<Place>,
+    pub place_sightings: Vec<PlaceSighting>,
+    pub lan_devices: Vec<LanDevice>,
+    /// The joined network right now, if a LAN observation ran this cycle.
+    pub current_network: Option<NetworkInfo>,
+}
+
+impl DetectContext {
+    /// Whether `id_hash` is marked mine under any of `kinds`.
+    pub fn is_mine(&self, kinds: &[MineKind], id_hash: &str) -> bool {
+        self.mine
+            .iter()
+            .any(|m| m.id_hash == id_hash && kinds.contains(&m.kind))
+    }
+}
 
 /// A tracker not seen for this long is no longer "following" the user.
 const TRACKER_STALE_MS: Millis = 10 * 60 * 1000;
@@ -25,8 +56,18 @@ const KIND_MAX_CONSECUTIVE_MISSES: usize = 1;
 /// SSIDs shorter than this (after folding) must match exactly to count as a lookalike.
 const MIN_FUZZY_LEN: usize = 4;
 
-/// Evaluate every enabled rule over `history` as of `now` (Unix ms).
+/// Evaluate every enabled rule over `history` as of `now` (Unix ms), with no v2 context.
 pub fn evaluate(history: &History, settings: &Settings, now: Millis) -> Vec<Alert> {
+    evaluate_with(history, settings, &DetectContext::default(), now)
+}
+
+/// [`evaluate`] plus the extra state the v2 rules read.
+pub fn evaluate_with(
+    history: &History,
+    settings: &Settings,
+    ctx: &DetectContext,
+    now: Millis,
+) -> Vec<Alert> {
     let mut out = Collector::default();
     let t = &settings.alert_toggles;
     if t.evil_twin {
@@ -36,7 +77,7 @@ pub fn evaluate(history: &History, settings: &Settings, now: Millis) -> Vec<Aler
         open_lookalike(history, settings, &mut out);
     }
     if t.trusted_network_changed {
-        trusted_network_changed(history, settings, &mut out);
+        trusted_network_changed(history, settings, ctx, &mut out);
     }
     if t.persistent_tracker {
         persistent_tracker(history, settings, now, &mut out);
@@ -44,7 +85,125 @@ pub fn evaluate(history: &History, settings: &Settings, now: Millis) -> Vec<Aler
     if t.new_device {
         new_device(history, &mut out);
     }
-    out.finish()
+    if t.followed_across_places {
+        follow::followed_across_places(history, settings, ctx, now, &mut out);
+    }
+    if t.watchlist {
+        watchlist::watchlist(history, settings, ctx, now, &mut out);
+    }
+    if t.new_lan_device {
+        lan::new_lan_device(history, settings, ctx, now, &mut out);
+    }
+    coalesce_floods(out.finish(), &protected_subjects(settings, ctx))
+}
+
+/// Alerts per kind kept individually per evaluation; the rest merge into ONE summary alert.
+pub const MAX_FLOOD_ALERTS_PER_KIND: usize = 5;
+
+/// Subjects of alerts about networks the user owns: trusted networks and access points marked
+/// Mine (by the name saved with the mark). Their alerts take the individual slots first.
+pub fn protected_subjects(settings: &Settings, ctx: &DetectContext) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = settings
+        .trusted_networks
+        .iter()
+        .map(|t| subject_key("ssid", &fold_ssid(&t.ssid)))
+        .collect();
+    for m in &ctx.mine {
+        if matches!(m.kind, MineKind::WifiAp | MineKind::WifiGroup) {
+            if let Some(ssid) = &m.ssid {
+                out.insert(subject_key("ssid", &fold_ssid(ssid)));
+            }
+        }
+    }
+    out
+}
+
+/// The fixed subject of the flood summary for `kind`.
+pub fn flood_summary_subject(kind: AlertKind) -> String {
+    subject_key("floodSummary", kind_tag(kind))
+}
+
+/// The count in a flood summary's title ("505 more ..."), or `None` for any other alert.
+pub fn flood_summary_count(a: &Alert) -> Option<usize> {
+    if a.subject_hash != flood_summary_subject(a.kind) {
+        return None;
+    }
+    a.title.split_whitespace().next()?.parse().ok()
+}
+
+/// Merge the alerts of each kind beyond [`MAX_FLOOD_ALERTS_PER_KIND`] into one summary alert,
+/// whatever their severity: one nearby transmitter can multiply any of them (hundreds of
+/// open/secured SSID pairs make hundreds of High evil-twin alerts). Individual slots go first to
+/// alerts about `protected` subjects (the user's own networks), then by severity, then the
+/// oldest (so the kept set is stable from cycle to cycle and a growing flood does not
+/// re-announce itself). The summary has a fixed subject, so its changing count updates it in
+/// place, and it keeps the highest severity it absorbed.
+pub fn coalesce_floods(alerts: Vec<Alert>, protected: &BTreeSet<String>) -> Vec<Alert> {
+    let mut out = Vec::with_capacity(alerts.len());
+    let mut groups: BTreeMap<&'static str, Vec<Alert>> = BTreeMap::new();
+    for a in alerts {
+        groups.entry(kind_tag(a.kind)).or_default().push(a);
+    }
+    for (tag, mut group) in groups {
+        if group.len() <= MAX_FLOOD_ALERTS_PER_KIND {
+            out.extend(group);
+            continue;
+        }
+        group.sort_by(|a, b| {
+            protected
+                .contains(&b.subject_hash)
+                .cmp(&protected.contains(&a.subject_hash))
+                .then_with(|| b.severity.cmp(&a.severity))
+                .then_with(|| a.first_seen.cmp(&b.first_seen))
+                .then_with(|| a.subject_hash.cmp(&b.subject_hash))
+        });
+        let rest = group.split_off(MAX_FLOOD_ALERTS_PER_KIND);
+        let kind = group[0].kind;
+        let subject = subject_key("floodSummary", tag);
+        let n = rest.len();
+        let (title, detail) = match kind {
+            AlertKind::NewLanDevice => (
+                format!("{n} more new devices on your network"),
+                "Many devices appeared at once, so they are grouped here instead of listed one by one. This can happen when something is announcing many fake devices.".to_string(),
+            ),
+            AlertKind::Watchlist => (
+                format!("{n} more watchlist matches"),
+                "Many matches appeared at once, so they are grouped here instead of listed one by one. This can happen when something is broadcasting many look-alike network names.".to_string(),
+            ),
+            _ => (
+                format!("{n} more alerts of the same kind"),
+                "Many alerts of one kind appeared at once, so they are grouped here instead of listed one by one. This can happen when something nearby is broadcasting many fake networks or devices. Your own networks are listed separately.".to_string(),
+            ),
+        };
+        out.extend(group);
+        out.push(Alert {
+            id: alert_id(kind, &subject),
+            kind,
+            severity: rest
+                .iter()
+                .map(|a| a.severity)
+                .max()
+                .unwrap_or(Severity::Medium),
+            title,
+            detail,
+            first_seen: rest.iter().map(|a| a.first_seen).min().unwrap_or(0),
+            last_seen: rest.iter().map(|a| a.last_seen).max().unwrap_or(0),
+            subject_hash: subject,
+            dismissed: false,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| {
+                protected
+                    .contains(&b.subject_hash)
+                    .cmp(&protected.contains(&a.subject_hash))
+            })
+            .then_with(|| kind_tag(a.kind).cmp(kind_tag(b.kind)))
+            .then_with(|| a.subject_hash.cmp(&b.subject_hash))
+    });
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +217,9 @@ fn kind_tag(kind: AlertKind) -> &'static str {
         AlertKind::TrustedNetworkChanged => "trustedNetworkChanged",
         AlertKind::PersistentTracker => "persistentTracker",
         AlertKind::NewDevice => "newDevice",
+        AlertKind::FollowedAcrossPlaces => "followedAcrossPlaces",
+        AlertKind::Watchlist => "watchlist",
+        AlertKind::NewLanDevice => "newLanDevice",
     }
 }
 
@@ -354,7 +516,12 @@ fn open_lookalike(history: &History, settings: &Settings, out: &mut Collector) {
     }
 }
 
-fn trusted_network_changed(history: &History, settings: &Settings, out: &mut Collector) {
+fn trusted_network_changed(
+    history: &History,
+    settings: &Settings,
+    ctx: &DetectContext,
+    out: &mut Collector,
+) {
     if settings.trusted_networks.is_empty() {
         return;
     }
@@ -363,9 +530,22 @@ fn trusted_network_changed(history: &History, settings: &Settings, out: &mut Col
             let Some(t) = named(o).and_then(|s| trusted_for(settings, s)) else {
                 continue;
             };
+            // An access point (or its whole radio group) marked mine counts as known, the same
+            // as one listed on the trusted network itself: one concept, two ways to record it.
+            let marked_mine = o
+                .bssid_hash
+                .as_deref()
+                .is_some_and(|b| ctx.is_mine(&[MineKind::WifiAp], b))
+                || o.group_id
+                    .as_deref()
+                    .is_some_and(|g| ctx.is_mine(&[MineKind::WifiGroup], g));
             let unknown_bssid = match o.bssid_hash.as_ref() {
                 // With no known BSSIDs on file there is nothing to compare against.
-                Some(b) => !t.known_bssid_hashes.is_empty() && !t.known_bssid_hashes.contains(b),
+                Some(b) => {
+                    !marked_mine
+                        && !t.known_bssid_hashes.is_empty()
+                        && !t.known_bssid_hashes.contains(b)
+                }
                 None => false,
             };
             let downgrade = o.security != Security::Unknown
@@ -667,6 +847,8 @@ mod tests {
             channel: Some(36),
             security: sec,
             seen_at: T0,
+            vendor: None,
+            group_id: None,
         }
     }
     fn ble(d: u8, tracker: Option<TrackerKind>) -> BleObservation {
@@ -1198,8 +1380,90 @@ mod tests {
             trusted_network_changed: false,
             persistent_tracker: false,
             new_device: false,
+            followed_across_places: false,
+            watchlist: false,
+            new_lan_device: false,
         };
         assert!(evaluate(&h, &all_off, at(25)).is_empty());
+    }
+
+    // ---- v2 context --------------------------------------------------------
+
+    fn mine_entry(kind: MineKind, id_hash: String) -> MineEntry {
+        MineEntry {
+            kind,
+            id_hash,
+            label: None,
+            ssid: None,
+            added_at: T0,
+        }
+    }
+
+    #[test]
+    fn v2_rules_are_silent_stubs_and_empty_context_equals_evaluate() {
+        let (h, s) = busy_history();
+        assert_eq!(
+            evaluate(&h, &s, at(25)),
+            evaluate_with(&h, &s, &DetectContext::default(), at(25))
+        );
+        // Even a populated context yields nothing until the work packages land.
+        let ctx = DetectContext {
+            mine: vec![mine_entry(MineKind::Lan, "aa".into())],
+            watchlist: vec![WatchlistEntry {
+                id: 1,
+                kind: crate::model::WatchKind::Ssid,
+                pattern: "Net-A".into(),
+                match_mode: crate::model::WatchMatch::Contains,
+                added_at: T0,
+            }],
+            current_network: Some(NetworkInfo::default()),
+            ..DetectContext::default()
+        };
+        let a = evaluate_with(&h, &s, &ctx, at(25));
+        for k in [AlertKind::FollowedAcrossPlaces, AlertKind::NewLanDevice] {
+            assert!(only_kind(&a, k).is_empty(), "{k:?} fired from a stub");
+        }
+    }
+
+    #[test]
+    fn mine_access_point_counts_as_known_for_trusted_network_changed() {
+        // Net-A trusts access point 1 only; access point 2 is the unfamiliar one.
+        let s = settings_with(vec![trusted("Net-A", &[1], Security::Wpa2Personal)]);
+        let h = hist(vec![scan(
+            0,
+            vec![ap("Net-A", 2, Security::Wpa2Personal)],
+            vec![],
+        )]);
+        let fires = |ctx: &DetectContext| {
+            !only_kind(
+                &evaluate_with(&h, &s, ctx, at(1)),
+                AlertKind::TrustedNetworkChanged,
+            )
+            .is_empty()
+        };
+        assert!(
+            fires(&DetectContext::default()),
+            "negative control: unknown AP alerts"
+        );
+        let mine = |kind, id: String| DetectContext {
+            mine: vec![mine_entry(kind, id)],
+            ..DetectContext::default()
+        };
+        assert!(
+            !fires(&mine(MineKind::WifiAp, bssid(2))),
+            "marked mine => known"
+        );
+        // Wrong kind or wrong hash must not silence it.
+        assert!(fires(&mine(MineKind::Ble, bssid(2))));
+        assert!(fires(&mine(MineKind::WifiAp, bssid(3))));
+        // A radio group marked mine covers an observation that carries that group id.
+        let mut grouped = ap("Net-A", 2, Security::Wpa2Personal);
+        grouped.group_id = Some("group-1".into());
+        let hg = hist(vec![scan(0, vec![grouped], vec![])]);
+        let ctx = mine(MineKind::WifiGroup, "group-1".into());
+        assert!(evaluate_with(&hg, &s, &ctx, at(1))
+            .iter()
+            .all(|a| a.kind != AlertKind::TrustedNetworkChanged));
     }
 
     #[test]
@@ -1267,5 +1531,158 @@ mod tests {
     #[test]
     fn empty_history_and_default_settings_yield_nothing() {
         assert!(evaluate(&History::default(), &Settings::default(), 0).is_empty());
+    }
+
+    // -- M2: flood coalescing ---------------------------------------------------------
+
+    fn flood_alert(kind: AlertKind, sev: Severity, n: usize) -> Alert {
+        let subject = subject_key("test", &format!("{n}"));
+        Alert {
+            id: alert_id(kind, &subject),
+            kind,
+            severity: sev,
+            title: format!("t{n}"),
+            detail: "d".into(),
+            first_seen: 1_000 + n as Millis,
+            last_seen: 1_000 + n as Millis,
+            subject_hash: subject,
+            dismissed: false,
+        }
+    }
+
+    #[test]
+    fn a_synthetic_flood_of_lan_and_watchlist_alerts_collapses_to_a_cap_plus_one_summary() {
+        for kind in [AlertKind::NewLanDevice, AlertKind::Watchlist] {
+            let mut v: Vec<Alert> = (0..510)
+                .map(|n| flood_alert(kind, Severity::Medium, n))
+                .collect();
+            // A different kind is never touched.
+            v.push(flood_alert(AlertKind::EvilTwin, Severity::High, 9_999));
+            let out = coalesce_floods(v, &BTreeSet::new());
+            let of_kind: Vec<_> = out.iter().filter(|a| a.kind == kind).collect();
+            assert_eq!(of_kind.len(), MAX_FLOOD_ALERTS_PER_KIND + 1, "{kind:?}");
+            let summary = of_kind
+                .iter()
+                .find(|a| a.subject_hash == subject_key("floodSummary", kind_tag(kind)))
+                .expect("one summary alert");
+            assert!(summary
+                .title
+                .contains(&format!("{}", 510 - MAX_FLOOD_ALERTS_PER_KIND)));
+            assert_eq!(
+                out.iter().filter(|a| a.kind == AlertKind::EvilTwin).count(),
+                1
+            );
+            // Stable across cycles: same input, same kept set and same summary subject.
+            let again: Vec<_> = coalesce_floods(
+                (0..510)
+                    .map(|n| flood_alert(kind, Severity::Medium, n))
+                    .collect(),
+                &BTreeSet::new(),
+            );
+            assert_eq!(
+                again
+                    .iter()
+                    .map(|a| &a.subject_hash)
+                    .collect::<BTreeSet<_>>(),
+                of_kind
+                    .iter()
+                    .map(|a| &a.subject_hash)
+                    .collect::<BTreeSet<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn coalescing_never_swallows_a_high_severity_alert_and_leaves_small_batches_alone() {
+        let mut v: Vec<Alert> = (0..40)
+            .map(|n| flood_alert(AlertKind::Watchlist, Severity::Medium, n))
+            .collect();
+        v.push(flood_alert(AlertKind::Watchlist, Severity::High, 500));
+        v.push(flood_alert(AlertKind::Watchlist, Severity::High, 501));
+        let out = coalesce_floods(v, &BTreeSet::new());
+        let high: Vec<_> = out
+            .iter()
+            .filter(|a| a.severity == Severity::High)
+            .collect();
+        assert_eq!(high.len(), 2, "both High alerts survive individually");
+        // NEGATIVE CONTROL: at or under the cap nothing is merged and no summary appears.
+        let small: Vec<Alert> = (0..MAX_FLOOD_ALERTS_PER_KIND)
+            .map(|n| flood_alert(AlertKind::NewLanDevice, Severity::Medium, n))
+            .collect();
+        let out = coalesce_floods(small.clone(), &BTreeSet::new());
+        assert_eq!(out.len(), small.len());
+        assert!(small.iter().all(|a| out.contains(a)));
+    }
+
+    #[test]
+    fn a_high_severity_flood_is_capped_per_kind_and_the_summary_stays_high() {
+        let v: Vec<Alert> = (0..300)
+            .map(|n| flood_alert(AlertKind::EvilTwin, Severity::High, n))
+            .collect();
+        let out = coalesce_floods(v, &BTreeSet::new());
+        assert_eq!(out.len(), MAX_FLOOD_ALERTS_PER_KIND + 1);
+        let summary = out
+            .iter()
+            .find(|a| a.subject_hash == subject_key("floodSummary", kind_tag(AlertKind::EvilTwin)))
+            .expect("summary");
+        assert_eq!(summary.severity, Severity::High);
+        assert!(summary
+            .title
+            .contains(&format!("{}", 300 - MAX_FLOOD_ALERTS_PER_KIND)));
+    }
+
+    #[test]
+    fn an_attack_on_a_trusted_or_mine_network_is_never_the_alert_folded_away() {
+        let home = subject_key("ssid", &fold_ssid("Home-Net"));
+        let mut v: Vec<Alert> = (0..300)
+            .map(|n| flood_alert(AlertKind::EvilTwin, Severity::High, n))
+            .collect();
+        // The real one is the NEWEST, so any oldest-first rule would fold it.
+        let mut real = flood_alert(AlertKind::EvilTwin, Severity::High, 9_000);
+        real.subject_hash = home.clone();
+        v.push(real);
+        let protected: BTreeSet<String> = [home.clone()].into();
+        let out = coalesce_floods(v.clone(), &protected);
+        assert!(
+            out.iter().any(|a| a.subject_hash == home),
+            "kept individually"
+        );
+        // NEGATIVE CONTROL: unprotected, it is folded like any other.
+        let out = coalesce_floods(v, &BTreeSet::new());
+        assert!(!out.iter().any(|a| a.subject_hash == home));
+    }
+
+    #[test]
+    fn protected_subjects_come_from_trusted_networks_and_named_mine_marks() {
+        let mut settings = Settings::default();
+        settings.trusted_networks.push(TrustedNetwork {
+            ssid: "Trusted-Net".into(),
+            known_bssid_hashes: vec![],
+            expected_security: Security::Wpa2Personal,
+        });
+        let ctx = DetectContext {
+            mine: vec![
+                MineEntry {
+                    kind: MineKind::WifiAp,
+                    id_hash: "b1".into(),
+                    label: None,
+                    ssid: Some("Mine-Net".into()),
+                    added_at: 1,
+                },
+                MineEntry {
+                    kind: MineKind::Ble,
+                    id_hash: "x".into(),
+                    label: None,
+                    ssid: Some("Ignored".into()),
+                    added_at: 1,
+                },
+            ],
+            ..DetectContext::default()
+        };
+        let p = protected_subjects(&settings, &ctx);
+        assert!(p.contains(&subject_key("ssid", &fold_ssid("Trusted-Net"))));
+        assert!(p.contains(&subject_key("ssid", &fold_ssid("Mine-Net"))));
+        assert!(!p.contains(&subject_key("ssid", &fold_ssid("Ignored"))));
+        assert_eq!(p.len(), 2);
     }
 }

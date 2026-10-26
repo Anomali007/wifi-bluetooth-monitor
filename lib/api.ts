@@ -7,12 +7,21 @@
  * normal build the branch is dead code and the mock module is not bundled.
  */
 import type {
+  HelperStatus,
   Alert,
   History,
+  LanDevice,
   Millis,
+  MineEntry,
+  MineKind,
+  NetworkInfo,
   PermissionState,
+  Place,
   ScanResult,
   Settings,
+  WatchKind,
+  WatchMatch,
+  WatchlistEntry,
 } from "./types";
 import { EVENT_ALERT, EVENT_SCAN } from "./types";
 
@@ -23,7 +32,21 @@ export type CommandName =
   | "dismiss_alert"
   | "get_settings"
   | "set_settings"
-  | "get_permissions";
+  | "get_permissions"
+  | "list_places"
+  | "rename_place"
+  | "forget_place"
+  | "list_mine"
+  | "add_mine"
+  | "remove_mine"
+  | "list_watchlist"
+  | "add_watchlist"
+  | "remove_watchlist"
+  | "list_lan_devices"
+  | "get_current_network"
+  | "sweep_now"
+  | "get_helper_status"
+  | "open_login_items";
 
 async function call<T>(
   cmd: CommandName,
@@ -58,6 +81,52 @@ export const setSettings = (settings: Settings) =>
   call<Settings>("set_settings", { settings });
 
 export const getPermissions = () => call<PermissionState>("get_permissions");
+
+// ---- Places, Mine, watchlist, LAN -------------------------------------------
+
+export const listPlaces = () => call<Place[]>("list_places");
+
+/** Blank or null clears the label. Returns the updated place. */
+export const renamePlace = (id: number, label: string | null) =>
+  call<Place>("rename_place", { id, label });
+
+/** Forgets the place and every sighting recorded there. */
+export const forgetPlace = (id: number) => call<void>("forget_place", { id });
+
+export const listMine = () => call<MineEntry[]>("list_mine");
+
+/** Mark an access point, radio group, BLE device or LAN device as mine (by hash). */
+export const addMine = (
+  kind: MineKind,
+  idHash: string,
+  label: string | null = null,
+  ssid: string | null = null,
+) => call<MineEntry>("add_mine", { kind, idHash, label, ssid });
+
+export const removeMine = (kind: MineKind, idHash: string) =>
+  call<void>("remove_mine", { kind, idHash });
+
+export const listWatchlist = () => call<WatchlistEntry[]>("list_watchlist");
+
+export const addWatchlist = (kind: WatchKind, pattern: string, matchMode: WatchMatch) =>
+  call<WatchlistEntry>("add_watchlist", { kind, pattern, matchMode });
+
+export const removeWatchlist = (id: number) => call<void>("remove_watchlist", { id });
+
+/** Stored LAN devices, newest first; omit networkKey for every network. */
+export const listLanDevices = (networkKey?: string) =>
+  call<LanDevice[]>("list_lan_devices", { networkKey: networkKey ?? null });
+
+export const getCurrentNetwork = () => call<NetworkInfo>("get_current_network");
+
+/** Observe the LAN now (the sweep gate still applies); returns the joined network's devices. */
+export const sweepNow = () => call<LanDevice[]>("sweep_now");
+
+/** Off, enabled, or waiting for approval in System Settings, Login Items. */
+export const getHelperStatus = () => call<HelperStatus>("get_helper_status");
+
+/** Open System Settings at Login Items. */
+export const openLoginItems = () => call<void>("open_login_items");
 
 type Unsubscribe = () => void;
 
