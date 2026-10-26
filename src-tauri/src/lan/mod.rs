@@ -616,6 +616,7 @@ pub fn record(store: &mut Store, outcome: &LanScanOutcome, _now: Millis) -> Stor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::MineKind;
     use gate::Subnet;
     use mdns::{Announcement, Heard};
 
@@ -1189,7 +1190,11 @@ mod tests {
         )
         .unwrap();
         let got = store.list_lan_devices(Some("key")).unwrap();
-        assert_eq!(got.len(), 2, "the Mine hostname row stays, the MAC row is new");
+        assert_eq!(
+            got.len(),
+            2,
+            "the Mine hostname row stays, the MAC row is new"
+        );
         let mac = got.iter().find(|d| d.mac_hash == "mac-hash").unwrap();
         assert!(!mac.mine, "not Mine under its new key");
         assert_eq!(mac.first_seen, 900, "no inherited first_seen");

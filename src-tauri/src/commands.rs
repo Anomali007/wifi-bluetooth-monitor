@@ -128,9 +128,15 @@ pub async fn run_cycle(app: &AppHandle) -> Result<ScanResult, String> {
     let _ = app.emit(EVENT_SCAN, &result);
     for alert in &new_alerts {
         let _ = app.emit(EVENT_ALERT, alert);
-        if settings.notify {
-            let (title, body) = pipeline::notification_text(alert);
-            let _ = app.notification().builder().title(title).body(body).show();
+    }
+    if settings.notify {
+        for n in pipeline::plan_notifications(&new_alerts) {
+            let _ = app
+                .notification()
+                .builder()
+                .title(n.title)
+                .body(n.body)
+                .show();
         }
     }
     Ok(result)

@@ -382,3 +382,37 @@ fn a_stranger_announcing_a_mine_hostname_does_not_inherit_mine() {
     assert!(own.mine);
     assert_eq!(own.possibly_same_as, None);
 }
+
+/// M2 end to end: ~510 spoofed LAN devices on a Mine network through the real pipeline create a
+/// handful of alerts (and so a handful of notifications), not 510.
+#[test]
+fn a_spoofed_device_flood_creates_a_capped_number_of_alerts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let t0 = app_lib::pipeline::now_ms() - 3 * 60 * MIN;
+    mine_ap(&mut store, t0 - MIN);
+    ingest_with(
+        &mut store,
+        &empty_scan(t0),
+        Some(&outcome(vec![device("old", t0)])),
+        t0,
+    )
+    .unwrap();
+    let later = t0 + 60 * MIN;
+    let mut flood = vec![device("old", later)];
+    flood.extend((0..510).map(|n| {
+        device(
+            &format!("02:00:00:00:{:02x}:{:02x}", n / 256, n % 256),
+            later,
+        )
+    }));
+    let created =
+        ingest_with(&mut store, &empty_scan(later), Some(&outcome(flood)), later).unwrap();
+    let lan: Vec<_> = created
+        .iter()
+        .filter(|a| a.kind == AlertKind::NewLanDevice)
+        .collect();
+    assert_eq!(lan.len(), app_lib::detect::MAX_FLOOD_ALERTS_PER_KIND + 1);
+    let notices = app_lib::pipeline::plan_notifications(&created);
+    assert!(notices.len() <= app_lib::pipeline::MAX_NOTIFICATIONS_PER_CYCLE + 1);
+}
