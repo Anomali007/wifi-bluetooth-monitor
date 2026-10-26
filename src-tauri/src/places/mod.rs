@@ -58,8 +58,12 @@ struct DwellState {
     streak: u32,
     /// Sightings from the pre-dwell scans of this streak, credited at confirmation.
     held: Vec<Held>,
-    /// Access points seen in two or more places; never part of a fingerprint.
+    /// Legacy (before marks carried a time): read once, stamped into `mobile_since`, then empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     mobile: Vec<String>,
+    /// Access points seen in two or more places, with when each was marked; never part of a
+    /// fingerprint until the mark expires (after the place retention period).
+    mobile_since: BTreeMap<String, Millis>,
     last_scan: Millis,
 }
 
@@ -161,7 +165,7 @@ fn sightings_for(held: &Held, place_id: i64) -> Vec<PlaceSighting> {
 
 /// Drop every access point that appears in two or more places from all member sets and
 /// remember it as mobile.
-fn remove_mobile(store: &mut Store, state: &mut DwellState) -> StoreResult<()> {
+fn remove_mobile(store: &mut Store, state: &mut DwellState, now: Millis) -> StoreResult<()> {
     let places = store.list_places()?;
     let mut count: BTreeMap<&String, usize> = BTreeMap::new();
     for p in &places {
@@ -189,15 +193,31 @@ fn remove_mobile(store: &mut Store, state: &mut DwellState) -> StoreResult<()> {
         }
     }
     for h in newly {
-        if !state.mobile.contains(&h) {
-            state.mobile.push(h);
-        }
+        state.mobile_since.entry(h).or_insert(now);
     }
-    if state.mobile.len() > MAX_MOBILE {
-        let drop = state.mobile.len() - MAX_MOBILE;
-        state.mobile.drain(..drop);
+    while state.mobile_since.len() > MAX_MOBILE {
+        let Some(oldest) = state
+            .mobile_since
+            .iter()
+            .min_by_key(|(_, t)| **t)
+            .map(|(h, _)| h.clone())
+        else {
+            break;
+        };
+        state.mobile_since.remove(&oldest);
     }
     Ok(())
+}
+
+/// Stamp marks from before they carried a time, and forget marks older than the place
+/// retention period. A home access point whose BSSID is cloned elsewhere is therefore
+/// "mobile" only for as long as places themselves are remembered.
+fn age_mobile(state: &mut DwellState, settings: &Settings, now: Millis) {
+    for h in std::mem::take(&mut state.mobile) {
+        state.mobile_since.entry(h).or_insert(now);
+    }
+    let keep = Millis::from(settings.place_retention_days) * 24 * 60 * 60 * 1000;
+    state.mobile_since.retain(|_, t| now - *t < keep);
 }
 
 fn reset_streak(state: &mut DwellState) {
@@ -225,7 +245,8 @@ pub fn update(
         .place_state()?
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    let mobile: BTreeSet<String> = state.mobile.iter().cloned().collect();
+    age_mobile(&mut state, settings, now);
+    let mobile: BTreeSet<String> = state.mobile_since.keys().cloned().collect();
     let fp = fingerprint(&scan.wifi, &mobile);
 
     // A long silence (app closed, laptop asleep) ends the streak: the scans are not consecutive.
@@ -295,7 +316,7 @@ pub fn update(
             p.id
         }
     };
-    remove_mobile(store, &mut state)?;
+    remove_mobile(store, &mut state, now)?;
     let mut batch: Vec<PlaceSighting> = Vec::new();
     for h in state.held.drain(..) {
         batch.extend(sightings_for(&h, place_id));
@@ -576,5 +597,63 @@ mod tests {
         assert_eq!(run(&mut s, aps(0..8), vec![], T0 + 3 * MIN), None);
         assert!(s.list_places().unwrap().is_empty());
         assert!(s.list_place_sightings().unwrap().is_empty());
+    }
+
+    /// The mobile marks currently remembered, read straight from the saved state.
+    fn marks(s: &Store) -> Vec<String> {
+        let v: serde_json::Value =
+            serde_json::from_str(&s.place_state().unwrap().expect("state")).unwrap();
+        let mut out: Vec<String> = Vec::new();
+        if let Some(a) = v.get("mobile").and_then(|m| m.as_array()) {
+            out.extend(a.iter().filter_map(|x| x.as_str().map(str::to_string)));
+        }
+        if let Some(o) = v.get("mobileSince").or(v.get("mobile_since")) {
+            if let Some(o) = o.as_object() {
+                out.extend(o.keys().cloned());
+            }
+        }
+        out
+    }
+
+    const DAY: Millis = 24 * 60 * MIN;
+
+    #[test]
+    fn a_mobile_mark_expires_with_place_retention() {
+        // L7: a cloned BSSID elsewhere marks a home AP mobile; that must not last forever.
+        let (_d, mut s) = store();
+        let with_mobile = |base: u32| {
+            let mut w = aps(base..base + 8);
+            w.push(ap(999, -50));
+            w
+        };
+        for i in 0..3 {
+            run(&mut s, with_mobile(0), vec![], T0 + i * MIN);
+        }
+        for i in 0..3 {
+            run(&mut s, with_mobile(100), vec![], T0 + (60 + i) * MIN);
+        }
+        assert!(marks(&s).contains(&h(999)), "marked mobile");
+        // Inside the retention window (14 days) it is still remembered.
+        run(&mut s, aps(0..8), vec![], T0 + 13 * DAY);
+        assert!(marks(&s).contains(&h(999)), "still within retention");
+        // Past it, the mark is gone, so the AP can join a fingerprint again.
+        run(&mut s, aps(0..8), vec![], T0 + 20 * DAY);
+        assert!(!marks(&s).contains(&h(999)), "expired with place retention");
+        let wifi = with_mobile(0);
+        assert!(fingerprint(&wifi, &BTreeSet::new()).contains(&h(999)));
+    }
+
+    #[test]
+    fn legacy_state_without_timestamps_is_stamped_on_load_and_then_expires() {
+        let (_d, mut s) = store();
+        s.set_place_state(&format!("{{\"mobile\":[\"{}\"],\"last_scan\":0}}", h(7)))
+            .unwrap();
+        run(&mut s, aps(0..8), vec![], T0);
+        assert!(marks(&s).contains(&h(7)), "kept when first loaded");
+        run(&mut s, aps(0..8), vec![], T0 + 20 * DAY);
+        assert!(
+            !marks(&s).contains(&h(7)),
+            "expires from the load, not never"
+        );
     }
 }
