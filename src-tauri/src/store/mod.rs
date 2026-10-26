@@ -877,9 +877,45 @@ impl Store {
                 ip: None,
                 mine,
                 source: source.as_deref().and_then(LanSource::parse),
+                possibly_same_as: None,
             });
         }
+        // Hint only: a not-Mine device that announced the hostname of a Mine row on the same
+        // network may be that device, but only the user can say so.
+        let labels: Vec<(String, String, String)> = out
+            .iter()
+            .filter(|d| d.mine)
+            .filter_map(|d| {
+                let label = self.lan_mine_label(&d.mac_hash).ok()??;
+                Some((d.network_key.clone(), d.mac_hash.clone(), label))
+            })
+            .collect();
+        if !labels.is_empty() {
+            for d in out.iter_mut().filter(|d| !d.mine) {
+                let Some(host) = &d.hostname else { continue };
+                let hk = crate::lan::host_key(&self.salt, host);
+                if let Some((_, _, label)) = labels
+                    .iter()
+                    .find(|(n, h, _)| *n == d.network_key && *h == hk && *h != d.mac_hash)
+                {
+                    d.possibly_same_as = Some(label.clone());
+                }
+            }
+        }
         Ok(out)
+    }
+
+    /// The label of a Mine LAN entry, or a generic name when it has none. `None` if not Mine.
+    fn lan_mine_label(&self, id_hash: &str) -> StoreResult<Option<String>> {
+        let found: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT label FROM mine WHERE kind = ?1 AND id_hash = ?2",
+                params![to_json(&MineKind::Lan)?, id_hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.map(|l| l.unwrap_or_else(|| "a device you marked as yours".to_string())))
     }
 
     /// Remove one stored LAN device and return it (with `mine` filled), or `None` if absent.
@@ -1296,6 +1332,7 @@ mod tests {
             ip: Some("192.0.2.9".into()),
             mine: false,
             source: None,
+            possibly_same_as: None,
         }
     }
 

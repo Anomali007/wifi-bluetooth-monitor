@@ -38,7 +38,14 @@ export default function LanDeviceTable({ devices }: { devices: LanDevice[] }) {
         <tbody>
           {devices.map((d) => (
             <tr key={`${d.networkKey}-${d.macHash}`} className="border-b last:border-0">
-              <td className="p-2">{deviceName(d)}</td>
+              <td className="p-2">
+                {deviceName(d)}
+                {d.possiblySameAs && (
+                  <span className="block text-xs text-muted-foreground" data-testid="lan-possibly-same">
+                    Possibly the same device as {d.possiblySameAs}. Mark it Mine only if it is.
+                  </span>
+                )}
+              </td>
               <td className="p-2 text-muted-foreground">
                 {d.vendor ?? (d.source === "announced" ? "Not known (no hardware address)" : "Unknown")}
               </td>

@@ -35,7 +35,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use crate::model::{
-    hash_identifier, LanDevice, LanMode, LanSource, Millis, MineEntry, MineKind, NetworkInfo, Salt,
+    hash_identifier, LanDevice, LanMode, LanSource, Millis, MineEntry, NetworkInfo, Salt,
     ScanError, Settings,
 };
 use crate::store::{Store, StoreResult};
@@ -398,6 +398,7 @@ pub fn build_devices(
             } else {
                 LanSource::Neighbor
             }),
+            possibly_same_as: None,
         });
     }
     for (lower, row) in hosts {
@@ -412,6 +413,7 @@ pub fn build_devices(
             ip: row.ip.map(|i| i.to_string()),
             mine: false,
             source: Some(LanSource::Announced),
+            possibly_same_as: None,
         });
     }
     out
@@ -581,22 +583,26 @@ pub fn sweep_refusal(inputs: &LanInputs, state: &LanState) -> Option<&'static st
 /// A device first stored by hostname alone that now has a hardware address is ONE device
 /// again: its hostname-keyed row is folded into the MAC-keyed row, keeping the earlier
 /// `first_seen` so the upgrade is not "news" to the NewLanDevice rule.
-pub fn record(store: &mut Store, outcome: &LanScanOutcome, now: Millis) -> StoreResult<()> {
+///
+/// Exception: when the hostname-keyed row is Mine the fold does NOT happen. Anyone on the
+/// network can announce a Mine device's hostname with an A record carrying their own IP, which
+/// the scan joins to their own MAC. That MAC row starts fresh (not Mine, its own `first_seen`,
+/// so it is news) and the user's Mine row stays; the listing shows it as "possibly the same
+/// device as <label>" for the user to confirm by hand.
+pub fn record(store: &mut Store, outcome: &LanScanOutcome, _now: Millis) -> StoreResult<()> {
     for d in &outcome.devices {
         let mut d = d.clone();
         if d.source == Some(LanSource::Both) {
             if let Some(host) = &d.hostname {
                 let old_key = host_key(store.salt(), host);
                 if old_key != d.mac_hash {
-                    if let Some(old) = store.take_lan_device(&d.network_key, &old_key)? {
-                        d.first_seen = d.first_seen.min(old.first_seen);
-                        if old.mine {
-                            store.add_mine(&MineEntry {
-                                kind: MineKind::Lan,
-                                id_hash: d.mac_hash.clone(),
-                                label: None,
-                                added_at: now,
-                            })?;
+                    let old_is_mine = store
+                        .list_lan_devices(Some(&d.network_key))?
+                        .iter()
+                        .any(|o| o.mac_hash == old_key && o.mine);
+                    if !old_is_mine {
+                        if let Some(old) = store.take_lan_device(&d.network_key, &old_key)? {
+                            d.first_seen = d.first_seen.min(old.first_seen);
                         }
                     }
                 }
@@ -1048,6 +1054,7 @@ mod tests {
             ip: Some("192.0.2.10".into()),
             mine: false,
             source: Some(source),
+            possibly_same_as: None,
         }
     }
 
@@ -1146,7 +1153,8 @@ mod tests {
     }
 
     #[test]
-    fn marking_a_hostname_row_mine_carries_over_to_the_mac_row() {
+    fn marking_a_hostname_row_mine_does_not_carry_over_to_a_mac_row() {
+        // M1: anyone can announce a Mine hostname, so Mine never follows a hostname -> MAC fold.
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path()).unwrap();
         let hk = host_key(store.salt(), "device-a.local");
@@ -1165,7 +1173,7 @@ mod tests {
             .add_mine(&MineEntry {
                 kind: MineKind::Lan,
                 id_hash: hk.clone(),
-                label: None,
+                label: Some("My Laptop".into()),
                 added_at: 110,
             })
             .unwrap();
@@ -1181,8 +1189,12 @@ mod tests {
         )
         .unwrap();
         let got = store.list_lan_devices(Some("key")).unwrap();
-        assert_eq!(got.len(), 1);
-        assert!(got[0].mine, "still mine under its new key");
+        assert_eq!(got.len(), 2, "the Mine hostname row stays, the MAC row is new");
+        let mac = got.iter().find(|d| d.mac_hash == "mac-hash").unwrap();
+        assert!(!mac.mine, "not Mine under its new key");
+        assert_eq!(mac.first_seen, 900, "no inherited first_seen");
+        assert_eq!(mac.possibly_same_as.as_deref(), Some("My Laptop"));
+        assert!(got.iter().find(|d| d.mac_hash == hk).unwrap().mine);
     }
 
     /// Reads the live network passively (no sweep: the setting is off). Counts only.

@@ -246,6 +246,11 @@ export interface LanDevice {
    * with no hardware address ("announced"), or both. Null only for rows from before v4.
    */
   source: LanSource | null;
+  /**
+   * Label of a Mine device whose mDNS hostname this device also announced. A hint to confirm
+   * by hand; it never makes the device Mine.
+   */
+  possiblySameAs?: string;
 }
 
 export type LanSource = "neighbor" | "announced" | "both";

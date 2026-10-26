@@ -107,6 +107,7 @@ mod tests {
             ip: None,
             mine: false,
             source: None,
+            possibly_same_as: None,
         }
     }
 

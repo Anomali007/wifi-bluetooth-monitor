@@ -523,6 +523,10 @@ pub struct LanDevice {
     /// both (merged across scans when stored). `None` only for rows from before v4.
     #[serde(default)]
     pub source: Option<LanSource>,
+    /// Filled when listing, never persisted: the label of a Mine device whose mDNS hostname
+    /// this device also announced. Only a hint to confirm by hand; it never makes a device Mine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub possibly_same_as: Option<String>,
 }
 
 /// Where a LAN device came from. A device only ever heard announcing has no hardware address
@@ -769,6 +773,7 @@ mod tests {
             ip: Some("192.0.2.10".into()),
             mine: false,
             source: Some(LanSource::Both),
+            possibly_same_as: None,
         };
         roundtrip(&dev);
         roundtrip(&NetworkInfo::default());
