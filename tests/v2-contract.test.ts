@@ -91,6 +91,13 @@ describe("mine", () => {
     const again = await addMine("ble", hash, "Tag-B");
     expect(again.label).toBe("Tag-B");
     expect((await listMine()).length).toBe(n0 + 2);
+    // The network name rides along with access-point marks only.
+    const ap = "03" + "b".repeat(62);
+    const saved = await addMine("wifiAp", ap, null, "Net-A");
+    expect(saved.ssid).toBe("Net-A");
+    expect((await addMine("wifiAp", ap, "Home")).ssid).toBe("Net-A"); // re-mark keeps the name
+    expect((await addMine("ble", hash, null, "Net-A")).ssid ?? null).toBeNull();
+    await removeMine("wifiAp", ap);
     await removeMine("ble", hash);
     const rest = await listMine();
     expect(rest.length).toBe(n0 + 1);

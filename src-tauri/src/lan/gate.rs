@@ -21,6 +21,27 @@ pub fn ap_is_mine(mine: &[MineEntry], bssid_hash: Option<&str>, group_id: Option
     mine_entry_for_ap(mine, bssid_hash, group_id).is_some()
 }
 
+/// Whether a Mine entry that matches the joined access point was saved with THIS network name.
+/// A cloned BSSID (or any BSSID in the same radio group) satisfies [`ap_is_mine`] without being
+/// the network the user meant, so the sweep also needs the name to match. Marks made before the
+/// name was stored (`ssid: None`) do not qualify: the user marks the network again once.
+pub fn ap_ssid_matches(
+    mine: &[MineEntry],
+    bssid_hash: Option<&str>,
+    group_id: Option<&str>,
+    ssid: Option<&str>,
+) -> bool {
+    let Some(joined) = ssid else { return false };
+    mine.iter().any(|m| {
+        let same_ap = match m.kind {
+            MineKind::WifiAp => bssid_hash.is_some_and(|b| b == m.id_hash),
+            MineKind::WifiGroup => group_id.is_some_and(|g| g == m.id_hash),
+            MineKind::Ble | MineKind::Lan => false,
+        };
+        same_ap && m.ssid.as_deref() == Some(joined)
+    })
+}
+
 /// The Mine entry that makes the joined access point mine (the oldest, when both forms exist).
 pub fn mine_entry_for_ap<'a>(
     mine: &'a [MineEntry],
@@ -96,6 +117,9 @@ pub enum SweepRefusal {
     NoInterface,
     /// Swept too recently.
     TooSoon,
+    /// The joined network's name is not the one saved when this access point was marked mine
+    /// (or the mark predates saving names).
+    SsidMismatch,
 }
 
 impl SweepRefusal {
@@ -111,6 +135,9 @@ impl SweepRefusal {
             }
             SweepRefusal::NoInterface => "There is no Wi-Fi interface to send on.",
             SweepRefusal::TooSoon => "A sweep ran moments ago; wait a little before the next one.",
+            SweepRefusal::SsidMismatch => {
+                "This network's name is not the one saved when you marked this access point as yours. Mark it as mine again if it is yours."
+            }
         }
     }
 }
@@ -124,6 +151,8 @@ pub struct GateInput<'a> {
     pub network_key: Option<&'a str>,
     /// Result of [`ap_is_mine`] for the joined access point.
     pub ap_is_mine: bool,
+    /// Result of [`ap_ssid_matches`]: the mark also carries this network's name.
+    pub ssid_ok: bool,
     /// OS index of the Wi-Fi interface the echo would be scoped to.
     pub if_index: Option<u16>,
 }
@@ -140,6 +169,9 @@ pub fn sweep_gate(input: &GateInput) -> Result<u16, SweepRefusal> {
     }
     if !input.ap_is_mine {
         return Err(SweepRefusal::NotMine);
+    }
+    if !input.ssid_ok {
+        return Err(SweepRefusal::SsidMismatch);
     }
     input.if_index.ok_or(SweepRefusal::NoInterface)
 }
@@ -160,16 +192,37 @@ pub fn cadence_ok(force: bool, last: Option<Millis>, now: Millis) -> Result<(), 
     }
 }
 
+/// Proof that [`may_sweep`] said yes. The only way to get one is [`may_sweep`] (the field is
+/// private and nothing else in this module builds one), and [`super::sweep::NetSink::new`]
+/// requires one, so no code path can open a transmitting socket without passing the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateToken {
+    if_index: u16,
+}
+
+impl GateToken {
+    /// The Wi-Fi interface the gate approved.
+    pub fn if_index(&self) -> u16 {
+        self.if_index
+    }
+
+    /// Unit tests only (not compiled into the app or into integration tests).
+    #[cfg(test)]
+    pub fn for_tests(if_index: u16) -> GateToken {
+        GateToken { if_index }
+    }
+}
+
 /// Gate plus cadence: the single decision point `lan::scan` consults before it transmits.
 pub fn may_sweep(
     input: &GateInput,
     force: bool,
     last: Option<Millis>,
     now: Millis,
-) -> Result<u16, SweepRefusal> {
+) -> Result<GateToken, SweepRefusal> {
     let if_index = sweep_gate(input)?;
     cadence_ok(force, last, now)?;
-    Ok(if_index)
+    Ok(GateToken { if_index })
 }
 
 #[cfg(test)]
@@ -185,6 +238,7 @@ mod tests {
             kind,
             id_hash: id.into(),
             label: None,
+            ssid: None,
             added_at: at,
         }
     }
@@ -194,6 +248,7 @@ mod tests {
             setting_on: true,
             network_key: Some("net-key"),
             ap_is_mine: true,
+            ssid_ok: true,
             if_index: Some(11),
         }
     }
@@ -297,6 +352,79 @@ mod tests {
             mine_entry_for_ap(&mine, Some("a"), Some("g")).map(|m| m.added_at),
             Some(20)
         );
+    }
+
+    fn ap_entry(kind: MineKind, id: &str, ssid: Option<&str>) -> MineEntry {
+        MineEntry {
+            ssid: ssid.map(str::to_string),
+            ..entry(kind, id, 1)
+        }
+    }
+
+    #[test]
+    fn a_cloned_bssid_with_another_name_does_not_satisfy_the_sweep_gate() {
+        let mine = [ap_entry(MineKind::WifiAp, "b1", Some("Net-A"))];
+        // The hash matches (a clone of the BSSID) but the name differs.
+        assert!(
+            ap_is_mine(&mine, Some("b1"), None),
+            "hash alone still says mine"
+        );
+        assert!(!ap_ssid_matches(&mine, Some("b1"), None, Some("Net-X")));
+        // NEGATIVE CONTROL: the genuine network, and the same BSSID with the saved name.
+        assert!(ap_ssid_matches(&mine, Some("b1"), None, Some("Net-A")));
+        // A hidden name (no Location access) cannot match.
+        assert!(!ap_ssid_matches(&mine, Some("b1"), None, None));
+        // Names compare exactly (SSIDs are case-sensitive).
+        assert!(!ap_ssid_matches(&mine, Some("b1"), None, Some("net-a")));
+    }
+
+    #[test]
+    fn a_group_mark_checks_the_name_too_and_legacy_marks_fail_closed() {
+        let group = [ap_entry(MineKind::WifiGroup, "g1", Some("Net-A"))];
+        assert!(ap_ssid_matches(
+            &group,
+            Some("other-bssid"),
+            Some("g1"),
+            Some("Net-A")
+        ));
+        assert!(!ap_ssid_matches(
+            &group,
+            Some("other-bssid"),
+            Some("g1"),
+            Some("Net-X")
+        ));
+        // A mark saved before names were stored never allows a sweep.
+        let legacy = [ap_entry(MineKind::WifiAp, "b1", None)];
+        assert!(!ap_ssid_matches(&legacy, Some("b1"), None, Some("Net-A")));
+        // The name must come from an entry that matches THIS access point.
+        let elsewhere = [ap_entry(MineKind::WifiAp, "b2", Some("Net-A"))];
+        assert!(!ap_ssid_matches(
+            &elsewhere,
+            Some("b1"),
+            None,
+            Some("Net-A")
+        ));
+    }
+
+    #[test]
+    fn the_gate_refuses_with_ssid_mismatch_when_the_name_check_fails() {
+        let mut i = open_input();
+        i.ssid_ok = false;
+        assert_eq!(sweep_gate(&i), Err(SweepRefusal::SsidMismatch));
+        // NEGATIVE CONTROL: not-mine is still reported as not-mine first.
+        i.ap_is_mine = false;
+        assert_eq!(sweep_gate(&i), Err(SweepRefusal::NotMine));
+        assert!(sweep_gate(&open_input()).is_ok());
+    }
+
+    #[test]
+    fn may_sweep_hands_out_a_token_carrying_the_approved_interface() {
+        let t = may_sweep(&open_input(), false, None, 1_000).unwrap();
+        assert_eq!(t.if_index(), 11);
+        // NEGATIVE CONTROL: every refusal yields no token.
+        let mut closed = open_input();
+        closed.ap_is_mine = false;
+        assert!(may_sweep(&closed, false, None, 1_000).is_err());
     }
 
     #[test]

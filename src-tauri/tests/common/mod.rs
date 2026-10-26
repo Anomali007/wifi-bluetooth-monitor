@@ -128,6 +128,7 @@ pub fn fixture() -> Fixture {
             ip: None,
             mine: false,
             source: Some(LanSource::Neighbor),
+            possibly_same_as: None,
         })
         .unwrap();
     let db = dir.path().join("store.sqlite3");

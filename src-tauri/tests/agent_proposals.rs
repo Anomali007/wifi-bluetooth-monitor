@@ -590,6 +590,7 @@ fn an_approved_mine_entry_counts_but_an_agent_written_one_never_arms_the_sweep_g
             kind: MineKind::WifiAp,
             id_hash: other.clone(),
             label: None,
+            ssid: None,
             added_at: 1,
         },
         AddedBy::Agent,
@@ -679,6 +680,7 @@ fn undoing_a_direct_mine_removal_restores_the_entry_and_who_made_it() {
             kind: MineKind::WifiAp,
             id_hash: ap.clone(),
             label: Some("Shed".into()),
+            ssid: None,
             added_at: 5,
         })
         .unwrap();
@@ -720,6 +722,7 @@ fn undo_refuses_when_a_person_changed_the_thing_since() {
             kind: MineKind::WifiAp,
             id_hash: ap,
             label: None,
+            ssid: None,
             added_at: now(),
         })
         .unwrap();
@@ -759,4 +762,48 @@ fn a_dismissed_alert_stays_dismissed_while_the_finding_continues() {
         !d.contains("reappears only if"),
         "the old, wrong claim is gone"
     );
+}
+
+#[test]
+fn an_approved_access_point_mark_stores_the_ssid_from_the_latest_scan_so_both_gate_rules_apply() {
+    use app_lib::lan::gate::{ap_is_mine, ap_ssid_matches};
+    let f = bare();
+    single_net(&f, f.now - 10_000);
+    let ap = h("02:00:00:00:0c:01");
+    let id = propose(&f, "mine_add", json!({"kind": "wifiAp", "idHash": ap}));
+    decide(&f, id, true).unwrap();
+    let mine = app(&f).list_mine().unwrap();
+    assert_eq!(
+        mine[0].ssid.as_deref(),
+        Some("Net-C"),
+        "name taken from the latest scan"
+    );
+    // Rule 1 (human-approved) and rule 2 (the name must match) both hold for the real network...
+    assert!(ap_is_mine(&mine, Some(&ap), None));
+    assert!(ap_ssid_matches(&mine, Some(&ap), None, Some("Net-C")));
+    // ...and a clone of the BSSID under another name does not pass.
+    assert!(!ap_ssid_matches(&mine, Some(&ap), None, Some("Net-X")));
+    // An agent-written row with the right name still counts for neither rule.
+    let other = h("02:00:00:00:0c:02");
+    app(&f)
+        .add_mine_as(
+            &MineEntry {
+                kind: MineKind::WifiAp,
+                id_hash: other.clone(),
+                label: None,
+                ssid: Some("Net-C".into()),
+                added_at: 1,
+            },
+            AddedBy::Agent,
+        )
+        .unwrap();
+    let mine = app(&f).list_mine().unwrap();
+    assert!(!ap_is_mine(&mine, Some(&other), None));
+    assert!(!ap_ssid_matches(&mine, Some(&other), None, Some("Net-C")));
+    // A BLE or LAN approval stores no name.
+    let ble = common::fixture();
+    let bid = h("synthetic-ble-1");
+    let id = propose(&ble, "mine_add", json!({"kind": "ble", "idHash": bid}));
+    decide(&ble, id, true).unwrap();
+    assert_eq!(app(&ble).list_mine().unwrap()[0].ssid, None);
 }

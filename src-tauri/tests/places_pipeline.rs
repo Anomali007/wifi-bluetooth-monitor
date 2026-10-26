@@ -187,6 +187,7 @@ fn a_tracker_marked_mine_raises_nothing() {
             kind: MineKind::Ble,
             id_hash: hash_identifier(&salt(), "synthetic-peripheral-1"),
             label: Some("My tag".into()),
+            ssid: None,
             added_at: T0,
         })
         .unwrap();

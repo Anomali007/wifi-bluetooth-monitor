@@ -57,9 +57,9 @@ export function rowsFrom(
       groupId: w.groupId,
       radios: radios.length,
       mine: w.groupId
-        ? { kind: "wifiGroup" as const, idHash: w.groupId, rotatingAddress: false }
+        ? { kind: "wifiGroup" as const, idHash: w.groupId, rotatingAddress: false, ssid: w.ssid }
         : w.bssidHash
-          ? { kind: "wifiAp" as const, idHash: w.bssidHash, rotatingAddress: false }
+          ? { kind: "wifiAp" as const, idHash: w.bssidHash, rotatingAddress: false, ssid: w.ssid }
           : null,
     })),
     ...ble.map((b) => ({

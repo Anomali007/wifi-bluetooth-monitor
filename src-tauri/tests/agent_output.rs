@@ -96,6 +96,7 @@ fn hostile() -> common::Fixture {
             ip: None,
             mine: false,
             source: Some(LanSource::Announced),
+            possibly_same_as: None,
         })
         .unwrap();
     store
@@ -426,6 +427,7 @@ fn limits_are_applied_in_the_query_and_report_the_true_total() {
                 ip: None,
                 mine: false,
                 source: None,
+                possibly_same_as: None,
             })
             .unwrap();
     }

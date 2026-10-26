@@ -467,6 +467,7 @@ mod tests {
             kind: MineKind::WifiAp,
             id_hash: h.into(),
             label: None,
+            ssid: None,
             added_at: at,
         };
         s.add_mine_as(&e(&ap, 1), AddedBy::Agent).unwrap();

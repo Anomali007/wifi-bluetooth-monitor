@@ -32,6 +32,7 @@ fn device(mac: &str, at: Millis) -> LanDevice {
         ip: Some("192.0.2.10".into()),
         mine: false,
         source: None,
+        possibly_same_as: None,
     }
 }
 
@@ -54,6 +55,7 @@ fn mine_ap(store: &mut Store, at: Millis) {
             kind: MineKind::WifiAp,
             id_hash: "ap-1".into(),
             label: None,
+            ssid: None,
             added_at: at,
         })
         .unwrap();
@@ -147,6 +149,7 @@ fn marking_a_device_mine_silences_it() {
             kind: MineKind::Lan,
             id_hash: "new".into(),
             label: Some("My device".into()),
+            ssid: None,
             added_at: t0,
         })
         .unwrap();
@@ -286,6 +289,7 @@ fn marking_a_hostname_keyed_device_mine_silences_it() {
             kind: MineKind::Lan,
             id_hash: new.clone(),
             label: Some("My device".into()),
+            ssid: None,
             added_at: t0,
         })
         .unwrap();
@@ -313,4 +317,106 @@ fn marking_a_hostname_keyed_device_mine_silences_it() {
     )
     .unwrap();
     assert!(second.iter().all(|a| a.kind != AlertKind::NewLanDevice));
+}
+
+/// M1: a stranger that announces a Mine device's mDNS hostname (A record with its own IP) is
+/// joined to its own ARP MAC by the scan. That MAC row must NOT inherit Mine or the old
+/// `first_seen`: it is news, and the user is only told it might be their device.
+#[test]
+fn a_stranger_announcing_a_mine_hostname_does_not_inherit_mine() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let t0 = app_lib::pipeline::now_ms() - 3 * 60 * MIN;
+    mine_ap(&mut store, t0 - MIN);
+    let hk = host_key(store.salt(), "device-a.local");
+    let anchor = host_key(store.salt(), "anchor.local");
+    store
+        .add_mine(&MineEntry {
+            kind: MineKind::Lan,
+            id_hash: hk.clone(),
+            label: Some("My Laptop".into()),
+            ssid: None,
+            added_at: t0,
+        })
+        .unwrap();
+    ingest_with(
+        &mut store,
+        &empty_scan(t0),
+        Some(&outcome(vec![
+            named(&anchor, "anchor.local", LanSource::Announced, t0),
+            named(&hk, "device-a.local", LanSource::Announced, t0),
+        ])),
+        t0,
+    )
+    .unwrap();
+    let later = t0 + 60 * MIN;
+    let stranger = "02:00:00:00:00:99";
+    let alerts = ingest_with(
+        &mut store,
+        &empty_scan(later),
+        Some(&outcome(vec![
+            named(&anchor, "anchor.local", LanSource::Announced, later),
+            named(stranger, "device-a.local", LanSource::Both, later),
+        ])),
+        later,
+    )
+    .unwrap();
+    let mine = store.list_mine().unwrap();
+    assert!(
+        !mine
+            .iter()
+            .any(|m| m.kind == MineKind::Lan && m.id_hash == stranger),
+        "the stranger's MAC must not be added to Mine"
+    );
+    let stored = store.list_lan_devices(Some(KEY)).unwrap();
+    let s = stored.iter().find(|d| d.mac_hash == stranger).unwrap();
+    assert!(!s.mine);
+    assert_eq!(s.first_seen, later, "no inherited first_seen");
+    assert_eq!(s.possibly_same_as.as_deref(), Some("My Laptop"));
+    assert_eq!(
+        alerts
+            .iter()
+            .filter(|a| a.kind == AlertKind::NewLanDevice)
+            .count(),
+        1,
+        "the stranger is announced as a new device"
+    );
+    // The user's own hostname row is untouched and still Mine.
+    let own = stored.iter().find(|d| d.mac_hash == hk).unwrap();
+    assert!(own.mine);
+    assert_eq!(own.possibly_same_as, None);
+}
+
+/// M2 end to end: ~510 spoofed LAN devices on a Mine network through the real pipeline create a
+/// handful of alerts (and so a handful of notifications), not 510.
+#[test]
+fn a_spoofed_device_flood_creates_a_capped_number_of_alerts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let t0 = app_lib::pipeline::now_ms() - 3 * 60 * MIN;
+    mine_ap(&mut store, t0 - MIN);
+    ingest_with(
+        &mut store,
+        &empty_scan(t0),
+        Some(&outcome(vec![device("old", t0)])),
+        t0,
+    )
+    .unwrap();
+    let later = t0 + 60 * MIN;
+    let mut flood = vec![device("old", later)];
+    flood.extend((0..510).map(|n| {
+        device(
+            &format!("02:00:00:00:{:02x}:{:02x}", n / 256, n % 256),
+            later,
+        )
+    }));
+    let created =
+        ingest_with(&mut store, &empty_scan(later), Some(&outcome(flood)), later).unwrap();
+    let lan: Vec<_> = created
+        .iter()
+        .filter(|a| a.kind == AlertKind::NewLanDevice)
+        .collect();
+    assert_eq!(lan.len(), app_lib::detect::MAX_FLOOD_ALERTS_PER_KIND + 1);
+    let notices = app_lib::pipeline::plan_notifications(&created);
+    assert!(notices.len() <= app_lib::pipeline::MAX_NOTIFICATIONS_PER_CYCLE + 1);
 }

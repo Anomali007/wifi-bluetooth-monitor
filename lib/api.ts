@@ -103,8 +103,12 @@ export const forgetPlace = (id: number) => call<void>("forget_place", { id });
 export const listMine = () => call<MineEntry[]>("list_mine");
 
 /** Mark an access point, radio group, BLE device or LAN device as mine (by hash). */
-export const addMine = (kind: MineKind, idHash: string, label: string | null = null) =>
-  call<MineEntry>("add_mine", { kind, idHash, label });
+export const addMine = (
+  kind: MineKind,
+  idHash: string,
+  label: string | null = null,
+  ssid: string | null = null,
+) => call<MineEntry>("add_mine", { kind, idHash, label, ssid });
 
 export const removeMine = (kind: MineKind, idHash: string) =>
   call<void>("remove_mine", { kind, idHash });

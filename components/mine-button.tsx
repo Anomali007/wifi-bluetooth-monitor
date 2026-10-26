@@ -14,6 +14,8 @@ export interface MineTarget {
   idHash: string;
   /** The device rotates its address (e.g. Apple BLE), so a mark will not last. */
   rotatingAddress: boolean;
+  /** For access points: the network name to save with the mark (the sweep checks it). */
+  ssid?: string | null;
 }
 
 const EMPTY: readonly never[] = [];
@@ -87,7 +89,7 @@ export default function MineButton({ target }: { target: MineTarget }) {
       />
       <button
         onClick={() =>
-          run(() => mineStore.mark(target.kind, target.idHash, cleanLabel(label)))
+          run(() => mineStore.mark(target.kind, target.idHash, cleanLabel(label), target.ssid ?? null))
         }
         className="rounded-md border px-2 py-0.5 text-xs hover:bg-accent"
       >

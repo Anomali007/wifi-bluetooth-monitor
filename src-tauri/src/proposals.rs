@@ -641,10 +641,28 @@ fn apply(store: &mut Store, p: &Proposal, now: Millis) -> Res<Applied> {
             let label = arg_str(&p.args, "label")
                 .map(|l| clean(&l, 64))
                 .filter(|l| !l.trim().is_empty());
+            // An access-point mark carries the network name from the LATEST scan, as the app's
+            // own Mine button does; the sweep gate requires it to match the joined network. If
+            // the name is hidden there is none to store, and the mark then fails closed for the
+            // sweep with SsidMismatch (it still silences alerts); mark it again in the app with
+            // Location access on.
+            let ssid = match kind {
+                MineKind::WifiAp | MineKind::WifiGroup => db(store.latest_scan())?.and_then(|s| {
+                    s.wifi
+                        .into_iter()
+                        .find(|o| match kind {
+                            MineKind::WifiAp => o.bssid_hash.as_deref() == Some(id_hash.as_str()),
+                            _ => o.group_id.as_deref() == Some(id_hash.as_str()),
+                        })
+                        .and_then(|o| o.ssid)
+                }),
+                _ => None,
+            };
             let entry = MineEntry {
                 kind,
                 id_hash: id_hash.clone(),
                 label,
+                ssid,
                 added_at: now,
             };
             // A person clicked Approve: the entry counts as user-confirmed.

@@ -21,6 +21,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::model::Millis;
 
+use super::gate::Subnet;
+
 pub const MDNS_PORT: u16 = 5353;
 pub const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 pub const MDNS_GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
@@ -313,22 +315,76 @@ pub struct Heard {
     pub info: Announcement,
 }
 
+/// The joined Wi-Fi link: only sources on it are cached. Anyone else who can reach the mDNS
+/// port (another interface, a spoofed source) must not be able to fill the cache.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LinkFilter {
+    /// The interface's IPv4 subnet; `None` admits no IPv4 source.
+    pub subnet: Option<Subnet>,
+    /// OS index of the Wi-Fi interface; link-local IPv6 sources must arrive on it.
+    pub if_index: Option<u16>,
+    /// The interface's own IPv6 addresses: a global/ULA source must share a /64 with one.
+    pub own_v6: Vec<Ipv6Addr>,
+}
+
+impl LinkFilter {
+    /// Whether a datagram from `ip` (arriving with IPv6 `scope`) came from this link.
+    pub fn admits(&self, ip: IpAddr, scope: u32) -> bool {
+        match ip {
+            IpAddr::V4(a) => self.subnet.is_some_and(|s| s.contains(a)),
+            IpAddr::V6(a) => {
+                let link_local = (a.segments()[0] & 0xffc0) == 0xfe80;
+                if link_local {
+                    self.if_index.is_some_and(|i| u32::from(i) == scope)
+                } else {
+                    self.own_v6.iter().any(|own| {
+                        (own.segments()[0] & 0xffc0) != 0xfe80
+                            && own.segments()[..4] == a.segments()[..4]
+                    })
+                }
+            }
+        }
+    }
+}
+
 /// Bounded per-source memory of what was announced.
 #[derive(Debug, Default)]
 pub struct MdnsCache {
     by_ip: HashMap<IpAddr, CacheEntry>,
+    filter: Option<LinkFilter>,
 }
 
 impl MdnsCache {
+    /// Restrict the cache to one link and drop what is already cached from elsewhere. `None`
+    /// lifts the restriction (before the first scan has read the link).
+    pub fn set_filter(&mut self, filter: Option<LinkFilter>) {
+        if let Some(f) = &filter {
+            self.by_ip.retain(|ip, e| f.admits(*ip, e.scope));
+        }
+        self.filter = filter;
+    }
+
     pub fn observe(&mut self, ip: IpAddr, scope: u32, a: Announcement, now: Millis) {
         // An announcement that is only the sender's own address teaches nothing.
         if a.hostname.is_none() && a.services.is_empty() {
             return;
         }
+        if self.filter.as_ref().is_some_and(|f| !f.admits(ip, scope)) {
+            return;
+        }
         if !self.by_ip.contains_key(&ip) && self.by_ip.len() >= MAX_CACHE_ENTRIES {
             self.by_ip.retain(|_, e| now - e.last_seen < CACHE_TTL_MS);
+            // Still full: make room by dropping the entry heard longest ago, so a flood of
+            // spoofed sources cannot lock real devices out for the whole TTL.
             if self.by_ip.len() >= MAX_CACHE_ENTRIES {
-                return;
+                let oldest = self
+                    .by_ip
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_seen)
+                    .map(|(ip, _)| *ip);
+                if let Some(old) = oldest {
+                    self.by_ip.remove(&old);
+                }
             }
         }
         let e = self.by_ip.entry(ip).or_default();
@@ -442,6 +498,15 @@ impl MdnsHandle {
     /// How many sources have announced (a count for the log; no content).
     pub fn announced_sources(&self) -> usize {
         self.cache.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// Tell the cache which link to accept sources from (called each scan with the joined Wi-Fi).
+    pub fn set_link(&self, filter: LinkFilter) {
+        if let Ok(mut c) = self.cache.lock() {
+            if c.filter.as_ref() != Some(&filter) {
+                c.set_filter(Some(filter));
+            }
+        }
     }
 
     /// Everything heard so far, per source.
@@ -938,5 +1003,116 @@ mod tests {
                 "mdns.rs must not contain {forbidden}"
             );
         }
+    }
+
+    // -- L5: spoofed sources cannot lock real devices out of the cache -----------------------------
+
+    fn named(host: &str) -> Announcement {
+        Announcement {
+            hostname: Some(host.into()),
+            ..Default::default()
+        }
+    }
+
+    fn spoof(i: u32) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::from(0xC000_0200 + i)) // 192.0.2.x, 198-style TEST-NET
+    }
+
+    #[test]
+    fn a_full_cache_evicts_its_oldest_entry_instead_of_dropping_a_real_device() {
+        let mut c = MdnsCache::default();
+        let t0: Millis = 1_000_000;
+        for i in 0..MAX_CACHE_ENTRIES as u32 {
+            c.observe(
+                spoof(i),
+                0,
+                named(&format!("spoof-{i}.local")),
+                t0 + Millis::from(i),
+            );
+        }
+        assert_eq!(c.len(), MAX_CACHE_ENTRIES);
+        // Within the TTL, a real device announces. It must be cached, displacing the oldest.
+        let real = IpAddr::V4(Ipv4Addr::new(192, 168, 77, 20));
+        c.observe(real, 0, named("real.local"), t0 + 10_000);
+        assert_eq!(
+            c.get(real).and_then(|a| a.hostname.as_deref()),
+            Some("real.local"),
+            "the real device is cached"
+        );
+        assert_eq!(c.len(), MAX_CACHE_ENTRIES, "still bounded");
+        assert!(c.get(spoof(0)).is_none(), "the OLDEST spoof was evicted");
+        assert!(c.get(spoof(1)).is_some(), "newer entries stay");
+        // NEGATIVE CONTROL: an entry that is already cached is refreshed, nothing evicted.
+        c.observe(spoof(5), 0, named("spoof-5.local"), t0 + 20_000);
+        assert!(c.get(spoof(1)).is_some());
+    }
+
+    fn filter() -> LinkFilter {
+        LinkFilter {
+            subnet: Some(Subnet {
+                addr: Ipv4Addr::new(192, 168, 77, 7),
+                prefix: 24,
+            }),
+            if_index: Some(11),
+            own_v6: vec![
+                "fe80::7".parse().unwrap(),
+                "2001:db8:1:2::7".parse().unwrap(),
+            ],
+        }
+    }
+
+    #[test]
+    fn only_sources_on_the_wifi_link_are_admitted() {
+        let f = filter();
+        let v4 = |s: &str| IpAddr::V4(s.parse().unwrap());
+        let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
+        assert!(f.admits(v4("192.168.77.20"), 0));
+        assert!(!f.admits(v4("192.168.78.20"), 0), "other subnet");
+        assert!(!f.admits(v4("10.9.9.9"), 0));
+        // Link-local IPv6 must arrive on the Wi-Fi interface.
+        assert!(f.admits(v6("fe80::20"), 11));
+        assert!(!f.admits(v6("fe80::20"), 4), "other interface");
+        assert!(!f.admits(v6("fe80::20"), 0), "unknown interface");
+        // A global source must share a /64 with one of our own addresses.
+        assert!(f.admits(v6("2001:db8:1:2::99"), 0));
+        assert!(!f.admits(v6("2001:db8:9:9::99"), 0));
+        // No IPv4 subnet known -> no IPv4 source admitted; a default filter admits nothing.
+        let none = LinkFilter::default();
+        assert!(!none.admits(v4("192.168.77.20"), 0));
+        assert!(!none.admits(v6("fe80::20"), 11));
+    }
+
+    #[test]
+    fn spoofed_off_link_sources_never_fill_the_cache_and_setting_the_filter_purges() {
+        let mut c = MdnsCache::default();
+        let t0: Millis = 1_000_000;
+        // Before the link is known everything is cached; the filter then clears what is off-link.
+        c.observe(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 77, 20)),
+            0,
+            named("real.local"),
+            t0,
+        );
+        c.observe(
+            IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)),
+            0,
+            named("elsewhere.local"),
+            t0,
+        );
+        c.set_filter(Some(filter()));
+        assert_eq!(c.len(), 1, "the off-link entry was purged");
+        // 2000 spoofed off-subnet sources do not occupy a single slot.
+        for i in 0..2000u32 {
+            c.observe(
+                IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + i)),
+                0,
+                named("x.local"),
+                t0 + 1,
+            );
+        }
+        assert_eq!(c.len(), 1);
+        let late = IpAddr::V4(Ipv4Addr::new(192, 168, 77, 21));
+        c.observe(late, 0, named("late.local"), t0 + 2);
+        assert!(c.get(late).is_some());
     }
 }

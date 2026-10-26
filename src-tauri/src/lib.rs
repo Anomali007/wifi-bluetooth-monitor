@@ -76,9 +76,9 @@ pub fn run() {
                 )?;
             }
             let dir = app.path().app_data_dir()?;
-            lan::helper::set_data_dir(&dir);
-            let store = store::Store::open(&dir)?;
+            // Lock the folder (0700) BEFORE the database is created inside it.
             lan::helper::prepare_dir(&dir);
+            let store = store::Store::open(&dir)?;
             let settings = store.get_settings().ok();
             let notify = settings.as_ref().map(|s| s.notify).unwrap_or(true);
             lan::helper::reconcile(
@@ -96,6 +96,12 @@ pub fn run() {
             commands::spawn_scan_loop(app.handle().clone());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // Stop the launchd jobs while the app is closed; the next launch registers again.
+            if matches!(event, tauri::RunEvent::Exit) {
+                lan::helper::on_quit();
+            }
+        });
 }

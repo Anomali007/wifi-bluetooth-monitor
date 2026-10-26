@@ -359,6 +359,9 @@ impl Store {
             }
             Some(_) => {}
         }
+        // Idempotent and independent of the schema version: the network name saved with an
+        // access-point mark (the sweep gate checks it).
+        add_column_if_missing(&tx, "mine", "ssid", "TEXT")?;
         tx.commit()?;
         Ok(())
     }
@@ -862,7 +865,7 @@ impl Store {
     /// Every Mine row with who made it, oldest first (for display and the audit).
     pub fn list_mine_with_source(&self) -> StoreResult<Vec<(MineEntry, AddedBy)>> {
         let mut q = self.conn.prepare(
-            "SELECT kind, id_hash, label, added_at, added_by FROM mine ORDER BY added_at, id_hash",
+            "SELECT kind, id_hash, label, added_at, added_by, ssid FROM mine ORDER BY added_at, id_hash",
         )?;
         let rows = q.query_map([], |r| {
             Ok((
@@ -871,16 +874,18 @@ impl Store {
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, Millis>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (kind, id_hash, label, added_at, by) = row?;
+            let (kind, id_hash, label, added_at, by, ssid) = row?;
             out.push((
                 MineEntry {
                     kind: from_json(&kind)?,
                     id_hash,
                     label,
+                    ssid,
                     added_at,
                 },
                 AddedBy::parse(&by),
@@ -899,10 +904,11 @@ impl Store {
     /// provenance wins (a person re-marking an `agent` row makes it theirs).
     pub fn add_mine_as(&mut self, e: &MineEntry, by: AddedBy) -> StoreResult<()> {
         self.conn.execute(
-            "INSERT INTO mine (kind, id_hash, label, added_at, added_by) VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO mine (kind, id_hash, label, added_at, added_by, ssid) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(kind, id_hash) DO UPDATE SET label = excluded.label,
+                 ssid = COALESCE(excluded.ssid, ssid),
                  added_by = CASE WHEN excluded.added_by = 'agent' THEN added_by ELSE excluded.added_by END",
-            params![to_json(&e.kind)?, e.id_hash, e.label, e.added_at, by.as_str()],
+            params![to_json(&e.kind)?, e.id_hash, e.label, e.added_at, by.as_str(), e.ssid],
         )?;
         Ok(())
     }
@@ -1046,9 +1052,45 @@ impl Store {
                 ip: None,
                 mine,
                 source: source.as_deref().and_then(LanSource::parse),
+                possibly_same_as: None,
             });
         }
+        // Hint only: a not-Mine device that announced the hostname of a Mine row on the same
+        // network may be that device, but only the user can say so.
+        let labels: Vec<(String, String, String)> = out
+            .iter()
+            .filter(|d| d.mine)
+            .filter_map(|d| {
+                let label = self.lan_mine_label(&d.mac_hash).ok()??;
+                Some((d.network_key.clone(), d.mac_hash.clone(), label))
+            })
+            .collect();
+        if !labels.is_empty() {
+            for d in out.iter_mut().filter(|d| !d.mine) {
+                let Some(host) = &d.hostname else { continue };
+                let hk = crate::lan::host_key(&self.salt, host);
+                if let Some((_, _, label)) = labels
+                    .iter()
+                    .find(|(n, h, _)| *n == d.network_key && *h == hk && *h != d.mac_hash)
+                {
+                    d.possibly_same_as = Some(label.clone());
+                }
+            }
+        }
         Ok((out, usize::try_from(total).unwrap_or(0)))
+    }
+
+    /// The label of a Mine LAN entry, or a generic name when it has none. `None` if not Mine.
+    fn lan_mine_label(&self, id_hash: &str) -> StoreResult<Option<String>> {
+        let found: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT label FROM mine WHERE kind = ?1 AND id_hash = ?2",
+                params![to_json(&MineKind::Lan)?, id_hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.map(|l| l.unwrap_or_else(|| "a device you marked as yours".to_string())))
     }
 
     /// Remove one stored LAN device and return it (with `mine` filled), or `None` if absent.
@@ -1484,6 +1526,7 @@ mod tests {
             kind,
             id_hash: id.into(),
             label: None,
+            ssid: None,
             added_at: at,
         }
     }
@@ -1500,6 +1543,7 @@ mod tests {
             ip: Some("192.0.2.9".into()),
             mine: false,
             source: None,
+            possibly_same_as: None,
         }
     }
 
@@ -1928,5 +1972,95 @@ mod tests {
         let p = d.path().join("a").join("b");
         Store::open(&p).unwrap();
         assert!(p.join(DB_FILE).exists());
+    }
+
+    #[test]
+    fn a_mine_mark_keeps_its_ssid_and_a_remark_without_one_does_not_erase_it() {
+        let (_d, mut s) = open();
+        let mut e = MineEntry {
+            kind: MineKind::WifiAp,
+            id_hash: "b1".into(),
+            label: None,
+            ssid: Some("Net-A".into()),
+            added_at: 10,
+        };
+        s.add_mine(&e).unwrap();
+        assert_eq!(s.list_mine().unwrap()[0].ssid.as_deref(), Some("Net-A"));
+        // Re-marking with only a new label keeps the saved name.
+        e.ssid = None;
+        e.label = Some("Home".into());
+        s.add_mine(&e).unwrap();
+        let got = &s.list_mine().unwrap()[0];
+        assert_eq!(
+            (got.label.as_deref(), got.ssid.as_deref()),
+            (Some("Home"), Some("Net-A"))
+        );
+        // Re-marking from another network name replaces it.
+        e.ssid = Some("Net-B".into());
+        s.add_mine(&e).unwrap();
+        assert_eq!(s.list_mine().unwrap()[0].ssid.as_deref(), Some("Net-B"));
+    }
+
+    #[test]
+    fn an_older_mine_table_gains_the_ssid_column_and_its_marks_have_no_name() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES (4);
+                 CREATE TABLE mine (kind TEXT NOT NULL, id_hash TEXT NOT NULL, label TEXT,
+                   added_at INTEGER NOT NULL, PRIMARY KEY (kind, id_hash));
+                 INSERT INTO mine VALUES ('\"wifiAp\"', 'old', NULL, 5);",
+            )
+            .unwrap();
+        }
+        let mut s = Store::open(dir.path()).unwrap();
+        let got = s.list_mine().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].ssid, None, "a pre-existing mark has no saved name");
+        // Migrating again changes nothing.
+        s.migrate().unwrap();
+        assert_eq!(s.list_mine().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_v4_mine_table_migrates_to_v5_whether_or_not_it_already_has_the_ssid_column() {
+        // Order 1: no ssid, no added_by. Order 2: ssid present (the places branch's column
+        // arrived first), added_by missing. Both end at v5 with both columns and keep the row.
+        for with_ssid in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+                let (cols, vals) = if with_ssid {
+                    (", ssid TEXT", "'\"wifiAp\"', 'old', 'Mine-A', 5, 'Net-A'")
+                } else {
+                    ("", "'\"wifiAp\"', 'old', 'Mine-A', 5")
+                };
+                conn.execute_batch(&format!(
+                    "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                     INSERT INTO schema_version VALUES (4);
+                     CREATE TABLE mine (kind TEXT NOT NULL, id_hash TEXT NOT NULL, label TEXT,
+                       added_at INTEGER NOT NULL{cols}, PRIMARY KEY (kind, id_hash));
+                     INSERT INTO mine VALUES ({vals});"
+                ))
+                .unwrap();
+            }
+            let mut s = Store::open(dir.path()).unwrap();
+            let v: i64 = s
+                .conn
+                .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, 5, "with_ssid={with_ssid}");
+            let rows = s.list_mine_with_source().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, AddedBy::User);
+            assert_eq!(
+                rows[0].0.ssid.as_deref(),
+                if with_ssid { Some("Net-A") } else { None }
+            );
+            s.migrate().unwrap();
+            assert_eq!(s.list_mine().unwrap().len(), 1);
+        }
     }
 }

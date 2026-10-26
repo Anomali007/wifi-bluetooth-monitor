@@ -219,6 +219,11 @@ export interface MineEntry {
   kind: MineKind;
   idHash: string;
   label: string | null;
+  /**
+   * The network name saved with a wifiAp/wifiGroup mark. The active sweep also requires the
+   * joined network to carry this name. Absent on other kinds and on marks made before it existed.
+   */
+  ssid?: string | null;
   addedAt: Millis;
 }
 
@@ -252,6 +257,11 @@ export interface LanDevice {
    * with no hardware address ("announced"), or both. Null only for rows from before v4.
    */
   source: LanSource | null;
+  /**
+   * Label of a Mine device whose mDNS hostname this device also announced. A hint to confirm
+   * by hand; it never makes the device Mine.
+   */
+  possiblySameAs?: string;
 }
 
 export type LanSource = "neighbor" | "announced" | "both";

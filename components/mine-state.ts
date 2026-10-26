@@ -38,7 +38,12 @@ export interface MineStore {
   /** Load once; later calls reuse the first request. Failures leave the list empty. */
   ensureLoaded: () => Promise<void>;
   reload: () => Promise<void>;
-  mark: (kind: MineKind, idHash: string, label: string | null) => Promise<void>;
+  mark: (
+    kind: MineKind,
+    idHash: string,
+    label: string | null,
+    ssid?: string | null,
+  ) => Promise<void>;
   unmark: (kind: MineKind, idHash: string) => Promise<void>;
 }
 
@@ -66,8 +71,8 @@ export function createMineStore(): MineStore {
       return loading;
     },
     reload,
-    mark: async (kind, idHash, label) => {
-      const saved = await addMine(kind, idHash, label);
+    mark: async (kind, idHash, label, ssid = null) => {
+      const saved = await addMine(kind, idHash, label, ssid);
       publish([...entries.filter((e) => !(e.kind === kind && e.idHash === idHash)), saved]);
     },
     unmark: async (kind, idHash) => {
