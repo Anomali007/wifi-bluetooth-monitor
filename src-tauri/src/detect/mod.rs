@@ -233,6 +233,12 @@ fn subject_key(namespace: &str, value: &str) -> String {
     sha_hex(&format!("{namespace}\u{1f}{value}"))
 }
 
+/// The `subject_hash` of the evil-twin and open-lookalike alerts about a network name. Lets a
+/// caller find the alerts for a name without reading alert text.
+pub fn ssid_subject_hash(ssid: &str) -> String {
+    subject_key("ssid", &fold_ssid(ssid))
+}
+
 fn alert_id(kind: AlertKind, subject_hash: &str) -> String {
     sha_hex(&format!("{}\u{1f}{}", kind_tag(kind), subject_hash))
 }
@@ -309,7 +315,7 @@ fn fold_ssid(s: &str) -> String {
     let mut out = String::new();
     let mut pending_space = false;
     for c in s.chars() {
-        if matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}') || c.is_control() {
+        if crate::labels::is_unsafe_char(c) {
             continue;
         }
         if c.is_whitespace() {
@@ -366,7 +372,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-fn is_lookalike(observed: &str, trusted: &str) -> bool {
+pub fn is_lookalike(observed: &str, trusted: &str) -> bool {
     let (o, t) = (fold_ssid(observed), fold_ssid(trusted));
     if o.is_empty() || t.is_empty() {
         return false;

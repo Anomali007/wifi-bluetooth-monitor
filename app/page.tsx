@@ -2,6 +2,7 @@
 
 import DeviceChart from "./components/DeviceChart";
 import DeviceTable, { rowsFrom } from "@/components/device-table";
+import AgentRequestsBadge from "@/components/agent-requests-badge";
 import PermissionBanner from "@/components/permission-banner";
 import { useMonitor } from "@/components/monitor-provider";
 import {
@@ -27,6 +28,7 @@ export default function Dashboard() {
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold">Dashboard</h1>
         <div className="flex items-center gap-3 text-sm text-muted-foreground">
+          <AgentRequestsBadge />
           {scan && <span>Last scan {formatTime(scan.scannedAt)}</span>}
           <button
             onClick={() => void refresh()}

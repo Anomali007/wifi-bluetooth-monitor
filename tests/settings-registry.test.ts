@@ -183,3 +183,12 @@ describe("queries find the right setting", () => {
     for (const i of SETTING_ITEMS) expect(i.href).toBe(settingHref(i.target!));
   });
 });
+
+describe("agent requests anchor", () => {
+  it("the dashboard badge links to the id the section and registry use", async () => {
+    const { AGENT_REQUESTS_ID } = await import("../lib/agent-requests");
+    const { SETTINGS_REGISTRY } = await import("../lib/settings-registry");
+    expect(AGENT_REQUESTS_ID).toBe("agent-requests");
+    expect(SETTINGS_REGISTRY.some((e) => e.id === AGENT_REQUESTS_ID)).toBe(true);
+  });
+});

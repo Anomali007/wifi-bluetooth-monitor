@@ -7,6 +7,9 @@
  * normal build the branch is dead code and the mock module is not bundled.
  */
 import type {
+  AgentAuditPage,
+  AgentDecision,
+  AgentProposal,
   HelperStatus,
   Alert,
   History,
@@ -46,7 +49,11 @@ export type CommandName =
   | "get_current_network"
   | "sweep_now"
   | "get_helper_status"
-  | "open_login_items";
+  | "open_login_items"
+  | "list_agent_proposals"
+  | "decide_agent_proposal"
+  | "list_agent_audit"
+  | "undo_agent_change";
 
 async function call<T>(
   cmd: CommandName,
@@ -127,6 +134,25 @@ export const getHelperStatus = () => call<HelperStatus>("get_helper_status");
 
 /** Open System Settings at Login Items. */
 export const openLoginItems = () => call<void>("open_login_items");
+
+// ---- Agent requests ----------------------------------------------------------
+
+/** Changes an agent asked for that wait for a person. Stale ones are expired first. */
+export const listAgentProposals = () => call<AgentProposal[]>("list_agent_proposals");
+
+/**
+ * Approve or reject one request. Approval needs the `digest` of the request as it was shown:
+ * the app recomputes it, refuses when it differs, then re-validates and applies.
+ */
+export const decideAgentProposal = (id: number, approve: boolean, digest: string | null = null) =>
+  call<AgentDecision>("decide_agent_proposal", { id, approve, digest });
+
+/** Changes agents made: direct, not-undone ones pinned first, then newest first. */
+export const listAgentAudit = (limit?: number) =>
+  call<AgentAuditPage>("list_agent_audit", { limit: limit ?? null });
+
+/** One-click undo of an audited agent change. */
+export const undoAgentChange = (id: number) => call<void>("undo_agent_change", { id });
 
 type Unsubscribe = () => void;
 

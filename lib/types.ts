@@ -179,6 +179,12 @@ export interface Settings {
   lanActiveSweep: boolean;
   /** Opt-in background item that runs Apple's arp and ndp every minute (the app spawns nothing). default false */
   lanNeighborHelper: boolean;
+  /**
+   * Write counter of the stored settings. Opaque: send back what you loaded. When it is behind
+   * (an agent tool edited the trusted networks meanwhile), the backend merges instead of
+   * overwriting, so a stale draft cannot erase that edit.
+   */
+  revision: number;
 }
 
 /** State of the background item (mirror of lan::helper::HelperStatus). */
@@ -284,6 +290,52 @@ export interface NetworkInfo {
   sweepNote?: string | null;
 }
 
+// ---- Agent requests (the wbm CLI / MCP server asks, a person decides) -------------
+
+/**
+ * One change an agent asked for. Nothing has happened yet. `summary` and `warnings` are
+ * written by the app from its own data; a name inside is the agent's and is shown in
+ * quotation marks. `blocked` is why approving would be refused right now, if it would.
+ */
+export interface AgentProposal {
+  id: number;
+  tool: string;
+  createdAt: Millis;
+  expiresAt: Millis;
+  summary: string;
+  warnings: string[];
+  blocked: string | null;
+  /** What this request describes, hashed. Approve sends it back; if the situation changed
+   * since it was read the app refuses and the request must be read again. */
+  digest: string;
+}
+
+/** One change an agent made (applied directly, or approved by a person). */
+export interface AgentAuditEntry {
+  id: number;
+  at: Millis;
+  tool: string;
+  via: "direct" | "proposal";
+  addedBy: "agent";
+  proposalId: number | null;
+  summary: string;
+  undone: boolean;
+}
+
+/** A page of the audit log: direct, not-undone changes first (pinned), then newest first. */
+export interface AgentAuditPage {
+  entries: AgentAuditEntry[];
+  total: number;
+  pinned: number;
+}
+
+export interface AgentDecision {
+  status: "approved" | "rejected";
+  /** Approved and something actually changed. */
+  changed: boolean;
+  message: string;
+}
+
 export const DEFAULT_SETTINGS: Settings = {
   trustedNetworks: [],
   scanIntervalSecs: 60,
@@ -305,4 +357,5 @@ export const DEFAULT_SETTINGS: Settings = {
   placeRetentionDays: 14,
   lanActiveSweep: false,
   lanNeighborHelper: false,
+  revision: 0,
 };

@@ -186,7 +186,7 @@ pub fn run_sweep<S: SweepSink>(
                 }
                 // Every RECHECK_EVERY sends, ask whether the network and the setting are still
                 // what the sweep was approved on; stop at once if not.
-                if attempts % RECHECK_EVERY == 0 && !still_ok() {
+                if attempts.is_multiple_of(RECHECK_EVERY) && !still_ok() {
                     stats.aborted = true;
                     break;
                 }

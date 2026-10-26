@@ -10,6 +10,7 @@ Only what is **not** built yet. What exists is described in the [README](README.
 - Confirm on real adverts that the separated-only Find My rule (length byte 0x19 plus AirTag/Find My status type, DULT near-owner bit) neither misses a real separated AirTag nor still flags ordinary Apple devices. It follows AirGuard source and is tested on synthetic bytes only.
 - Verify the network sweep on a real network (the gate, the packet sink, the rate limit, the /23 cap and the socket opening are tested; no packet of either kind has been sent on a real Wi-Fi link, and how many more devices it surfaces is unmeasured) and the Local Network prompt on more than one macOS version.
 - Verify the Location prompt and grant flow across rebuilds on more than one macOS version.
+- **Agent tools (`wbm`) against a real agent session.** Tested end to end over stdio with a scripted client and synthetic data; not yet run from Claude Code against the real database for a working session. Also unverified: how a long-open settings window behaves after an agent edit on a real machine (the merge and the stale-save refusal are unit-tested; the window itself does not live-refresh), and the Agent requests section and Dashboard count against a real running app (tested against the mock backend and the Rust approval functions, not clicked through in the built app).
 
 ## Dependencies
 
@@ -22,6 +23,9 @@ Only what is **not** built yet. What exists is described in the [README](README.
 
 ## Features
 
+- Agent tools: a live-refresh path for an open app window when `wbm` edits Mine, the watchlist or trusted networks (today the window shows the change after its next reload; saves from a stale window are merged, never destructive).
+- Agent tools: finer per-tool control than read-only versus `--edits` (for example hiding history or LAN tools).
+- Agent tools: a signed/notarized `wbm` that ships inside the app bundle, so `claude mcp add` can point at a stable path.
 - Alert history that survives the retention window (dismissed state is lost when an alert is purged).
 - An in-app "add the current access points to this trusted network" action for networks that are already trusted.
 - Linux and Windows backends (different radio APIs; none exist).

@@ -390,6 +390,10 @@ pub struct Settings {
     /// whose output the app reads, because macOS 27 hides the neighbor tables from apps. The
     /// app spawns nothing. Default false.
     pub lan_neighbor_helper: bool,
+    /// Write counter of the stored settings, bumped by every save (the app's or an agent
+    /// tool's). A client sends back the revision it loaded; when it is behind, the store
+    /// merges instead of overwriting (see `Store::set_settings`). Opaque to the UI.
+    pub revision: u64,
 }
 
 impl Default for Settings {
@@ -406,6 +410,7 @@ impl Default for Settings {
             place_retention_days: 14,
             lan_active_sweep: false,
             lan_neighbor_helper: false,
+            revision: 0,
         }
     }
 }

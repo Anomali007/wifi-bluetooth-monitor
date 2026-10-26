@@ -1,0 +1,770 @@
+//! Agent proposals and the agent audit log.
+//!
+//! An agent (the `wbm` CLI or MCP server) can never apply an edit that could hide an alert.
+//! It writes a row to `agent_proposals` and stops; a person approves or rejects it in the app.
+//! Nothing here applies a proposal: applying lives in `crate::proposals`, which only the app's
+//! Tauri commands call (`tests/agent_listen_only.rs` keeps `agent/` away from it).
+//!
+//! `agent_audit` records every change an agent made, directly or through an approved proposal,
+//! with `added_by = agent`, and carries what is needed to undo it.
+
+use super::{from_json, to_json, Store, StoreResult};
+use crate::model::{Millis, MineEntry, MineKind, WatchKind, WatchMatch, WatchlistEntry};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// A pending proposal expires after this long.
+pub const PROPOSAL_TTL_MS: Millis = 24 * 60 * 60 * 1000;
+/// At most this many proposals wait at once; more are refused until some are decided.
+pub const MAX_PENDING_PROPOSALS: usize = 20;
+/// ...and at most this many per tool, so one tool cannot fill the inbox and bury the rest.
+pub const MAX_PENDING_PER_TOOL: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProposalStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+impl ProposalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProposalStatus::Pending => "pending",
+            ProposalStatus::Approved => "approved",
+            ProposalStatus::Rejected => "rejected",
+            ProposalStatus::Expired => "expired",
+        }
+    }
+    fn parse(s: &str) -> ProposalStatus {
+        match s {
+            "approved" => ProposalStatus::Approved,
+            "rejected" => ProposalStatus::Rejected,
+            "expired" => ProposalStatus::Expired,
+            _ => ProposalStatus::Pending,
+        }
+    }
+}
+
+/// Who made a Mine entry. Only a person's (`User`, or `Approved` by a click) count for
+/// detection and for the sweep gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AddedBy {
+    /// Created by a person in the app.
+    User,
+    /// Proposed by an agent, then approved by a person in the app.
+    Approved,
+    /// Written by an agent with no human click. Kept for display; never trusted.
+    Agent,
+}
+
+impl AddedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AddedBy::User => "user",
+            AddedBy::Approved => "approved",
+            AddedBy::Agent => "agent",
+        }
+    }
+    /// Unknown text reads as `Agent`: the least trusted reading.
+    pub fn parse(s: &str) -> AddedBy {
+        match s {
+            "user" => AddedBy::User,
+            "approved" => AddedBy::Approved,
+            _ => AddedBy::Agent,
+        }
+    }
+    pub fn is_human_confirmed(self) -> bool {
+        self != AddedBy::Agent
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Proposal {
+    pub id: i64,
+    pub tool: String,
+    pub args: Value,
+    pub created_at: Millis,
+    pub status: ProposalStatus,
+    pub decided_at: Option<Millis>,
+}
+
+/// What [`Store::create_proposal`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewProposal {
+    Created(i64),
+    /// An identical proposal was already pending; this is its id.
+    Existing(i64),
+    /// [`MAX_PENDING_PROPOSALS`] are already waiting.
+    TooMany,
+}
+
+fn dedupe_key(args: &Value) -> String {
+    let mut v = args.clone();
+    if let Value::Object(m) = &mut v {
+        m.remove("label");
+    }
+    serde_json::to_string(&v).unwrap_or_default()
+}
+
+/// What an agent's direct `watchlist_add` did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DirectAdd {
+    Added(WatchlistEntry),
+    Existing(WatchlistEntry),
+    CapReached,
+    RateLimited,
+}
+
+/// What an agent's direct `mine_remove` did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DirectMineRemove {
+    Removed(MineEntry),
+    Absent,
+    /// The row was made or approved by a person: not removed.
+    NotAgent,
+    RateLimited,
+}
+
+/// One applied agent change, as recorded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub at: Millis,
+    pub tool: String,
+    /// `direct` (applied by the tool) or `proposal` (a person approved it).
+    pub via: String,
+    /// Always `agent`: the change originated from an agent, whoever clicked.
+    pub added_by: String,
+    pub proposal_id: Option<i64>,
+    /// App-written one-liner.
+    pub summary: String,
+    /// How to reverse it (interpreted by `crate::proposals::undo`).
+    pub undo: Value,
+    pub undone: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAudit<'a> {
+    pub at: Millis,
+    pub tool: &'a str,
+    pub via: &'a str,
+    pub proposal_id: Option<i64>,
+    pub summary: &'a str,
+    pub undo: &'a Value,
+}
+
+fn row_to_proposal(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(i64, String, String, Millis, String, Option<Millis>)> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+    ))
+}
+
+fn build(row: (i64, String, String, Millis, String, Option<Millis>)) -> Proposal {
+    Proposal {
+        id: row.0,
+        tool: row.1,
+        args: serde_json::from_str(&row.2).unwrap_or(Value::Null),
+        created_at: row.3,
+        status: ProposalStatus::parse(&row.4),
+        decided_at: row.5,
+    }
+}
+
+const PROPOSAL_COLS: &str = "id, tool, args, created_at, status, decided_at";
+
+impl Store {
+    /// Record a proposal. Identical pending proposals (same tool and arguments) are one;
+    /// stale pending ones are expired first; at most [`MAX_PENDING_PROPOSALS`] wait at once.
+    pub fn create_proposal(
+        &mut self,
+        tool: &str,
+        args: &Value,
+        now: Millis,
+    ) -> StoreResult<NewProposal> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        expire(&tx, now)?;
+        // `Value` objects are key-sorted, so equal arguments serialise equally. The dedupe key
+        // leaves the label out: the same thing proposed again with a new label is the same
+        // request, not another row to approve.
+        let canon = serde_json::to_string(args).unwrap_or_default();
+        let key = dedupe_key(args);
+        let mut q = tx.prepare(
+            "SELECT id, args FROM agent_proposals WHERE status = 'pending' AND tool = ?1 ORDER BY id",
+        )?;
+        let same_tool: Vec<(i64, String)> = q
+            .query_map([tool], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        drop(q);
+        if let Some((id, _)) = same_tool
+            .iter()
+            .find(|(_, a)| serde_json::from_str::<Value>(a).is_ok_and(|v| dedupe_key(&v) == key))
+        {
+            return Ok(NewProposal::Existing(*id));
+        }
+        if same_tool.len() >= MAX_PENDING_PER_TOOL {
+            return Ok(NewProposal::TooMany);
+        }
+        let pending: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM agent_proposals WHERE status = 'pending'",
+            [],
+            |r| r.get(0),
+        )?;
+        if pending as usize >= MAX_PENDING_PROPOSALS {
+            return Ok(NewProposal::TooMany);
+        }
+        tx.execute(
+            "INSERT INTO agent_proposals (tool, args, created_at, status) VALUES (?1, ?2, ?3, 'pending')",
+            params![tool, canon, now],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(NewProposal::Created(id))
+    }
+
+    /// Mark every pending proposal older than the TTL expired. Returns how many.
+    pub fn expire_proposals(&mut self, now: Millis) -> StoreResult<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = expire(&tx, now)?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Pending proposals (after expiring stale ones), oldest first.
+    pub fn list_pending_proposals(&mut self, now: Millis) -> StoreResult<Vec<Proposal>> {
+        self.expire_proposals(now)?;
+        let mut q = self.conn.prepare(&format!(
+            "SELECT {PROPOSAL_COLS} FROM agent_proposals WHERE status = 'pending' ORDER BY id"
+        ))?;
+        let rows = q.query_map([], row_to_proposal)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(build(r?));
+        }
+        Ok(out)
+    }
+
+    pub fn get_proposal(&self, id: i64) -> StoreResult<Option<Proposal>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {PROPOSAL_COLS} FROM agent_proposals WHERE id = ?1"),
+                [id],
+                row_to_proposal,
+            )
+            .optional()?
+            .map(build))
+    }
+
+    /// Decide a PENDING proposal. Returns false when it was not pending (already decided or
+    /// expired), so a double click or a second window cannot apply it twice.
+    pub fn decide_proposal(
+        &mut self,
+        id: i64,
+        status: ProposalStatus,
+        now: Millis,
+    ) -> StoreResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE agent_proposals SET status = ?1, decided_at = ?2 WHERE id = ?3 AND status = 'pending'",
+            params![status.as_str(), now, id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Append to the audit log. Returns the entry id.
+    pub fn record_audit(&mut self, e: &NewAudit<'_>) -> StoreResult<i64> {
+        insert_audit(&self.conn, e)
+    }
+
+    /// An agent's direct `watchlist_add`, atomically: the duplicate check, the rule cap, the
+    /// hourly direct-edit limit, the insert and its audit row are ONE `BEGIN IMMEDIATE`
+    /// transaction, so parallel callers cannot each pass the check and together exceed it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_add_watchlist(
+        &mut self,
+        kind: WatchKind,
+        pattern: &str,
+        mode: WatchMatch,
+        now: Millis,
+        summary: &str,
+        max_rules: usize,
+        max_direct_per_hour: usize,
+    ) -> StoreResult<DirectAdd> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rules = read_watchlist(&tx)?;
+        if let Some(w) = rules.iter().find(|w| {
+            w.kind == kind && w.match_mode == mode && w.pattern.eq_ignore_ascii_case(pattern)
+        }) {
+            return Ok(DirectAdd::Existing(w.clone()));
+        }
+        if rules.len() >= max_rules {
+            return Ok(DirectAdd::CapReached);
+        }
+        if direct_edits_since(&tx, now - 3_600_000)? >= max_direct_per_hour {
+            return Ok(DirectAdd::RateLimited);
+        }
+        tx.execute(
+            "INSERT INTO watchlist (kind, pattern, match_mode, added_at) VALUES (?1, ?2, ?3, ?4)",
+            params![to_json(&kind)?, pattern, to_json(&mode)?, now],
+        )?;
+        let w = WatchlistEntry {
+            id: tx.last_insert_rowid(),
+            kind,
+            pattern: pattern.to_string(),
+            match_mode: mode,
+            added_at: now,
+        };
+        insert_audit(
+            &tx,
+            &NewAudit {
+                at: now,
+                tool: "watchlist_add",
+                via: "direct",
+                proposal_id: None,
+                summary,
+                undo: &serde_json::json!({"op": "watchlistRemove", "entry": w}),
+            },
+        )?;
+        tx.commit()?;
+        Ok(DirectAdd::Added(w))
+    }
+
+    /// An agent's direct `mine_remove`, atomically, and ONLY for a row an agent itself wrote:
+    /// the lookup, the hourly limit, a `DELETE ... AND added_by = 'agent'` and the audit row are
+    /// one `BEGIN IMMEDIATE` transaction. A row a person made or approved is reported as
+    /// [`DirectMineRemove::NotAgent`] and left alone (the caller turns it into a proposal).
+    pub fn agent_remove_mine(
+        &mut self,
+        kind: MineKind,
+        id_hash: &str,
+        now: Millis,
+        summary: impl FnOnce(&MineEntry) -> String,
+        max_direct_per_hour: usize,
+    ) -> StoreResult<DirectMineRemove> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(Option<String>, Millis, Option<String>, String)> = tx
+            .query_row(
+                "SELECT label, added_at, ssid, added_by FROM mine WHERE kind = ?1 AND id_hash = ?2",
+                params![to_json(&kind)?, id_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((label, added_at, ssid, by)) = row else {
+            return Ok(DirectMineRemove::Absent);
+        };
+        if AddedBy::parse(&by) != AddedBy::Agent {
+            return Ok(DirectMineRemove::NotAgent);
+        }
+        if direct_edits_since(&tx, now - 3_600_000)? >= max_direct_per_hour {
+            return Ok(DirectMineRemove::RateLimited);
+        }
+        let entry = MineEntry {
+            kind,
+            id_hash: id_hash.to_string(),
+            label,
+            ssid,
+            added_at,
+        };
+        let n = tx.execute(
+            "DELETE FROM mine WHERE kind = ?1 AND id_hash = ?2 AND added_by = 'agent'",
+            params![to_json(&kind)?, id_hash],
+        )?;
+        if n == 0 {
+            return Ok(DirectMineRemove::NotAgent);
+        }
+        let text = summary(&entry);
+        insert_audit(
+            &tx,
+            &NewAudit {
+                at: now,
+                tool: "mine_remove",
+                via: "direct",
+                proposal_id: None,
+                summary: &text,
+                undo: &serde_json::json!({"op": "mineRestore", "entry": entry, "addedBy": "agent"}),
+            },
+        )?;
+        tx.commit()?;
+        Ok(DirectMineRemove::Removed(entry))
+    }
+
+    /// Newest first.
+    pub fn list_audit(&self, limit: usize) -> StoreResult<Vec<AuditEntry>> {
+        let mut q = self.conn.prepare(
+            "SELECT id, at, tool, via, added_by, proposal_id, summary, undo, undone
+             FROM agent_audit ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = q.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], audit_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Audit entries for display: every direct change that has not been undone first (so a
+    /// burst of later entries can never push it out of sight), then the rest newest first.
+    pub fn list_audit_pinned_first(&self, limit: usize) -> StoreResult<Vec<AuditEntry>> {
+        let mut q = self.conn.prepare(
+            "SELECT id, at, tool, via, added_by, proposal_id, summary, undo, undone
+             FROM agent_audit
+             ORDER BY (via = 'direct' AND undone = 0) DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = q.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], audit_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// (all entries, direct entries not yet undone).
+    pub fn count_audit(&self) -> StoreResult<(usize, usize)> {
+        let all: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM agent_audit", [], |r| r.get(0))?;
+        let pinned: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM agent_audit WHERE via = 'direct' AND undone = 0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((all as usize, pinned as usize))
+    }
+
+    /// Direct (unreviewed) agent changes recorded at or after `since`: the rate-limit input.
+    pub fn count_direct_edits_since(&self, since: Millis) -> StoreResult<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM agent_audit WHERE via = 'direct' AND at >= ?1",
+            [since],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    pub fn get_audit(&self, id: i64) -> StoreResult<Option<AuditEntry>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, at, tool, via, added_by, proposal_id, summary, undo, undone
+                 FROM agent_audit WHERE id = ?1",
+                [id],
+                audit_row,
+            )
+            .optional()?)
+    }
+
+    /// Returns false when already undone.
+    pub fn mark_audit_undone(&mut self, id: i64) -> StoreResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE agent_audit SET undone = 1 WHERE id = ?1 AND undone = 0",
+            [id],
+        )?;
+        Ok(n == 1)
+    }
+}
+
+fn insert_audit(conn: &rusqlite::Connection, e: &NewAudit<'_>) -> StoreResult<i64> {
+    conn.execute(
+        "INSERT INTO agent_audit (at, tool, via, added_by, proposal_id, summary, undo)
+         VALUES (?1, ?2, ?3, 'agent', ?4, ?5, ?6)",
+        params![
+            e.at,
+            e.tool,
+            e.via,
+            e.proposal_id,
+            e.summary,
+            serde_json::to_string(e.undo).unwrap_or_default()
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn direct_edits_since(conn: &rusqlite::Connection, since: Millis) -> StoreResult<usize> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM agent_audit WHERE via = 'direct' AND at >= ?1",
+        [since],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
+}
+
+fn read_watchlist(conn: &rusqlite::Connection) -> StoreResult<Vec<WatchlistEntry>> {
+    let mut q =
+        conn.prepare("SELECT id, kind, pattern, match_mode, added_at FROM watchlist ORDER BY id")?;
+    let rows = q.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Millis>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, kind, pattern, mode, added_at) = row?;
+        out.push(WatchlistEntry {
+            id,
+            kind: from_json(&kind)?,
+            pattern,
+            match_mode: from_json(&mode)?,
+            added_at,
+        });
+    }
+    Ok(out)
+}
+
+fn audit_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEntry> {
+    let undo: String = r.get(7)?;
+    Ok(AuditEntry {
+        id: r.get(0)?,
+        at: r.get(1)?,
+        tool: r.get(2)?,
+        via: r.get(3)?,
+        added_by: r.get(4)?,
+        proposal_id: r.get(5)?,
+        summary: r.get(6)?,
+        undo: serde_json::from_str(&undo).unwrap_or(Value::Null),
+        undone: r.get::<_, i64>(8)? != 0,
+    })
+}
+
+fn expire(tx: &rusqlite::Transaction<'_>, now: Millis) -> StoreResult<usize> {
+    Ok(tx.execute(
+        "UPDATE agent_proposals SET status = 'expired', decided_at = ?1
+         WHERE status = 'pending' AND created_at <= ?2",
+        params![now, now - PROPOSAL_TTL_MS],
+    )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::MAX_PENDING_PER_TOOL;
+    use super::*;
+    use serde_json::json;
+
+    fn open() -> (tempfile::TempDir, Store) {
+        let d = tempfile::TempDir::new().unwrap();
+        let s = Store::open(d.path()).unwrap();
+        (d, s)
+    }
+
+    #[test]
+    fn identical_pending_proposals_are_one() {
+        let (_d, mut s) = open();
+        let a = s
+            .create_proposal("trusted_add", &json!({"ssid": "Net-A"}), 1_000)
+            .unwrap();
+        let b = s
+            .create_proposal("trusted_add", &json!({"ssid": "Net-A"}), 2_000)
+            .unwrap();
+        let c = s
+            .create_proposal("trusted_add", &json!({"ssid": "Net-B"}), 2_000)
+            .unwrap();
+        let (NewProposal::Created(ida), NewProposal::Existing(idb)) = (a, b) else {
+            panic!("{a:?} {b:?}")
+        };
+        assert_eq!(ida, idb);
+        assert!(matches!(c, NewProposal::Created(_)));
+        assert_eq!(s.list_pending_proposals(3_000).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pending_is_capped_overall_and_per_tool_and_a_decision_frees_a_slot() {
+        let (_d, mut s) = open();
+        // Four tools x five each fills the inbox of twenty.
+        let tools = ["trusted_add", "mine_add", "dismiss_alert", "trusted_remove"];
+        for t in tools {
+            for i in 0..MAX_PENDING_PER_TOOL {
+                let r = s
+                    .create_proposal(t, &json!({"k": format!("N{i}")}), 1_000)
+                    .unwrap();
+                assert!(matches!(r, NewProposal::Created(_)), "{t} {i}");
+            }
+            // One tool cannot take more than its share.
+            assert_eq!(
+                s.create_proposal(t, &json!({"k": "over"}), 1_000).unwrap(),
+                NewProposal::TooMany,
+                "{t}"
+            );
+        }
+        assert_eq!(
+            s.list_pending_proposals(1_000).unwrap().len(),
+            MAX_PENDING_PROPOSALS
+        );
+        // Total cap: a fifth tool is refused too.
+        assert_eq!(
+            s.create_proposal("watchlist_remove", &json!({"id": 1}), 1_000)
+                .unwrap(),
+            NewProposal::TooMany
+        );
+        // A repeat of one already waiting is still just that one.
+        assert!(matches!(
+            s.create_proposal("trusted_add", &json!({"k": "N0"}), 1_000)
+                .unwrap(),
+            NewProposal::Existing(_)
+        ));
+        let first = s.list_pending_proposals(1_000).unwrap()[0].id;
+        assert!(s
+            .decide_proposal(first, ProposalStatus::Rejected, 1_500)
+            .unwrap());
+        assert!(matches!(
+            s.create_proposal("trusted_add", &json!({"k": "over"}), 1_600)
+                .unwrap(),
+            NewProposal::Created(_)
+        ));
+    }
+
+    #[test]
+    fn the_label_is_not_part_of_the_dedupe_key() {
+        let (_d, mut s) = open();
+        let a = s
+            .create_proposal(
+                "mine_add",
+                &json!({"kind": "ble", "idHash": "aa", "label": "One"}),
+                1,
+            )
+            .unwrap();
+        let b = s
+            .create_proposal(
+                "mine_add",
+                &json!({"kind": "ble", "idHash": "aa", "label": "Two"}),
+                2,
+            )
+            .unwrap();
+        let (NewProposal::Created(x), NewProposal::Existing(y)) = (a, b) else {
+            panic!("{a:?} {b:?}")
+        };
+        assert_eq!(x, y, "a new label does not mint a new request");
+        // A different hash is a different request.
+        assert!(matches!(
+            s.create_proposal("mine_add", &json!({"kind": "ble", "idHash": "bb"}), 3)
+                .unwrap(),
+            NewProposal::Created(_)
+        ));
+    }
+
+    #[test]
+    fn proposals_expire_after_24_hours_and_cannot_be_decided_afterwards() {
+        let (_d, mut s) = open();
+        let NewProposal::Created(id) = s
+            .create_proposal("mine_add", &json!({"kind": "ble"}), 1_000)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let just_before = 1_000 + PROPOSAL_TTL_MS - 1;
+        assert_eq!(s.list_pending_proposals(just_before).unwrap().len(), 1);
+        let after = 1_000 + PROPOSAL_TTL_MS;
+        assert!(s.list_pending_proposals(after).unwrap().is_empty());
+        assert_eq!(
+            s.get_proposal(id).unwrap().unwrap().status,
+            ProposalStatus::Expired
+        );
+        assert!(!s
+            .decide_proposal(id, ProposalStatus::Approved, after)
+            .unwrap());
+        // An expired identical proposal does not block a fresh one.
+        assert!(matches!(
+            s.create_proposal("mine_add", &json!({"kind": "ble"}), after)
+                .unwrap(),
+            NewProposal::Created(_)
+        ));
+    }
+
+    #[test]
+    fn a_proposal_is_decided_once() {
+        let (_d, mut s) = open();
+        let NewProposal::Created(id) = s
+            .create_proposal("dismiss_alert", &json!({"id": "x"}), 1)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(s.decide_proposal(id, ProposalStatus::Approved, 2).unwrap());
+        assert!(!s.decide_proposal(id, ProposalStatus::Rejected, 3).unwrap());
+        let p = s.get_proposal(id).unwrap().unwrap();
+        assert_eq!(
+            (p.status, p.decided_at),
+            (ProposalStatus::Approved, Some(2))
+        );
+    }
+
+    #[test]
+    fn audit_round_trips_and_undo_is_once() {
+        let (_d, mut s) = open();
+        let undo = json!({"op": "watchlistRemove", "id": 3});
+        let id = s
+            .record_audit(&NewAudit {
+                at: 5,
+                tool: "watchlist_add",
+                via: "direct",
+                proposal_id: None,
+                summary: "s",
+                undo: &undo,
+            })
+            .unwrap();
+        let e = s.get_audit(id).unwrap().unwrap();
+        assert_eq!(
+            (e.added_by.as_str(), e.via.as_str(), e.undone),
+            ("agent", "direct", false)
+        );
+        assert_eq!(e.undo, undo);
+        assert!(s.mark_audit_undone(id).unwrap());
+        assert!(!s.mark_audit_undone(id).unwrap());
+        assert_eq!(s.list_audit(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_agent_written_mine_row_is_invisible_to_detection_and_the_gate() {
+        use crate::lan::gate::ap_is_mine;
+        use crate::model::{MineEntry, MineKind};
+        let (_d, mut s) = open();
+        let ap = "a".repeat(64);
+        let e = |h: &str, at| MineEntry {
+            kind: MineKind::WifiAp,
+            id_hash: h.into(),
+            label: None,
+            ssid: None,
+            added_at: at,
+        };
+        s.add_mine_as(&e(&ap, 1), AddedBy::Agent).unwrap();
+        assert!(
+            !ap_is_mine(&s.list_mine().unwrap(), Some(&ap), None),
+            "agent rows never arm the gate"
+        );
+        assert_eq!(
+            s.list_mine_with_source().unwrap().len(),
+            1,
+            "but it is still listed for display"
+        );
+        // A person marking the same thing makes it theirs; an approved one counts as well.
+        s.add_mine(&e(&ap, 2)).unwrap();
+        assert!(ap_is_mine(&s.list_mine().unwrap(), Some(&ap), None));
+        let other = "b".repeat(64);
+        s.add_mine_as(&e(&other, 3), AddedBy::Approved).unwrap();
+        assert!(ap_is_mine(&s.list_mine().unwrap(), Some(&other), None));
+        // An agent re-adding cannot demote or promote.
+        s.add_mine_as(&e(&other, 4), AddedBy::Agent).unwrap();
+        assert!(ap_is_mine(&s.list_mine().unwrap(), Some(&other), None));
+    }
+}

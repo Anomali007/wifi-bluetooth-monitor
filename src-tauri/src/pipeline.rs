@@ -98,6 +98,33 @@ pub fn ingest_with(
     store.upsert_alerts(&alerts)
 }
 
+/// [`ingest_with`], then publish the status snapshot an agent (`wbm status`) reads, because it
+/// cannot ask CoreWLAN, CoreBluetooth or the Login Items service itself. Publishing is best
+/// effort: a failed snapshot write never fails the cycle.
+pub fn ingest_and_publish(
+    store: &mut Store,
+    scan: &ScanResult,
+    lan_outcome: Option<&LanScanOutcome>,
+    helper: crate::lan::helper::HelperStatus,
+    pid: u32,
+    now: Millis,
+) -> StoreResult<Vec<Alert>> {
+    let created = ingest_with(store, scan, lan_outcome, now)?;
+    let interval = store.get_settings()?.scan_interval_secs;
+    let snapshot = crate::agent::status::build(
+        scan,
+        lan_outcome.map(|o| &o.network),
+        helper,
+        interval,
+        created.len(),
+        pid,
+        env!("CARGO_PKG_VERSION"),
+        now_ms(),
+    );
+    let _ = crate::agent::status::publish(store, &snapshot);
+    Ok(created)
+}
+
 /// Text for the OS notification of a new alert. Deliberately generic: it names the kind of
 /// finding and never an SSID, hash or device name.
 pub fn notification_text(alert: &Alert) -> (&'static str, &'static str) {

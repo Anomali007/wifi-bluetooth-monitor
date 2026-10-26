@@ -2,7 +2,7 @@
 //!
 //! CONTRACT (frozen):
 //! - `rusqlite` (bundled). Tables: `wifi_sightings`, `ble_sightings`, `alerts`, `settings`,
-//!   `meta` (salt); v4 adds `lan_devices.source`; v3 adds `places`, `place_sightings`, `mine`, `watchlist`, `lan_devices`
+//!   `meta` (salt); v5 adds `agent_proposals`, `agent_audit` and `mine.added_by`; v4 adds `lan_devices.source`; v3 adds `places`, `place_sightings`, `mine`, `watchlist`, `lan_devices`
 //!   and the `vendor` / `group_id` columns on `wifi_sightings`. Observations are grouped by their scan's `scanned_at` so
 //!   [`Store::get_history`] can rebuild [`ScanSnapshot`]s.
 //! - Salt: 32 random bytes generated on first open, persisted (file/DB mode 0600), never
@@ -21,8 +21,19 @@ use crate::model::{
     Place, PlaceSighting, Salt, ScanResult, ScanSnapshot, Settings, SightingKind, WatchKind,
     WatchMatch, WatchlistEntry, WifiObservation,
 };
+mod agent_queries;
 mod lan_queries;
 mod places_queries;
+mod proposals;
+mod settings_sync;
+mod views;
+
+pub use agent_queries::{OpenError, OpenMode, StoreCounts, BUSY_TIMEOUT};
+pub use proposals::{
+    AddedBy, AuditEntry, DirectAdd, DirectMineRemove, NewAudit, NewProposal, Proposal,
+    ProposalStatus, MAX_PENDING_PER_TOOL, MAX_PENDING_PROPOSALS, PROPOSAL_TTL_MS,
+};
+pub use settings_sync::STALE_SETTINGS;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
@@ -33,7 +44,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SALT_LEN: usize = 32;
 const DB_FILE: &str = "store.sqlite3";
 /// The salt lives in its own 0600 file, NOT in the database: a copy, backup or export of the
@@ -174,6 +185,11 @@ fn add_lan_source_column(tx: &rusqlite::Transaction<'_>) -> StoreResult<()> {
     add_column_if_missing(tx, "lan_devices", "source", "TEXT")
 }
 
+/// v4 -> v5: who made a Mine entry. Existing rows were made by a person.
+fn add_mine_added_by_column(tx: &rusqlite::Transaction<'_>) -> StoreResult<()> {
+    add_column_if_missing(tx, "mine", "added_by", "TEXT NOT NULL DEFAULT 'user'")
+}
+
 impl Store {
     /// Open (creating if needed) the store in directory `path` (the integrator passes the
     /// Tauri app-data dir): `store.sqlite3` plus `salt.key`. Runs [`Store::migrate`] and loads
@@ -183,6 +199,7 @@ impl Store {
         let salt = load_or_create_salt(path)?;
         let db_path: PathBuf = path.join(DB_FILE);
         let conn = Connection::open(&db_path)?;
+        agent_queries::configure(&conn)?;
         set_mode_0600(&db_path)?;
         let mut store = Store { conn, salt };
         store.migrate()?;
@@ -256,7 +273,27 @@ impl Store {
                  id_hash TEXT NOT NULL,
                  label TEXT,
                  added_at INTEGER NOT NULL,
+                 added_by TEXT NOT NULL DEFAULT 'user',
                  PRIMARY KEY (kind, id_hash)
+             );
+             CREATE TABLE IF NOT EXISTS agent_proposals (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 tool TEXT NOT NULL,
+                 args TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'pending',
+                 decided_at INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS agent_audit (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 at INTEGER NOT NULL,
+                 tool TEXT NOT NULL,
+                 via TEXT NOT NULL,
+                 added_by TEXT NOT NULL DEFAULT 'agent',
+                 proposal_id INTEGER,
+                 summary TEXT NOT NULL,
+                 undo TEXT NOT NULL,
+                 undone INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS watchlist (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -278,6 +315,8 @@ impl Store {
         )?;
         let version: Option<i64> =
             tx.query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))?;
+        // v4 -> v5 for the one existing table that changed; a no-op everywhere else.
+        add_mine_added_by_column(&tx)?;
         match version {
             None => {
                 // Fresh database: the v1 CREATE above has no owner_state / v3 columns yet.
@@ -311,6 +350,11 @@ impl Store {
             Some(v) if v < 4 => {
                 // v3 -> v4: lan_devices.source. Existing rows read back as None.
                 add_lan_source_column(&tx)?;
+                tx.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])?;
+            }
+            Some(v) if v < SCHEMA_VERSION => {
+                // v4 -> v5: agent_proposals, agent_audit (created above) and mine.added_by.
+                // Every existing Mine row was made by a person, which is the column default.
                 tx.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])?;
             }
             Some(_) => {}
@@ -377,6 +421,28 @@ impl Store {
         purge_tx(&tx, retention, scan.scanned_at)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The newest `limit` scans with `scanned_at >= since` (ascending), and how many scans
+    /// match in all. The limit is applied in SQL, so older scans' observations are never read.
+    pub fn get_history_newest(&self, since: Millis, limit: usize) -> StoreResult<(History, usize)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM scans WHERE scanned_at >= ?1",
+            [since],
+            |r| r.get(0),
+        )?;
+        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let cutoff: Option<Millis> = self
+            .conn
+            .query_row(
+                "SELECT scanned_at FROM scans WHERE scanned_at >= ?1
+                 ORDER BY scanned_at DESC LIMIT 1 OFFSET ?2",
+                params![since, limit - 1],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let history = self.get_history(cutoff.map_or(since, |c| c.max(since)))?;
+        Ok((history, usize::try_from(total).unwrap_or(0)))
     }
 
     /// All scans with `scanned_at >= since`, ascending.
@@ -580,10 +646,75 @@ impl Store {
         Ok(out)
     }
 
+    /// Stored alerts, newest `last_seen` first, with `last_seen >= since`, at most `limit` rows
+    /// (applied in SQL), and the number of rows that match before the limit.
+    pub fn get_alerts_limited(
+        &self,
+        include_dismissed: bool,
+        since: Option<Millis>,
+        limit: usize,
+    ) -> StoreResult<(Vec<Alert>, usize)> {
+        let since = since.unwrap_or(i64::MIN);
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM alerts WHERE (?1 = 1 OR dismissed = 0) AND last_seen >= ?2",
+            params![include_dismissed, since],
+            |r| r.get(0),
+        )?;
+        let mut q = self.conn.prepare(
+            "SELECT id, kind, severity, title, detail, first_seen, last_seen, subject_hash, dismissed
+             FROM alerts WHERE (?1 = 1 OR dismissed = 0) AND last_seen >= ?2
+             ORDER BY last_seen DESC, id LIMIT ?3",
+        )?;
+        let rows = q.query_map(
+            params![
+                include_dismissed,
+                since,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Millis>(5)?,
+                    r.get::<_, Millis>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, bool>(8)?,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, kind, sev, title, detail, first_seen, last_seen, subject_hash, dismissed) =
+                row?;
+            out.push(Alert {
+                id,
+                kind: from_json(&kind)?,
+                severity: from_json(&sev)?,
+                title,
+                detail,
+                first_seen,
+                last_seen,
+                subject_hash,
+                dismissed,
+            });
+        }
+        Ok((out, usize::try_from(total).unwrap_or(0)))
+    }
+
     /// Mark an alert dismissed. Unknown id is not an error.
     pub fn dismiss_alert(&mut self, id: &str) -> StoreResult<()> {
         self.conn
             .execute("UPDATE alerts SET dismissed = 1 WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Clear a dismissal (undo of an approved dismissal). Unknown id is not an error.
+    pub fn undismiss_alert(&mut self, id: &str) -> StoreResult<()> {
+        self.conn
+            .execute("UPDATE alerts SET dismissed = 0 WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -603,14 +734,12 @@ impl Store {
         }
     }
 
+    /// Save settings. A client that loaded the current revision overwrites; one that is behind
+    /// (the stored settings were written since it loaded them, for instance by an agent adding
+    /// a trusted network) is merged field by field instead, so neither side's change is lost.
+    /// See `settings_sync`.
     pub fn set_settings(&mut self, settings: &Settings) -> StoreResult<()> {
-        let json = to_json(settings)?;
-        self.conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('settings', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [json],
-        )?;
-        Ok(())
+        self.save_settings(settings)
     }
 
     // -- Places ------------------------------------------------------------
@@ -752,10 +881,22 @@ impl Store {
 
     // -- Mine --------------------------------------------------------------
 
-    /// Everything marked mine, oldest first.
+    /// Everything a PERSON marked mine (created in the app, or approved there), oldest first.
+    /// This is what detection and the sweep gate see: an entry whose `added_by` is `agent` is
+    /// never in it, so nothing an agent wrote can silence an alert or arm the sweep.
     pub fn list_mine(&self) -> StoreResult<Vec<MineEntry>> {
+        Ok(self
+            .list_mine_with_source()?
+            .into_iter()
+            .filter(|(_, by)| by.is_human_confirmed())
+            .map(|(e, _)| e)
+            .collect())
+    }
+
+    /// Every Mine row with who made it, oldest first (for display and the audit).
+    pub fn list_mine_with_source(&self) -> StoreResult<Vec<(MineEntry, AddedBy)>> {
         let mut q = self.conn.prepare(
-            "SELECT kind, id_hash, label, added_at, ssid FROM mine ORDER BY added_at, id_hash",
+            "SELECT kind, id_hash, label, added_at, added_by, ssid FROM mine ORDER BY added_at, id_hash",
         )?;
         let rows = q.query_map([], |r| {
             Ok((
@@ -763,30 +904,42 @@ impl Store {
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, Millis>(3)?,
-                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (kind, id_hash, label, added_at, ssid) = row?;
-            out.push(MineEntry {
-                kind: from_json(&kind)?,
-                id_hash,
-                label,
-                ssid,
-                added_at,
-            });
+            let (kind, id_hash, label, added_at, by, ssid) = row?;
+            out.push((
+                MineEntry {
+                    kind: from_json(&kind)?,
+                    id_hash,
+                    label,
+                    ssid,
+                    added_at,
+                },
+                AddedBy::parse(&by),
+            ));
         }
         Ok(out)
     }
 
-    /// Mark something mine. Marking it again updates the label and keeps `added_at`.
+    /// Mark something mine, as a person. Marking it again updates the label and keeps
+    /// `added_at`.
     pub fn add_mine(&mut self, e: &MineEntry) -> StoreResult<()> {
+        self.add_mine_as(e, AddedBy::User)
+    }
+
+    /// Mark something mine and record who did it. Re-marking keeps `added_at`; the stronger
+    /// provenance wins (a person re-marking an `agent` row makes it theirs).
+    pub fn add_mine_as(&mut self, e: &MineEntry, by: AddedBy) -> StoreResult<()> {
         self.conn.execute(
-            "INSERT INTO mine (kind, id_hash, label, added_at, ssid) VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO mine (kind, id_hash, label, added_at, added_by, ssid) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(kind, id_hash) DO UPDATE SET label = excluded.label,
-                 ssid = COALESCE(excluded.ssid, ssid)",
-            params![to_json(&e.kind)?, e.id_hash, e.label, e.added_at, e.ssid],
+                 ssid = COALESCE(excluded.ssid, ssid),
+                 added_by = CASE WHEN excluded.added_by = 'agent' THEN added_by ELSE excluded.added_by END",
+            params![to_json(&e.kind)?, e.id_hash, e.label, e.added_at, by.as_str(), e.ssid],
         )?;
         Ok(())
     }
@@ -878,17 +1031,33 @@ impl Store {
     /// Stored LAN devices (all networks, or one `network_key`), newest `last_seen` first.
     /// `ip` is always `None` here (never persisted); `mine` reflects the Mine table.
     pub fn list_lan_devices(&self, network_key: Option<&str>) -> StoreResult<Vec<LanDevice>> {
+        Ok(self.list_lan_devices_limited(network_key, usize::MAX)?.0)
+    }
+
+    /// Like [`Store::list_lan_devices`], at most `limit` rows (applied in SQL), plus the number
+    /// of devices that match before the limit.
+    pub fn list_lan_devices_limited(
+        &self,
+        network_key: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<(Vec<LanDevice>, usize)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM lan_devices WHERE (?1 IS NULL OR network_key = ?1)",
+            params![network_key],
+            |r| r.get(0),
+        )?;
         let mine = to_json(&MineKind::Lan)?;
         let mut q = self.conn.prepare(
             "SELECT d.network_key, d.mac_hash, d.vendor, d.hostname, d.services, d.first_seen,
                     d.last_seen,
-                    EXISTS(SELECT 1 FROM mine m WHERE m.kind = ?2 AND m.id_hash = d.mac_hash),
+                    EXISTS(SELECT 1 FROM mine m WHERE m.kind = ?2 AND m.id_hash = d.mac_hash AND m.added_by != 'agent'),
                     d.source
              FROM lan_devices d
              WHERE (?1 IS NULL OR d.network_key = ?1)
-             ORDER BY d.last_seen DESC, d.mac_hash",
+             ORDER BY d.last_seen DESC, d.mac_hash LIMIT ?3",
         )?;
-        let rows = q.query_map(params![network_key, mine], |r| {
+        let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = q.query_map(params![network_key, mine, sql_limit], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -938,7 +1107,8 @@ impl Store {
                 Some((d.network_key.clone(), d.mac_hash.clone(), label))
             })
             .collect();
-        if !labels.is_empty() {
+        // No salt (an agent connection) means no way to hash hostnames: no hint.
+        if !labels.is_empty() && !self.salt.as_bytes().is_empty() {
             for d in out.iter_mut().filter(|d| !d.mine) {
                 let Some(host) = &d.hostname else { continue };
                 let hk = crate::lan::host_key(&self.salt, host);
@@ -950,7 +1120,7 @@ impl Store {
                 }
             }
         }
-        Ok(out)
+        Ok((out, usize::try_from(total).unwrap_or(0)))
     }
 
     /// The label of a Mine LAN entry, or a generic name when it has none. `None` if not Mine.
@@ -1145,7 +1315,7 @@ mod tests {
             .conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
         let h = s.get_history(0).unwrap();
         let ble = &h.scans[0].ble;
         assert_eq!(ble.len(), 2);
@@ -1206,7 +1376,7 @@ mod tests {
             .conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
         for t in V3_TABLES {
             assert!(table_exists(&s, t), "{t} missing after v2 -> v3");
         }
@@ -1253,7 +1423,7 @@ mod tests {
             .conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
         let old = s.list_lan_devices(Some("net")).unwrap();
         assert_eq!(old.len(), 1);
         assert_eq!((old[0].first_seen, old[0].last_seen), (10, 20));
@@ -1272,6 +1442,41 @@ mod tests {
     }
 
     #[test]
+    fn v4_database_migrates_to_v5_keeps_its_mine_rows_as_the_users_and_gains_the_agent_tables() {
+        let dir = TempDir::new().unwrap();
+        {
+            let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version VALUES (4);
+                 CREATE TABLE mine (kind TEXT NOT NULL, id_hash TEXT NOT NULL, label TEXT,
+                     added_at INTEGER NOT NULL, PRIMARY KEY (kind, id_hash));
+                 INSERT INTO mine VALUES ('\"wifiAp\"', 'aa', 'Mine-A', 7);",
+            )
+            .unwrap();
+        }
+        let mut s = Store::open(dir.path()).unwrap();
+        let v: i64 = s
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 5);
+        let rows = s.list_mine_with_source().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].0.label.as_deref(), rows[0].1),
+            (Some("Mine-A"), AddedBy::User)
+        );
+        assert_eq!(
+            s.list_mine().unwrap().len(),
+            1,
+            "a pre-existing row is the person's, so it counts"
+        );
+        assert!(table_exists(&s, "agent_proposals") && table_exists(&s, "agent_audit"));
+        s.migrate().unwrap(); // idempotent
+    }
+
+    #[test]
     fn fresh_database_has_the_lan_source_column() {
         let (_d, s) = open();
         let has: bool = s
@@ -1287,7 +1492,7 @@ mod tests {
             .conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
     }
 
     #[test]
@@ -1723,11 +1928,19 @@ mod tests {
             place_retention_days: 30,
             lan_active_sweep: true,
             lan_neighbor_helper: true,
+            revision: 0,
         };
         s.set_settings(&custom).unwrap();
-        assert_eq!(s.get_settings().unwrap(), custom);
-        s.set_settings(&Settings::default()).unwrap();
-        assert_eq!(s.get_settings().unwrap(), Settings::default());
+        // Every save bumps `revision`; compare everything else.
+        let same = |a: Settings, b: &Settings| Settings { revision: 0, ..a } == *b;
+        assert!(same(s.get_settings().unwrap(), &custom));
+        // A client that has loaded the current settings overwrites them.
+        let reset = Settings {
+            revision: s.get_settings().unwrap().revision,
+            ..Settings::default()
+        };
+        s.set_settings(&reset).unwrap();
+        assert!(same(s.get_settings().unwrap(), &Settings::default()));
     }
 
     #[test]
@@ -1852,6 +2065,46 @@ mod tests {
         // Migrating again changes nothing.
         s.migrate().unwrap();
         assert_eq!(s.list_mine().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_v4_mine_table_migrates_to_v5_whether_or_not_it_already_has_the_ssid_column() {
+        // Order 1: no ssid, no added_by. Order 2: ssid present (the places branch's column
+        // arrived first), added_by missing. Both end at v5 with both columns and keep the row.
+        for with_ssid in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+                let (cols, vals) = if with_ssid {
+                    (", ssid TEXT", "'\"wifiAp\"', 'old', 'Mine-A', 5, 'Net-A'")
+                } else {
+                    ("", "'\"wifiAp\"', 'old', 'Mine-A', 5")
+                };
+                conn.execute_batch(&format!(
+                    "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                     INSERT INTO schema_version VALUES (4);
+                     CREATE TABLE mine (kind TEXT NOT NULL, id_hash TEXT NOT NULL, label TEXT,
+                       added_at INTEGER NOT NULL{cols}, PRIMARY KEY (kind, id_hash));
+                     INSERT INTO mine VALUES ({vals});"
+                ))
+                .unwrap();
+            }
+            let mut s = Store::open(dir.path()).unwrap();
+            let v: i64 = s
+                .conn
+                .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, 5, "with_ssid={with_ssid}");
+            let rows = s.list_mine_with_source().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, AddedBy::User);
+            assert_eq!(
+                rows[0].0.ssid.as_deref(),
+                if with_ssid { Some("Net-A") } else { None }
+            );
+            s.migrate().unwrap();
+            assert_eq!(s.list_mine().unwrap().len(), 1);
+        }
     }
 
     fn summary(count: usize) -> Alert {

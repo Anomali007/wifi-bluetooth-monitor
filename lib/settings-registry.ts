@@ -24,6 +24,13 @@ const ALERTS = "Alerts";
 
 export const SETTINGS_REGISTRY: readonly SettingEntry[] = [
   {
+    id: "agent-requests",
+    label: "Agent requests",
+    section: "Agent requests",
+    description: "Approve or reject changes an AI agent asked for, and undo changes agents made.",
+    keywords: ["agent", "agents", "ai", "mcp", "wbm", "approve", "approval", "proposal", "request", "undo", "audit"],
+  },
+  {
     id: "trusted-networks",
     label: TN,
     section: TN,
