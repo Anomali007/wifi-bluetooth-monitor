@@ -124,6 +124,12 @@ fn subject_key(namespace: &str, value: &str) -> String {
     sha_hex(&format!("{namespace}\u{1f}{value}"))
 }
 
+/// The `subject_hash` of the evil-twin and open-lookalike alerts about a network name. Lets a
+/// caller find the alerts for a name without reading alert text.
+pub fn ssid_subject_hash(ssid: &str) -> String {
+    subject_key("ssid", &fold_ssid(ssid))
+}
+
 fn alert_id(kind: AlertKind, subject_hash: &str) -> String {
     sha_hex(&format!("{}\u{1f}{}", kind_tag(kind), subject_hash))
 }

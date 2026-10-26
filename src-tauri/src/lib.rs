@@ -14,6 +14,9 @@
 //! - [`places`]   Wi-Fi-fingerprint place memory and dwell tracking
 //! - [`lan`]      local-network discovery (ARP, receive-only mDNS, opt-in sweep)
 //! - [`pipeline`] one scan cycle without Tauri: assemble -> store -> detect -> upsert
+//! - [`labels`]   plain-English labels and safe text for broadcast names
+//! - [`proposals`] what an agent asked for, described from the app's own data, and applying it
+//!   once a person approves (only the Tauri commands call this)
 //! - [`commands`] the Tauri command surface and the background scan loop
 //! - [`agent`]    the `wbm` CLI and MCP server (read + a few safe edits over the same store)
 
@@ -21,10 +24,12 @@ pub mod agent;
 pub mod ble;
 pub mod commands;
 pub mod detect;
+pub mod labels;
 pub mod lan;
 pub mod model;
 pub mod pipeline;
 pub mod places;
+pub mod proposals;
 pub mod store;
 pub mod vendor;
 pub mod wifi;
@@ -57,6 +62,10 @@ pub fn run() {
             commands::sweep_now,
             commands::get_helper_status,
             commands::open_login_items,
+            commands::list_agent_proposals,
+            commands::decide_agent_proposal,
+            commands::list_agent_audit,
+            commands::undo_agent_change,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {

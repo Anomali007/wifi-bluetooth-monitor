@@ -133,3 +133,64 @@ pub fn fixture() -> Fixture {
     let db = dir.path().join("store.sqlite3");
     Fixture { dir, db, now }
 }
+
+/// A store with a salt and schema but no scans, alerts or devices.
+pub fn bare() -> Fixture {
+    let dir = TempDir::new().unwrap();
+    Store::open(dir.path()).unwrap();
+    let db = dir.path().join("store.sqlite3");
+    Fixture {
+        dir,
+        db,
+        now: now_ms(),
+    }
+}
+
+/// Add one stored scan with these Wi-Fi rows (and no Bluetooth).
+pub fn push_scan(f: &Fixture, at: Millis, wifi: Vec<WifiObservation>) {
+    let mut store = Store::open(f.dir.path()).unwrap();
+    store
+        .insert_scan(&ScanResult {
+            scanned_at: at,
+            wifi,
+            ble: vec![],
+            errors: vec![],
+            permissions: PermissionState {
+                bluetooth: PermissionStatus::Granted,
+                location: PermissionStatus::Granted,
+            },
+        })
+        .unwrap();
+}
+
+/// A Wi-Fi row whose radio group is chosen by the caller (two radios of one device share one).
+pub fn wifi_in_group(
+    ssid: &str,
+    mac: &str,
+    group: &str,
+    sec: Security,
+    at: Millis,
+) -> WifiObservation {
+    let mut o = wifi(Some(ssid), mac, -50, sec, at);
+    o.group_id = Some(h(group));
+    o
+}
+
+/// Store an alert about a network name, found by the app's own subject hash.
+pub fn push_name_alert(f: &Fixture, kind: AlertKind, ssid: &str, last_seen: Millis) {
+    let subject = app_lib::detect::ssid_subject_hash(ssid);
+    let mut store = Store::open(f.dir.path()).unwrap();
+    store
+        .upsert_alerts(&[Alert {
+            id: format!("alert-{ssid}-{last_seen}"),
+            kind,
+            severity: Severity::High,
+            title: format!("Possible evil twin: \"{ssid}\""),
+            detail: "synthetic".into(),
+            first_seen: last_seen - 1_000,
+            last_seen,
+            subject_hash: subject,
+            dismissed: false,
+        }])
+        .unwrap();
+}

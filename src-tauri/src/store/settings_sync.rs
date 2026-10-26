@@ -7,14 +7,28 @@
 //! merged three ways: the version the client loaded (its base), what is stored now, and what
 //! the client wants. A field the client did not change keeps the stored value; a trusted
 //! network is added or removed only if the client itself added or removed it.
+//!
+//! Two rules keep the merge honest:
+//! - A save or edit that changes nothing writes nothing and bumps no revision, so repeated
+//!   no-op calls (an agent retrying, a UI saving an untouched form) cannot push a client's base
+//!   out of the bounded history.
+//! - A save whose base revision is no longer remembered is REFUSED with [`STALE_SETTINGS`], not
+//!   merged "keep both sides": with no base, nothing can be called a removal, so that path
+//!   resurrected trusted networks a person had removed and re-enabled switches they had turned
+//!   off. The UI shows the message and reloads.
 
-use super::{err, from_json, to_json, Store, StoreResult};
+use super::{err, from_json, to_json, Store, StoreError, StoreResult};
 use crate::model::{Settings, TrustedNetwork};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 
 const HISTORY_KEY: &str = "settings_history";
-const HISTORY_LEN: usize = 16;
+/// Versions remembered for merging. A client's base must still be in here to be merged.
+const HISTORY_LEN: usize = 64;
+
+/// Shown by the UI when a save is refused because the settings changed under it.
+pub const STALE_SETTINGS: &str =
+    "Settings changed elsewhere since this page loaded them; reload and try again.";
 
 fn load_settings(conn: &Connection) -> StoreResult<Settings> {
     let raw: Option<String> = conn
@@ -38,7 +52,7 @@ fn load_history(conn: &Connection) -> StoreResult<Vec<Settings>> {
             |r| r.get(0),
         )
         .optional()?;
-    // A damaged history only costs the ability to merge: the save then keeps both sides.
+    // A damaged history only costs the ability to merge: a stale save is then refused.
     Ok(raw
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default())
@@ -83,9 +97,14 @@ impl Store {
         let next = if incoming.revision == current.revision {
             incoming.clone()
         } else {
-            let base = history.iter().find(|h| h.revision == incoming.revision);
-            merge_settings(base, &current, incoming)?
+            let Some(base) = history.iter().find(|h| h.revision == incoming.revision) else {
+                return Err(StoreError(STALE_SETTINGS.into()));
+            };
+            merge_settings(Some(base), &current, incoming)?
         };
+        if same_apart_from_revision(&current, &next) {
+            return Ok(()); // nothing to write: no commit, no revision bump
+        }
         commit(&tx, history, &current, next)?;
         tx.commit()?;
         Ok(())
@@ -104,10 +123,19 @@ impl Store {
         let history = load_history(&tx)?;
         let mut next = current.clone();
         let out = change(&mut next);
+        if same_apart_from_revision(&current, &next) {
+            return Ok(out);
+        }
         commit(&tx, history, &current, next)?;
         tx.commit()?;
         Ok(out)
     }
+}
+
+fn same_apart_from_revision(current: &Settings, next: &Settings) -> bool {
+    let mut n = next.clone();
+    n.revision = current.revision;
+    &n == current
 }
 
 fn to_value(s: &Settings) -> StoreResult<Value> {
@@ -278,8 +306,127 @@ mod tests {
         assert_eq!(h.last().unwrap().revision, last);
     }
 
+    /// The UI loads a draft at revision R with Net-A trusted and the sweep on. Meanwhile a person
+    /// removes Net-A and turns the sweep off. Then `noops` agent calls change nothing.
+    fn stale_ui_scenario(
+        noops: usize,
+        intervening_edit: bool,
+    ) -> (Store, Settings, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        s.update_trusted_networks(|l| l.push(tn("Net-A"))).unwrap();
+        s.edit_stored_settings(|st| st.lan_active_sweep = true)
+            .unwrap();
+        let draft = s.get_settings().unwrap(); // the UI's copy, base revision R
+                                               // The person, in another window, from a fresh draft:
+        let mut fresh = s.get_settings().unwrap();
+        fresh.trusted_networks.clear();
+        fresh.lan_active_sweep = false;
+        s.set_settings(&fresh).unwrap();
+        if intervening_edit {
+            s.update_trusted_networks(|l| l.push(tn("Net-C"))).unwrap();
+        }
+        for _ in 0..noops {
+            // Removing something that is not there changes nothing.
+            let removed = s
+                .update_trusted_networks(|l| {
+                    let n = l.len();
+                    l.retain(|t| t.ssid != "Not-Trusted");
+                    l.len() != n
+                })
+                .unwrap();
+            assert!(!removed);
+        }
+        (s, draft, dir)
+    }
+
     #[test]
-    fn a_damaged_history_costs_only_the_merge_never_the_data() {
+    fn seventeen_no_op_edits_do_not_evict_the_base_a_stale_save_needs() {
+        let (mut s, draft, _dir) = stale_ui_scenario(17, false);
+        let rev_before = s.get_settings().unwrap().revision;
+        // The stale UI saves an unrelated change from its old draft.
+        let mut stale = draft;
+        stale.notify = false;
+        s.set_settings(&stale).unwrap();
+        let now = s.get_settings().unwrap();
+        assert!(!now.notify, "the client's own change lands");
+        assert!(
+            !now.lan_active_sweep,
+            "the sweep the person turned off must stay off"
+        );
+        assert!(
+            names(&now).is_empty(),
+            "the network the person removed must stay removed: {:?}",
+            names(&now)
+        );
+        assert_eq!(rev_before + 1, now.revision, "17 no-ops bumped nothing");
+    }
+
+    #[test]
+    fn a_no_op_edit_changes_neither_the_revision_nor_the_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        s.update_trusted_networks(|l| l.push(tn("Net-A"))).unwrap();
+        let (rev, hist) = (
+            s.get_settings().unwrap().revision,
+            load_history(&s.conn).unwrap(),
+        );
+        s.update_trusted_networks(|l| l.retain(|t| t.ssid != "Nope"))
+            .unwrap();
+        let same = s.get_settings().unwrap();
+        s.set_settings(&same).unwrap(); // saving what is stored is a no-op too
+        assert_eq!(s.get_settings().unwrap().revision, rev);
+        assert_eq!(load_history(&s.conn).unwrap(), hist);
+    }
+
+    #[test]
+    fn one_intervening_edit_still_merges_correctly() {
+        // CONTROL: the base is remembered, so the three-way merge works as designed.
+        let (mut s, draft, _dir) = stale_ui_scenario(0, true);
+        let mut stale = draft;
+        stale.notify = false;
+        s.set_settings(&stale).unwrap();
+        let now = s.get_settings().unwrap();
+        assert!(!now.notify);
+        assert!(!now.lan_active_sweep);
+        assert_eq!(
+            names(&now),
+            ["Net-C"],
+            "removed stays removed, the other edit stays"
+        );
+    }
+
+    #[test]
+    fn a_save_whose_base_was_evicted_is_rejected_not_merged_keep_both() {
+        let (mut s, draft, _dir) = stale_ui_scenario(0, false);
+        // Enough REAL edits to push the draft's revision out of the bounded history.
+        for i in 0..(HISTORY_LEN + 4) {
+            s.update_trusted_networks(|l| l.push(tn(&format!("Churn-{i}"))))
+                .unwrap();
+            s.update_trusted_networks(|l| l.clear()).unwrap();
+        }
+        let before = s.get_settings().unwrap();
+        let mut stale = draft;
+        stale.notify = false;
+        let e = s
+            .set_settings(&stale)
+            .expect_err("unknown base must be refused");
+        assert!(e.to_string().contains("reload"), "{e}");
+        assert_eq!(s.get_settings().unwrap(), before, "nothing was written");
+        // Reloading and saving again works.
+        let mut again = s.get_settings().unwrap();
+        again.notify = false;
+        s.set_settings(&again).unwrap();
+        assert!(!s.get_settings().unwrap().notify);
+    }
+
+    #[test]
+    fn history_keeps_sixty_four_versions() {
+        assert_eq!(HISTORY_LEN, 64);
+    }
+
+    #[test]
+    fn a_damaged_history_costs_only_the_save_never_the_data() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut s = Store::open(dir.path()).unwrap();
         let draft = s.get_settings().unwrap();
@@ -292,9 +439,10 @@ mod tests {
             .unwrap();
         let mut stale = draft;
         stale.notify = false;
-        s.set_settings(&stale).unwrap();
+        let e = s.set_settings(&stale).expect_err("no base to merge from");
+        assert!(e.to_string().contains("reload"), "{e}");
         let now = s.get_settings().unwrap();
         assert_eq!(names(&now), ["Net-A"], "the stored network survives");
-        assert!(!now.notify);
+        assert!(now.notify, "and nothing of the stale save landed");
     }
 }

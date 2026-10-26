@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useMonitor } from "@/components/monitor-provider";
+import AgentRequestsSection from "@/components/settings/agent-requests-section";
 import AlertsSection from "@/components/settings/alerts-section";
 import LanSection from "@/components/settings/lan-section";
 import MineSection from "@/components/settings/mine-section";
@@ -9,6 +10,7 @@ import PlacesSection from "@/components/settings/places-section";
 import ScanningSection from "@/components/settings/scanning-section";
 import TrustedNetworksSection from "@/components/settings/trusted-networks-section";
 import WatchlistSection from "@/components/settings/watchlist-section";
+import { STALE_SETTINGS_NOTICE, isStaleSettingsError } from "@/lib/agent-requests";
 import type { Settings } from "@/lib/types";
 
 export default function SettingsPage() {
@@ -27,8 +29,15 @@ export default function SettingsPage() {
     try {
       await saveSettings(draft);
       setStatus("Saved");
-    } catch {
-      setStatus("Save failed");
+    } catch (e) {
+      if (isStaleSettingsError(e)) {
+        // The stored settings moved on and this page's base is gone: drop the local edits and
+        // show the current values instead of guessing how to merge.
+        setDraft(null);
+        setStatus(STALE_SETTINGS_NOTICE);
+      } else {
+        setStatus("Save failed");
+      }
     }
   };
 
@@ -36,6 +45,7 @@ export default function SettingsPage() {
     <div className="max-w-2xl space-y-6">
       <h1 className="text-2xl font-bold">Settings</h1>
 
+      <AgentRequestsSection />
       <TrustedNetworksSection draft={draft} set={set} wifi={scan?.wifi ?? []} />
       <MineSection />
       <PlacesSection draft={draft} set={set} />

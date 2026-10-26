@@ -1,8 +1,10 @@
 //! The agent tool table and the MCP server, against synthetic temp databases.
 //!
-//! Boundaries under test: read tools never write; edit tools change only trusted networks,
-//! Mine, the watchlist and alert dismissal; there is no sweep tool and no settings tool, and
-//! calling one fails. Every guard has a negative control.
+//! Boundaries under test: read tools never write; edit tools exist only with edits on; the five
+//! edits that could hide an alert are proposals that change nothing until a person approves
+//! them in the app (here: `app_lib::proposals::decide`, the function the Tauri command calls);
+//! the two direct edits only add alerts and are audited; there is no sweep tool and no settings
+//! tool, and calling one fails. Every guard has a negative control.
 
 mod common;
 
@@ -12,6 +14,7 @@ use app_lib::agent::tools::{self, Access};
 use app_lib::agent::{AgentError, Ctx};
 use app_lib::lan::helper::HelperStatus;
 use app_lib::model::{PermissionState, PermissionStatus, ScanResult, Settings};
+use app_lib::proposals;
 use app_lib::store::{OpenMode, Store};
 use common::{fixture, h};
 use rusqlite::Connection;
@@ -63,14 +66,36 @@ const FORBIDDEN_WORDS: [&str; 8] = [
     "helper",
 ];
 
+/// The context with edits ON (`wbm --edits`). Read-only contexts are built explicitly.
 fn ctx(f: &common::Fixture) -> Ctx {
-    let mut c = Ctx::new(f.db.clone());
+    let mut c = Ctx::new(f.db.clone()).with_edits(true);
     c.pid_alive = |_| true;
     c
 }
 
+fn read_ctx(f: &common::Fixture) -> Ctx {
+    ctx(f).with_edits(false)
+}
+
 fn call(f: &common::Fixture, name: &str, args: Value) -> Result<Value, AgentError> {
     tools::call(&ctx(f), name, &args)
+}
+
+/// The running app's handle on the same file.
+fn app(f: &common::Fixture) -> Store {
+    Store::open(f.dir.path()).unwrap()
+}
+
+/// A person clicks Approve (or Reject) in the app: the Rust function the Tauri command calls.
+fn decide(f: &common::Fixture, id: i64, approve: bool) -> Result<proposals::Decision, String> {
+    proposals::decide(&mut app(f), id, approve, app_lib::pipeline::now_ms())
+}
+
+/// Propose through the tool and return the proposal id, asserting nothing was applied.
+fn propose(f: &common::Fixture, name: &str, args: Value) -> i64 {
+    let r = ok(f, name, args);
+    assert_eq!(r["status"], "pending", "{name}: {r}");
+    r["proposalId"].as_i64().unwrap()
 }
 
 fn ok(f: &common::Fixture, name: &str, args: Value) -> Value {
@@ -105,7 +130,8 @@ fn the_table_is_exactly_the_documented_seventeen() {
 
 #[test]
 fn no_tool_can_sweep_scan_or_change_a_setting() {
-    let names: Vec<String> = tool_definitions()
+    let f = fixture();
+    let names: Vec<String> = tool_definitions(&ctx(&f))
         .iter()
         .map(|t| t.name.to_string())
         .collect();
@@ -178,6 +204,8 @@ fn dump(f: &common::Fixture) -> Vec<String> {
         ("ble_sightings", "id"),
         ("scans", "scanned_at"),
         ("places", "id"),
+        ("agent_proposals", "id"),
+        ("agent_audit", "id"),
     ] {
         let mut q = c
             .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
@@ -203,7 +231,17 @@ fn a_read_connection_is_refused_every_write_by_sqlite_itself() {
     let mut ro = Store::open_db_file(&f.db, OpenMode::Read).unwrap();
     assert!(ro.set_app_status("{}").is_err());
     assert!(ro.dismiss_alert("alert-1").is_err());
-    assert!(ro.update_trusted_networks(|l| l.clear()).is_err());
+    // A change that really changes something (a no-op writes nothing, so it cannot fail).
+    assert!(ro
+        .update_trusted_networks(|l| l.push(app_lib::model::TrustedNetwork {
+            ssid: "Net-Z".into(),
+            known_bssid_hashes: vec![],
+            expected_security: app_lib::model::Security::Open,
+        }))
+        .is_err());
+    assert!(ro
+        .create_proposal("trusted_add", &json!({"ssid": "Net-A"}), 1)
+        .is_err());
     // NEGATIVE CONTROL: the same calls succeed on an edit connection.
     let mut rw = Store::open_db_file(&f.db, OpenMode::Edit).unwrap();
     rw.set_app_status("{}").unwrap();
@@ -306,18 +344,38 @@ fn reads_return_the_documented_shapes() {
 }
 
 #[test]
-fn alerts_since_filters_and_dismiss_works_and_is_repeatable() {
+fn alerts_since_filters_and_dismiss_is_a_proposal_a_person_approves() {
     let f = fixture();
     assert_eq!(ok(&f, "alerts", json!({"since": "10s"}))["total"], 0);
     assert_eq!(ok(&f, "alerts", json!({"since": "1h"}))["total"], 1);
-    let d = ok(&f, "dismiss_alert", json!({"id": "alert-1"}));
-    assert_eq!(d["alert"]["dismissed"], true);
+    let before = dump(&f);
+    let id = propose(&f, "dismiss_alert", json!({"id": "alert-1"}));
+    assert_eq!(
+        ok(&f, "alerts", json!({}))["total"],
+        1,
+        "still active: only a proposal exists"
+    );
+    assert_ne!(dump(&f), before, "the proposal row is the only change");
+    assert_eq!(
+        Store::open_db_file(&f.db, OpenMode::Read)
+            .unwrap()
+            .get_alerts(false)
+            .unwrap()
+            .len(),
+        1
+    );
+    let d = decide(&f, id, true).unwrap();
+    assert!(d.changed);
     assert_eq!(ok(&f, "alerts", json!({}))["total"], 0);
     assert_eq!(
         ok(&f, "alerts", json!({"includeDismissed": true}))["total"],
         1
     );
-    ok(&f, "dismiss_alert", json!({"id": "alert-1"})); // idempotent
+    // Proposing it again: the alert is already dismissed.
+    assert!(matches!(
+        call(&f, "dismiss_alert", json!({"id": "alert-1"})).unwrap_err(),
+        AgentError::Usage(_)
+    ));
     let e = call(&f, "dismiss_alert", json!({"id": "nope"})).unwrap_err();
     assert!(matches!(e, AgentError::NotFound(_)), "{e:?}");
 }
@@ -350,7 +408,7 @@ fn mine_add_refuses_raw_identifiers_and_unseen_hashes() {
 }
 
 #[test]
-fn mine_add_remove_roundtrip_for_every_kind() {
+fn mine_add_is_a_proposal_and_mine_remove_applies_directly_for_every_kind() {
     let f = fixture();
     let nets = ok(&f, "networks", json!({}));
     let ap = nets["networks"][0]["bssidHash"]
@@ -366,35 +424,42 @@ fn mine_add_remove_roundtrip_for_every_kind() {
         .as_str()
         .unwrap()
         .to_string();
-    for (kind, hash) in [
+    let kinds = [
         ("wifiAp", &ap),
         ("wifiGroup", &group),
         ("ble", &ble),
         ("lan", &lan),
-    ] {
-        let a = ok(
+    ];
+    let mut ids = Vec::new();
+    for (kind, hash) in kinds {
+        ids.push(propose(
             &f,
             "mine_add",
             json!({"kind": kind, "idHash": hash, "label": "Mine-A"}),
-        );
-        assert_eq!(a["mine"]["label"], "Mine-A", "{kind}");
+        ));
     }
-    assert_eq!(
+    assert!(
         ok(&f, "mine_list", json!({}))["mine"]
             .as_array()
             .unwrap()
-            .len(),
-        4
+            .is_empty(),
+        "nothing is mine until a person approves"
     );
+    assert_eq!(ok(&f, "networks", json!({}))["networks"][0]["mine"], false);
+    for id in ids {
+        assert!(decide(&f, id, true).unwrap().changed);
+    }
+    let mine = ok(&f, "mine_list", json!({}));
+    assert_eq!(mine["mine"].as_array().unwrap().len(), 4);
+    assert!(mine["mine"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["label"] == "Mine-A" && m["addedBy"] == "approved"));
     // The read tools now say so.
     assert_eq!(ok(&f, "networks", json!({}))["networks"][0]["mine"], true);
     assert_eq!(ok(&f, "lan_devices", json!({}))["devices"][0]["mine"], true);
-    for (kind, hash) in [
-        ("wifiAp", &ap),
-        ("wifiGroup", &group),
-        ("ble", &ble),
-        ("lan", &lan),
-    ] {
+    for (kind, hash) in kinds {
         assert_eq!(
             ok(&f, "mine_remove", json!({"kind": kind, "idHash": hash}))["removed"],
             true
@@ -408,71 +473,12 @@ fn mine_add_remove_roundtrip_for_every_kind() {
         .as_array()
         .unwrap()
         .is_empty());
-}
-
-#[test]
-fn trusted_add_records_hashes_and_strongest_security_like_the_ui() {
-    let f = fixture();
-    let a = ok(&f, "trusted_add", json!({"ssid": "Net-A"}));
-    assert_eq!(a["added"], true);
-    assert_eq!(
-        a["trusted"]["expectedSecurity"], "wpa3Personal",
-        "strongest seen"
-    );
-    let hashes = a["trusted"]["knownBssidHashes"].as_array().unwrap();
-    assert_eq!(hashes.len(), 2);
-    assert!(hashes.contains(&json!(h("02:00:00:00:00:01"))));
-    // The list tool and the networks flag agree.
-    assert_eq!(
-        ok(&f, "trusted_list", json!({}))["trusted"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    let nets = ok(&f, "networks", json!({}));
-    assert!(nets["networks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|r| r["ssid"] == "Net-A" && r["trusted"] == true));
-    // Again: not an error, nothing changes.
-    let again = ok(
-        &f,
-        "trusted_add",
-        json!({"ssid": "Net-A", "security": "open"}),
-    );
-    assert_eq!(again["added"], false);
-    assert_eq!(again["trusted"]["expectedSecurity"], "wpa3Personal");
-    // Override applies on a fresh add.
-    let b = ok(
-        &f,
-        "trusted_add",
-        json!({"ssid": "Net-B", "security": "wpa2Personal"}),
-    );
-    assert_eq!(b["trusted"]["expectedSecurity"], "wpa2Personal");
-    // Unknown name, bad security.
-    assert!(matches!(
-        call(&f, "trusted_add", json!({"ssid": "Net-Z"})).unwrap_err(),
-        AgentError::NotFound(_)
-    ));
-    assert!(matches!(
-        call(
-            &f,
-            "trusted_add",
-            json!({"ssid": "Net-A", "security": "wpa9"})
-        )
-        .unwrap_err(),
-        AgentError::Usage(_)
-    ));
-    assert_eq!(
-        ok(&f, "trusted_remove", json!({"ssid": "Net-A"}))["removed"],
-        true
-    );
-    assert_eq!(
-        ok(&f, "trusted_remove", json!({"ssid": "Net-A"}))["removed"],
-        false
-    );
+    // Four approved additions and four direct removals, all attributed to the agent.
+    let audit = app(&f).list_audit(50).unwrap();
+    assert_eq!(audit.len(), 8);
+    assert!(audit.iter().all(|a| a.added_by == "agent"));
+    assert_eq!(audit.iter().filter(|a| a.via == "proposal").count(), 4);
+    assert_eq!(audit.iter().filter(|a| a.via == "direct").count(), 4);
 }
 
 #[test]
@@ -494,19 +500,24 @@ fn edits_change_nothing_but_their_own_table() {
         .get_settings()
         .unwrap();
 
-    ok(&f, "trusted_add", json!({"ssid": "Net-A"}));
+    // Net-B is a single open access point in the fixture, so it can be trusted on approval.
+    let t = propose(&f, "trusted_add", json!({"ssid": "Net-B"}));
     ok(
         &f,
         "watchlist_add",
         json!({"kind": "vendor", "pattern": "Vendor-A"}),
     );
-    ok(&f, "dismiss_alert", json!({"id": "alert-1"}));
+    let d = propose(&f, "dismiss_alert", json!({"id": "alert-1"}));
     let ap = ok(&f, "networks", json!({}))["networks"][0]["bssidHash"]
         .as_str()
         .unwrap()
         .to_string();
-    ok(&f, "mine_add", json!({"kind": "wifiAp", "idHash": ap}));
-    ok(&f, "trusted_remove", json!({"ssid": "Net-A"}));
+    let m = propose(&f, "mine_add", json!({"kind": "wifiAp", "idHash": ap}));
+    for id in [t, d, m] {
+        decide(&f, id, true).unwrap();
+    }
+    let r = propose(&f, "trusted_remove", json!({"ssid": "Net-B"}));
+    decide(&f, r, true).unwrap();
 
     let after = Store::open_db_file(&f.db, OpenMode::Edit)
         .unwrap()
@@ -514,7 +525,11 @@ fn edits_change_nothing_but_their_own_table() {
         .unwrap();
     let mut expect: Settings = settings_before.clone();
     expect.revision = after.revision;
-    assert_eq!(after, expect, "an edit tool changed a setting");
+    assert_eq!(after, expect, "an edit changed a setting");
+    assert!(
+        after.revision > settings_before.revision,
+        "the trust add and remove did commit"
+    );
     assert!(after.lan_active_sweep && after.lan_neighbor_helper);
     assert_eq!(
         (
@@ -568,14 +583,24 @@ fn watchlist_add_dedupes_validates_and_removes() {
             AgentError::Usage(_)
         ));
     }
+    // Removing a rule is a proposal.
+    let p = propose(&f, "watchlist_remove", json!({"id": id}));
     assert_eq!(
-        ok(&f, "watchlist_remove", json!({"id": id}))["removed"],
-        true
+        ok(&f, "watchlist_list", json!({}))["watchlist"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
-    assert_eq!(
-        ok(&f, "watchlist_remove", json!({"id": id}))["removed"],
-        false
-    );
+    decide(&f, p, true).unwrap();
+    assert!(ok(&f, "watchlist_list", json!({}))["watchlist"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        call(&f, "watchlist_remove", json!({"id": id})).unwrap_err(),
+        AgentError::NotFound(_)
+    ));
 }
 
 #[test]
@@ -743,13 +768,44 @@ fn access_classes_match_the_edit_allowlist() {
     );
     for s in tools::specs() {
         match s.name {
-            "dismiss_alert" | "mine_remove" | "trusted_remove" | "watchlist_remove" => {
-                assert_eq!(s.access, Access::Remove)
-            }
-            "mine_add" | "trusted_add" | "watchlist_add" => assert_eq!(s.access, Access::Add),
+            // The edits that could hide an alert are proposals.
+            "dismiss_alert" | "mine_add" | "trusted_add" | "trusted_remove"
+            | "watchlist_remove" => assert_eq!(s.access, Access::Propose, "{}", s.name),
+            // The edits that can only add alerts apply directly.
+            "watchlist_add" => assert_eq!(s.access, Access::Add),
+            "mine_remove" => assert_eq!(s.access, Access::Remove),
             _ => assert_eq!(s.access, Access::Read),
         }
     }
+    // NEGATIVE CONTROL: dropping the classes to their old meaning would be caught.
+    assert_ne!(Access::Propose.mode(), Access::Add.mode());
+}
+
+#[test]
+fn without_edits_the_edit_tools_are_neither_listed_nor_callable() {
+    let f = fixture();
+    let c = read_ctx(&f);
+    let names: Vec<&str> = tools::available(&c).map(|s| s.name).collect();
+    assert_eq!(names, READ_TOOLS);
+    let with: Vec<&str> = tools::available(&ctx(&f)).map(|s| s.name).collect();
+    assert_eq!(
+        with, EXPECTED_TOOLS,
+        "NEGATIVE CONTROL: edits on lists all seventeen"
+    );
+    let before = dump(&f);
+    for spec in tools::specs().iter().filter(|s| !s.read_only()) {
+        let e = tools::call(&c, spec.name, &json!({})).unwrap_err();
+        assert!(matches!(e, AgentError::Usage(_)), "{}: {e:?}", spec.name);
+        assert!(e.message().contains("--edits"), "{}", e.message());
+        // Even with valid arguments.
+        let e = tools::call_marked(
+            &c,
+            spec.name,
+            &json!({"kind": "ssid", "pattern": "x", "ssid": "Net-A", "id": "alert-1", "idHash": h("02:00:00:00:00:01")}),
+        );
+        assert!(e.is_err(), "{}", spec.name);
+    }
+    assert_eq!(dump(&f), before);
 }
 
 // ---------------------------------------------------------------------------
@@ -791,9 +847,13 @@ impl Client {
 }
 
 async fn start(f: &common::Fixture) -> Client {
+    start_with(f, ctx(f)).await
+}
+
+async fn start_with(_f: &common::Fixture, c: Ctx) -> Client {
     let (cw, sr) = tokio::io::duplex(1 << 20);
     let (sw, cr) = tokio::io::duplex(1 << 20);
-    tokio::spawn(serve_rw(ctx(f), sr, sw));
+    tokio::spawn(serve_rw(c, sr, sw));
     let mut c = Client {
         w: cw,
         r: BufReader::new(cr),
@@ -816,8 +876,35 @@ async fn start(f: &common::Fixture) -> Client {
 }
 
 #[tokio::test]
-async fn mcp_lists_exactly_the_table_with_read_only_annotations() {
+async fn mcp_lists_ten_read_tools_by_default_and_all_seventeen_with_edits() {
     let f = fixture();
+    // Default server: reads only.
+    let mut r = start_with(&f, read_ctx(&f)).await;
+    let list = r.request("tools/list", json!({})).await;
+    let names: Vec<String> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, READ_TOOLS);
+    // An edit tool is a protocol error on the read-only server, and changes nothing.
+    let before = dump(&f);
+    for edit in [
+        "watchlist_add",
+        "trusted_add",
+        "dismiss_alert",
+        "mine_remove",
+    ] {
+        let resp = r
+            .request("tools/call", json!({"name": edit, "arguments": {"kind": "ssid", "pattern": "Net-Z", "ssid": "Net-B", "id": "alert-1"}}))
+            .await;
+        assert!(resp.get("error").is_some(), "{edit}: {resp}");
+    }
+    assert_eq!(dump(&f), before);
+    let info = r.request("tools/list", json!({})).await;
+    assert!(info.get("result").is_some());
+
     let mut c = start(&f).await;
     let list = c.request("tools/list", json!({})).await;
     let tools_v = list["result"]["tools"].as_array().unwrap();
@@ -836,10 +923,22 @@ async fn mcp_lists_exactly_the_table_with_read_only_annotations() {
         assert_eq!(ro, Some(READ_TOOLS.contains(&name)), "{name} readOnlyHint");
         assert_eq!(t["annotations"]["openWorldHint"], false, "{name}");
     }
-    // Removal tools say they are destructive; add tools do not.
     let by = |n: &str| tools_v.iter().find(|t| t["name"] == n).unwrap().clone();
-    assert_eq!(by("trusted_remove")["annotations"]["destructiveHint"], true);
-    assert_eq!(by("trusted_add")["annotations"]["destructiveHint"], false);
+    // Every proposal tool is flagged destructive; the direct add is not; the direct
+    // removal is.
+    for n in [
+        "trusted_add",
+        "trusted_remove",
+        "mine_add",
+        "dismiss_alert",
+        "watchlist_remove",
+    ] {
+        assert_eq!(by(n)["annotations"]["destructiveHint"], true, "{n}");
+        assert_eq!(by(n)["annotations"]["readOnlyHint"], false, "{n}");
+    }
+    assert_eq!(by("watchlist_add")["annotations"]["destructiveHint"], false);
+    assert_eq!(by("watchlist_add")["annotations"]["readOnlyHint"], false);
+    assert_eq!(by("mine_remove")["annotations"]["readOnlyHint"], false);
 }
 
 #[tokio::test]

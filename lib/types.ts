@@ -275,6 +275,42 @@ export interface NetworkInfo {
   neighborNote: string | null;
 }
 
+// ---- Agent requests (the wbm CLI / MCP server asks, a person decides) -------------
+
+/**
+ * One change an agent asked for. Nothing has happened yet. `summary` and `warnings` are
+ * written by the app from its own data; a name inside is the agent's and is shown in
+ * quotation marks. `blocked` is why approving would be refused right now, if it would.
+ */
+export interface AgentProposal {
+  id: number;
+  tool: string;
+  createdAt: Millis;
+  expiresAt: Millis;
+  summary: string;
+  warnings: string[];
+  blocked: string | null;
+}
+
+/** One change an agent made (applied directly, or approved by a person). */
+export interface AgentAuditEntry {
+  id: number;
+  at: Millis;
+  tool: string;
+  via: "direct" | "proposal";
+  addedBy: "agent";
+  proposalId: number | null;
+  summary: string;
+  undone: boolean;
+}
+
+export interface AgentDecision {
+  status: "approved" | "rejected";
+  /** Approved and something actually changed. */
+  changed: boolean;
+  message: string;
+}
+
 export const DEFAULT_SETTINGS: Settings = {
   trustedNetworks: [],
   scanIntervalSecs: 60,

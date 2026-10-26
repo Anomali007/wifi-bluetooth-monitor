@@ -24,6 +24,7 @@ use crate::model::{
     Settings, WatchKind, WatchMatch, WatchlistEntry, EVENT_ALERT, EVENT_SCAN,
 };
 use crate::pipeline;
+use crate::proposals::{self, AuditView, Decision, ProposalView};
 use crate::store::Store;
 use crate::{ble, wifi};
 
@@ -349,6 +350,43 @@ pub async fn add_watchlist(
 pub async fn remove_watchlist(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     let mut store = state.store.lock().map_err(lock_err)?;
     store.remove_watchlist(id).map_err(|e| e.to_string())
+}
+
+/// Requests an agent made that wait for a person (stale ones are expired first). Each is
+/// described from the app's own data; see `proposals`.
+#[tauri::command]
+pub async fn list_agent_proposals(state: State<'_, AppState>) -> Result<Vec<ProposalView>, String> {
+    let mut store = state.store.lock().map_err(lock_err)?;
+    proposals::list_pending(&mut store, pipeline::now_ms())
+}
+
+/// Approve or reject one pending request. Only the webview can call this; the `wbm` CLI and
+/// MCP server have no route to it. Approval re-validates against current data.
+#[tauri::command]
+pub async fn decide_agent_proposal(
+    state: State<'_, AppState>,
+    id: i64,
+    approve: bool,
+) -> Result<Decision, String> {
+    let mut store = state.store.lock().map_err(lock_err)?;
+    proposals::decide(&mut store, id, approve, pipeline::now_ms())
+}
+
+/// Changes agents made (applied directly, or approved), newest first.
+#[tauri::command]
+pub async fn list_agent_audit(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<AuditView>, String> {
+    let store = state.store.lock().map_err(lock_err)?;
+    proposals::list_audit(&store, limit.unwrap_or(50).min(200))
+}
+
+/// One-click undo of an audited agent change.
+#[tauri::command]
+pub async fn undo_agent_change(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let mut store = state.store.lock().map_err(lock_err)?;
+    proposals::undo(&mut store, id)
 }
 
 /// Stored LAN devices, all networks or one `network_key`, newest first. IPs are not stored.

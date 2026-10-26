@@ -52,11 +52,17 @@ fn exit_codes() {
     let junk = f.dir.path().join("junk.sqlite3");
     std::fs::write(&junk, b"this is not sqlite at all, just text padding.....").unwrap();
     assert_eq!(wbm(&junk, &["status"]).status.code(), Some(4));
-    // 5 not found
+    // 5 not found (edits on, so the call reaches the lookup)
     assert_eq!(
-        wbm(&f.db, &["alert", "dismiss", "nope"]).status.code(),
+        wbm(&f.db, &["--edits", "alert", "dismiss", "nope"])
+            .status
+            .code(),
         Some(5)
     );
+    // An edit command without --edits is bad usage and says how to allow it.
+    let o = wbm(&f.db, &["alert", "dismiss", "alert-1"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--edits"));
     // Human errors go to stderr, nothing on stdout.
     let o = wbm(&missing, &["status"]);
     assert!(o.stdout.is_empty() && !o.stderr.is_empty());
@@ -98,6 +104,20 @@ fn json_output_is_stable_and_parseable_for_every_read_command() {
 }
 
 #[test]
+fn json_marks_broadcast_text_as_untrusted_and_the_table_prints_it_plain() {
+    let f = fixture();
+    let j = json_of(&wbm(&f.db, &["networks", "--json"]));
+    assert_eq!(j["networks"][0]["ssid"], json!({"untrusted": "Net-A"}));
+    assert!(j["networks"][0]["rssi"].is_number() && j["networks"][0]["bssidHash"].is_string());
+    let a = json_of(&wbm(&f.db, &["alerts", "--json"]));
+    assert!(a["alerts"][0]["title"]["untrusted"].is_string());
+    assert_eq!(a["alerts"][0]["kind"], "evilTwin");
+    // Human tables are not wrapped.
+    let t = text(&wbm(&f.db, &["networks"]));
+    assert!(t.contains("Net-A") && !t.contains("untrusted"), "{t}");
+}
+
+#[test]
 fn human_output_is_a_short_table() {
     let f = fixture();
     let o = wbm(&f.db, &["networks"]);
@@ -118,20 +138,67 @@ fn human_output_is_a_short_table() {
     assert!(text(&wbm(&f.db, &["alerts"])).contains("evilTwin"));
 }
 
-#[test]
-fn edits_through_the_cli_land_in_the_database() {
-    let f = fixture();
-    assert_eq!(
-        wbm(&f.db, &["trusted", "add", "Net-A"]).status.code(),
-        Some(0)
-    );
-    let t = json_of(&wbm(&f.db, &["trusted", "list", "--json"]));
-    assert_eq!(t["trusted"][0]["ssid"], "Net-A");
-    let again = text(&wbm(&f.db, &["trusted", "add", "Net-A"]));
-    assert!(again.contains("Already trusted"));
+/// Run with --edits.
+fn wbme(db: &std::path::Path, args: &[&str]) -> Output {
+    let mut a = vec!["--edits"];
+    a.extend_from_slice(args);
+    wbm(db, &a)
+}
 
+#[test]
+fn edits_through_the_cli_need_edits_and_proposals_wait_for_the_app() {
+    let f = fixture();
+    // Every edit subcommand is refused without --edits and writes nothing.
+    let ap = h("02:00:00:00:00:03");
+    let refused: [&[&str]; 7] = [
+        &["trusted", "add", "Net-B"],
+        &["trusted", "remove", "Net-B"],
+        &["mine", "add", "wifiAp", &ap],
+        &["mine", "remove", "wifiAp", &ap],
+        &["alert", "dismiss", "alert-1"],
+        &["watchlist", "add", "ssid", "Net-Z"],
+        &["watchlist", "remove", "1"],
+    ];
+    for args in refused {
+        let o = wbm(&f.db, args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(o.stdout.is_empty());
+    }
+    assert!(
+        json_of(&wbm(&f.db, &["trusted", "list", "--json"]))["trusted"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // With --edits, a trust request is a pending proposal.
+    let o = wbme(&f.db, &["trusted", "add", "Net-B"]);
+    assert_eq!(o.status.code(), Some(0));
+    let t = text(&o);
+    assert!(
+        t.contains("Nothing has changed") && t.contains("Agent requests"),
+        "{t}"
+    );
+    let j = json_of(&wbme(&f.db, &["trusted", "add", "Net-B", "--json"]));
+    assert_eq!(j["status"], "pending");
+    assert!(j["proposalId"].as_i64().unwrap() > 0);
+    assert!(
+        json_of(&wbm(&f.db, &["trusted", "list", "--json"]))["trusted"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // --security is gone.
     assert_eq!(
-        wbm(
+        wbme(&f.db, &["trusted", "add", "Net-B", "--security", "open"])
+            .status
+            .code(),
+        Some(2)
+    );
+
+    // The direct edits apply at once.
+    assert_eq!(
+        wbme(
             &f.db,
             &["watchlist", "add", "vendor", "Vendor-A", "--match", "exact"]
         )
@@ -142,43 +209,51 @@ fn edits_through_the_cli_land_in_the_database() {
     let w = json_of(&wbm(&f.db, &["watchlist", "list", "--json"]));
     assert_eq!(w["watchlist"][0]["match"], "exact");
     let id = w["watchlist"][0]["id"].to_string();
+    // Removing it is a proposal.
     assert_eq!(
-        wbm(&f.db, &["watchlist", "remove", &id]).status.code(),
+        wbme(&f.db, &["watchlist", "remove", &id]).status.code(),
         Some(0)
+    );
+    assert_eq!(
+        json_of(&wbm(&f.db, &["watchlist", "list", "--json"]))["watchlist"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
 
-    let ap = h("02:00:00:00:00:03");
-    assert_eq!(
-        wbm(&f.db, &["mine", "add", "wifiAp", &ap, "--label", "Shed"])
-            .status
-            .code(),
-        Some(0)
-    );
-    assert_eq!(
-        json_of(&wbm(&f.db, &["mine", "list", "--json"]))["mine"][0]["label"],
-        "Shed"
-    );
+    let o = wbme(&f.db, &["mine", "add", "wifiAp", &ap, "--label", "Shed"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(json_of(&wbm(&f.db, &["mine", "list", "--json"]))["mine"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     // A raw MAC is refused with the usage code.
     assert_eq!(
-        wbm(&f.db, &["mine", "add", "wifiAp", "02:00:00:00:00:03"])
+        wbme(&f.db, &["mine", "add", "wifiAp", "02:00:00:00:00:03"])
             .status
             .code(),
         Some(2)
     );
+    // mine remove of something absent is fine; alert dismiss is a proposal.
     assert_eq!(
-        wbm(&f.db, &["mine", "remove", "wifiAp", &ap]).status.code(),
+        wbme(&f.db, &["mine", "remove", "wifiAp", &ap])
+            .status
+            .code(),
         Some(0)
     );
-
     assert_eq!(
-        wbm(&f.db, &["alert", "dismiss", "alert-1"]).status.code(),
+        wbme(&f.db, &["alert", "dismiss", "alert-1"]).status.code(),
         Some(0)
     );
-    assert_eq!(json_of(&wbm(&f.db, &["alerts", "--json"]))["total"], 0);
     assert_eq!(
-        wbm(&f.db, &["trusted", "remove", "Net-A"]).status.code(),
-        Some(0)
+        json_of(&wbm(&f.db, &["alerts", "--json"]))["total"],
+        1,
+        "not dismissed"
     );
+    // Four distinct proposals are waiting (trust, watchlist removal, mine add, dismissal).
+    let store = app_lib::store::Store::open(f.dir.path()).unwrap();
+    assert_eq!(store.get_alerts(false).unwrap().len(), 1);
 }
 
 #[test]
@@ -198,17 +273,21 @@ fn there_is_no_command_for_sweeping_scanning_or_settings() {
     let help = text(&wbm(&f.db, &["help"]));
     assert!(help.contains("never scans, never sweeps"), "{help}");
     let tools = text(&wbm(&f.db, &["tools"]));
-    assert_eq!(tools.lines().count(), 17);
-    assert!(!tools.contains("sweep_now") && !tools.contains("set_settings"));
+    assert_eq!(tools.lines().count(), 10, "reads only without --edits");
+    let all = text(&wbme(&f.db, &["tools"]));
+    assert_eq!(all.lines().count(), 17);
+    assert!(all.contains("proposal") && all.contains("direct"));
+    assert!(!all.contains("sweep_now") && !all.contains("set_settings"));
 }
 
-#[test]
-fn mcp_end_to_end_over_the_real_binary_stdio() {
-    let f = fixture();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wbm"))
-        .arg("--db")
-        .arg(&f.db)
-        .arg("mcp")
+/// One MCP session over the real binary's stdio; returns (tool count, trusted_add result).
+fn mcp_session(db: &std::path::Path, edits: bool) -> (usize, Value) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wbm"));
+    cmd.arg("--db").arg(db).arg("mcp");
+    if edits {
+        cmd.arg("--edits");
+    }
+    let mut child = cmd
         .env_remove("HOME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -238,7 +317,6 @@ fn mcp_end_to_end_over_the_real_binary_stdio() {
     send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
     send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}));
     let n = recv(2)["result"]["tools"].as_array().unwrap().len();
-    assert_eq!(n, 17);
     send(
         json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "status", "arguments": {}}}),
     );
@@ -249,10 +327,34 @@ fn mcp_end_to_end_over_the_real_binary_stdio() {
         json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "sweep_now", "arguments": {}}}),
     );
     assert!(recv(4).get("error").is_some());
+    send(
+        json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "trusted_add", "arguments": {"ssid": "Net-B"}}}),
+    );
+    let t = recv(5);
     drop(stdin);
     let status = child.wait().unwrap();
     assert!(
         status.success(),
         "clean exit when the client closes stdin: {status:?}"
+    );
+    (n, t)
+}
+
+#[test]
+fn mcp_end_to_end_over_the_real_binary_stdio() {
+    let f = fixture();
+    // Default: the ten read tools; trusted_add is not served.
+    let (n, t) = mcp_session(&f.db, false);
+    assert_eq!(n, 10);
+    assert!(t.get("error").is_some(), "{t}");
+    // --edits: all seventeen; trusted_add returns a pending proposal and changes nothing.
+    let (n, t) = mcp_session(&f.db, true);
+    assert_eq!(n, 17);
+    assert_eq!(t["result"]["structuredContent"]["status"], "pending", "{t}");
+    assert!(
+        json_of(&wbm(&f.db, &["trusted", "list", "--json"]))["trusted"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
 }

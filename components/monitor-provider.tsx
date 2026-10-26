@@ -19,6 +19,7 @@ import {
   scanNow,
   setSettings,
 } from "@/lib/api";
+import { isStaleSettingsError } from "@/lib/agent-requests";
 import type { Alert, PermissionState, ScanResult, Settings } from "@/lib/types";
 
 interface MonitorState {
@@ -130,7 +131,17 @@ export function MonitorProvider({ children }: { children: React.ReactNode }) {
       setSettingsState(await setSettings(s));
       setError(null);
     } catch (e) {
-      setError(msg(e));
+      if (isStaleSettingsError(e)) {
+        // The stored settings changed under this page: show them, let the page tell the user.
+        try {
+          setSettingsState(await getSettings());
+        } catch {
+          /* keep what is shown */
+        }
+        setError(null);
+      } else {
+        setError(msg(e));
+      }
       throw e;
     }
   }, []);

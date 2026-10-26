@@ -11,6 +11,9 @@
  */
 import type { CommandName } from "./api";
 import type {
+  AgentAuditEntry,
+  AgentDecision,
+  AgentProposal,
   Alert,
   BleObservation,
   History,
@@ -37,13 +40,14 @@ function fakeHash(n: number): string {
   return ("02" + n.toString(16).padStart(62, "0")).slice(0, 64);
 }
 
-function scenario(): "ok" | "denied" {
+let staleServed = false;
+
+function scenario(): "ok" | "denied" | "stale" {
   try {
-    if (
-      typeof window !== "undefined" &&
-      new URLSearchParams(window.location.search).get("mock") === "denied"
-    ) {
-      return "denied";
+    if (typeof window !== "undefined") {
+      const m = new URLSearchParams(window.location.search).get("mock");
+      if (m === "denied") return "denied";
+      if (m === "stale") return "stale";
     }
   } catch {
     /* no window / blocked: default scenario */
@@ -396,6 +400,48 @@ let watchlist: WatchlistEntry[] = [
 ];
 let nextWatchId = 2;
 
+// ---- Agent requests (synthetic) -----------------------------------------------------
+// Sentences below mirror what src-tauri/src/proposals.rs writes: from app data, with the
+// agent's names only inside quotation marks.
+const DAY_MS = 24 * 60 * 60 * 1000;
+let proposals: AgentProposal[] = [
+  {
+    id: 1,
+    tool: "trusted_add",
+    createdAt: Date.now() - 20 * 60_000,
+    expiresAt: Date.now() - 20 * 60_000 + DAY_MS,
+    summary: "Trust network \u201CNet-A\u201D: 2 access points seen, WPA2 and WPA3.",
+    warnings: ["\u26A0 an evil-twin alert for this name is active."],
+    blocked:
+      "This name appears with 2 security modes in the latest scan (WPA2 and WPA3). That is what an evil twin looks like. Check it, then use Trust on the Networks page.",
+  },
+  {
+    id: 2,
+    tool: "mine_add",
+    createdAt: Date.now() - 5 * 60_000,
+    expiresAt: Date.now() - 5 * 60_000 + DAY_MS,
+    summary:
+      "Mark this access point named \u201CHome-5G\u201D (Vendor-A, -52 dBm) as yours.",
+    warnings: [
+      "\u26A0 this is the Wi-Fi network this Mac is joined to. Marking it as yours is what lets the opt-in LAN sweep run on it (the sweep is off in Settings).",
+    ],
+    blocked: null,
+  },
+];
+let agentAudit: AgentAuditEntry[] = [
+  {
+    id: 1,
+    at: Date.now() - 3 * 3_600_000,
+    tool: "watchlist_add",
+    via: "direct",
+    addedBy: "agent",
+    proposalId: null,
+    summary: "Added a watchlist rule: network name contains \u201CNet-Z\u201D.",
+    undone: false,
+  },
+];
+let nextAuditId = 2;
+
 function currentNetwork(): NetworkInfo {
   const isMine = mine.some((m) => m.kind === "wifiGroup" && m.idHash === H_GROUP_A);
   const sweepEnabled = settings.lanActiveSweep && isMine;
@@ -497,9 +543,25 @@ export async function mockInvoke<T>(
       return undefined as T;
     case "get_settings":
       return settings as T;
-    case "set_settings":
-      settings = (args?.settings as Settings) ?? settings;
+    case "set_settings": {
+      const incoming = (args?.settings as Settings) ?? settings;
+      // `?mock=stale` plays the Rust store's refusal once: the page's base revision is no
+      // longer remembered (src-tauri/src/store/settings_sync.rs STALE_SETTINGS), so the page
+      // must show the current values instead of saving.
+      if (scenario() === "stale" && !staleServed) {
+        staleServed = true;
+        settings = { ...settings, notify: !settings.notify, revision: settings.revision + 1 };
+        return Promise.reject(
+          "store error: Settings changed elsewhere since this page loaded them; reload and try again.",
+        );
+      }
+      // An unchanged save writes nothing and bumps no revision, like the store.
+      const same =
+        JSON.stringify({ ...incoming, revision: 0 }) ===
+        JSON.stringify({ ...settings, revision: 0 });
+      if (!same) settings = { ...incoming, revision: settings.revision + 1 };
       return settings as T;
+    }
     case "get_permissions":
       return permissions() as T;
     case "list_places":
@@ -559,6 +621,44 @@ export async function mockInvoke<T>(
       return lanDevices(args?.networkKey as string | null | undefined) as T;
     case "get_current_network":
       return currentNetwork() as T;
+    case "list_agent_proposals":
+      return proposals.map((p) => ({ ...p })) as T;
+    case "decide_agent_proposal": {
+      const id = Number(args?.id);
+      const p = proposals.find((x) => x.id === id);
+      if (!p) return Promise.reject("That request no longer exists.");
+      if (args?.approve) {
+        // Approval re-validates: a blocked request is refused and stays listed.
+        if (p.blocked) return Promise.reject(p.blocked);
+        agentAudit = [
+          {
+            id: nextAuditId++,
+            at: Date.now(),
+            tool: p.tool,
+            via: "proposal",
+            addedBy: "agent",
+            proposalId: p.id,
+            summary: p.summary,
+            undone: false,
+          },
+          ...agentAudit,
+        ];
+      }
+      proposals = proposals.filter((x) => x.id !== id);
+      const d: AgentDecision = args?.approve
+        ? { status: "approved", changed: true, message: "Approved and applied." }
+        : { status: "rejected", changed: false, message: "Rejected. Nothing changed." };
+      return d as T;
+    }
+    case "list_agent_audit":
+      return agentAudit.slice(0, Number(args?.limit ?? 50)).map((a) => ({ ...a })) as T;
+    case "undo_agent_change": {
+      const a = agentAudit.find((x) => x.id === Number(args?.id));
+      if (!a) return Promise.reject("That entry no longer exists.");
+      if (a.undone) return Promise.reject("That change was already undone.");
+      a.undone = true;
+      return undefined as T;
+    }
     case "get_helper_status":
       return (settings.lanNeighborHelper ? "enabled" : "off") as T;
     case "open_login_items":

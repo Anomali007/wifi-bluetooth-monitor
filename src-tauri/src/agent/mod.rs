@@ -1,20 +1,25 @@
 //! Agent tools: one read/edit path shared by the `wbm` CLI and its MCP server.
 //!
 //! - [`tools`]  the tool table: name, description, input schema, access class, implementation.
-//!   The CLI and the MCP server both call [`tools::call`], so they cannot drift apart.
+//!   The CLI and the MCP server both call it, so they cannot drift apart.
+//! - [`output`] the one output stage every result passes through: strips and caps text that
+//!   other people's devices broadcast, marks it as untrusted data, caps the response size.
 //! - [`status`] the snapshot the running app publishes after every scan, and how `wbm status`
 //!   reports its age.
 //! - [`cli`]    argument parsing and human output.
 //! - [`mcp`]    the MCP stdio server (official `rmcp` SDK).
 //!
 //! Boundaries, enforced by `tests/agent_tools.rs` and `tests/lan_listen_only.rs`:
-//! - Reads come from the SQLite file; edits are limited to trusted networks, Mine, the
-//!   watchlist and alert dismissal. Nothing here starts a scan or a sweep, and nothing here
-//!   writes any setting other than the trusted-network list.
+//! - Reads come from the SQLite file. Edits need `--edits`. Edits that could hide an alert
+//!   (trusting or untrusting a network, marking a device mine, dismissing an alert, removing a
+//!   watchlist rule) are only PROPOSALS a person approves in the app; the two direct edits
+//!   (adding a watchlist rule, removing a Mine entry) can only add alerts and are audited.
+//!   Nothing here starts a scan or a sweep, and nothing here writes any setting.
 //! - No socket, no child process.
 
 pub mod cli;
 pub mod mcp;
+pub mod output;
 pub mod status;
 pub mod tools;
 
@@ -119,6 +124,8 @@ pub struct Ctx {
     pub now: fn() -> Millis,
     /// Is a process with this pid alive? (`kill(pid, 0)`; sends no signal.)
     pub pid_alive: fn(u32) -> bool,
+    /// Edit tools are offered and callable. Off unless `--edits` was given.
+    pub edits: bool,
 }
 
 impl Ctx {
@@ -127,7 +134,14 @@ impl Ctx {
             db,
             now: crate::pipeline::now_ms,
             pid_alive: status::process_alive,
+            edits: false,
         }
+    }
+
+    /// The same context with edit tools switched on or off.
+    pub fn with_edits(mut self, edits: bool) -> Ctx {
+        self.edits = edits;
+        self
     }
 }
 
