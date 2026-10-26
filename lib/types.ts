@@ -277,6 +277,11 @@ export interface NetworkInfo {
   lastSweepAt: Millis | null;
   /** Why neighbor tables could not be read (Apple's arp/ndp unavailable); null when they could. */
   neighborNote: string | null;
+  /**
+   * Why a sweep will not run on a network marked as yours although the setting is on (a mark
+   * without a saved name, a hidden name, a different name). Absent or null otherwise.
+   */
+  sweepNote?: string | null;
 }
 
 export const DEFAULT_SETTINGS: Settings = {

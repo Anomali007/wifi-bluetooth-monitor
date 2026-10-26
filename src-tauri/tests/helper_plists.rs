@@ -86,6 +86,15 @@ fn startup_locks_the_folder_before_the_database_and_quit_stops_the_jobs() {
         prepare < open,
         "the folder must be locked before the database exists"
     );
+    // A refused folder stops startup: the Err is returned before the database is opened.
+    let refused = lib.find("prepare_dir(&dir)").expect("prepare_dir call");
+    let guard = lib
+        .find("return Err(")
+        .expect("early return on a refused folder");
+    assert!(
+        refused < guard && guard < open,
+        "refusal must precede Store::open"
+    );
     let exit = lib.find("RunEvent::Exit").expect("an Exit handler");
     let quit = lib.find("helper::on_quit()").expect("on_quit call");
     assert!(exit < quit, "on_quit runs from the Exit event");

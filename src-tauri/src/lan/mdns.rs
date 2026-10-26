@@ -452,9 +452,11 @@ impl MdnsListener {
         socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())?;
         socket.join_multicast_v4(&MDNS_GROUP, &Ipv4Addr::UNSPECIFIED)?;
         socket.set_read_timeout(Some(Duration::from_secs(1)))?;
-        Ok(MdnsListener {
+        let l = MdnsListener {
             socket: socket.into(),
-        })
+        };
+        l.report_hops(false);
+        Ok(l)
     }
 
     /// Bind `[::]:5353` (IPv6 only) and join ff02::fb on every interface.
@@ -466,27 +468,119 @@ impl MdnsListener {
         socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, MDNS_PORT)).into())?;
         socket.join_multicast_v6(&MDNS_GROUP_V6, 0)?;
         socket.set_read_timeout(Some(Duration::from_secs(1)))?;
-        Ok(MdnsListener {
+        let l = MdnsListener {
             socket: socket.into(),
-        })
+        };
+        l.report_hops(true);
+        Ok(l)
     }
 
-    /// Read one datagram: `(length, sender, interface scope)`. `Ok(None)` on timeout.
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<Option<(usize, IpAddr, u32)>> {
-        match self.socket.recv_from(buf) {
-            Ok((n, SocketAddr::V4(from))) => Ok(Some((n, IpAddr::V4(*from.ip()), 0))),
-            Ok((n, SocketAddr::V6(from))) => Ok(Some((n, IpAddr::V6(*from.ip()), from.scope_id()))),
-            Err(e)
-                if matches!(
+    /// Ask the OS to report each datagram's TTL (IPv4) or hop limit (IPv6). Best effort: if it
+    /// refuses, `recv` simply reports no value.
+    fn report_hops(&self, v6: bool) {
+        use std::os::fd::AsRawFd;
+        let (level, opt) = if v6 {
+            (libc::IPPROTO_IPV6, libc::IPV6_RECVHOPLIMIT)
+        } else {
+            (libc::IPPROTO_IP, libc::IP_RECVTTL)
+        };
+        let on: libc::c_int = 1;
+        // SAFETY: valid fd, and a pointer/length pair for one c_int.
+        let _ = unsafe {
+            libc::setsockopt(
+                self.socket.as_raw_fd(),
+                level,
+                opt,
+                std::ptr::addr_of!(on).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+    }
+
+    /// Read one datagram with its sender, interface scope and (when the OS reports it) hop
+    /// limit. `Ok(None)` on timeout.
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<Option<Received>> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: zeroed C structs are valid initial values; the pointers handed to recvmsg
+        // point at locals that outlive the call; the control buffer is 8-byte aligned.
+        unsafe {
+            let mut name: libc::sockaddr_storage = std::mem::zeroed();
+            let mut iov = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
+            };
+            let mut control = [0u64; 16];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_name = std::ptr::addr_of_mut!(name).cast();
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = std::mem::size_of_val(&control) as _;
+            let n = libc::recvmsg(self.socket.as_raw_fd(), &mut msg, 0);
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                return if matches!(
                     e.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                Ok(None)
+                ) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                };
             }
-            Err(e) => Err(e),
+            let (from, scope) = match libc::c_int::from(name.ss_family) {
+                libc::AF_INET => {
+                    let a = &*std::ptr::addr_of!(name).cast::<libc::sockaddr_in>();
+                    (
+                        IpAddr::V4(Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr))),
+                        0,
+                    )
+                }
+                libc::AF_INET6 => {
+                    let a = &*std::ptr::addr_of!(name).cast::<libc::sockaddr_in6>();
+                    (
+                        IpAddr::V6(Ipv6Addr::from(a.sin6_addr.s6_addr)),
+                        a.sin6_scope_id,
+                    )
+                }
+                _ => return Ok(None),
+            };
+            let mut hop = None;
+            let mut c = libc::CMSG_FIRSTHDR(&msg);
+            while !c.is_null() {
+                let h = &*c;
+                let data = libc::CMSG_DATA(c);
+                let len = (h.cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+                if h.cmsg_level == libc::IPPROTO_IP && h.cmsg_type == libc::IP_RECVTTL && len >= 1 {
+                    // macOS reports one byte, other systems an int.
+                    hop = Some(if len >= 4 {
+                        data.cast::<libc::c_int>().read_unaligned() as u8
+                    } else {
+                        *data
+                    });
+                } else if h.cmsg_level == libc::IPPROTO_IPV6
+                    && h.cmsg_type == libc::IPV6_HOPLIMIT
+                    && len >= 4
+                {
+                    hop = Some(data.cast::<libc::c_int>().read_unaligned() as u8);
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
+            }
+            Ok(Some((n as usize, from, scope, hop)))
         }
     }
+}
+
+/// `(length, sender, interface scope, hop limit / TTL if the OS reported one)`.
+pub type Received = (usize, IpAddr, u32, Option<u8>);
+
+/// RFC 6762 section 11: a genuine link-local mDNS packet is sent with hop limit / TTL 255, and
+/// anything else has been routed (or forged from off the link). `None` = the OS did not report
+/// it, which is accepted: failing closed there would break receive on a system that cannot
+/// deliver the value.
+pub fn hop_ok(hop: Option<u8>) -> bool {
+    hop.is_none_or(|h| h == 255)
 }
 
 /// Handle to the process-wide listener threads and their shared cache.
@@ -575,8 +669,11 @@ fn listen_forever(cache: &Mutex<MdnsCache>, v6: bool) {
         flag.store(true, Ordering::Relaxed);
         loop {
             match listener.recv(&mut buf) {
-                Ok(Some((n, from, scope))) => {
+                Ok(Some((n, from, scope, hop))) => {
                     PACKETS.fetch_add(1, Ordering::Relaxed);
+                    if !hop_ok(hop) {
+                        continue;
+                    }
                     let a = parse_announcement(&buf[..n], from);
                     if let Ok(mut c) = cache.lock() {
                         let from = match from {
@@ -1114,5 +1211,48 @@ mod tests {
         let late = IpAddr::V4(Ipv4Addr::new(192, 168, 77, 21));
         c.observe(late, 0, named("late.local"), t0 + 2);
         assert!(c.get(late).is_some());
+    }
+
+    // -- N4: hop limit 255 -----------------------------------------------------------------------
+
+    #[test]
+    fn only_hop_limit_255_or_unreported_is_accepted() {
+        assert!(hop_ok(Some(255)));
+        assert!(
+            hop_ok(None),
+            "an OS that cannot report it must not break receive"
+        );
+        for h in [0u8, 1, 64, 254] {
+            assert!(!hop_ok(Some(h)), "{h}");
+        }
+    }
+
+    /// A listener on a loopback socket (never the real 5353), fed by a plain loopback sender.
+    fn loopback_listener() -> (MdnsListener, std::net::SocketAddr) {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let l = MdnsListener { socket: sock };
+        l.report_hops(false);
+        (l, addr)
+    }
+
+    #[test]
+    fn the_listener_reads_the_ttl_of_each_datagram() {
+        let (l, to) = loopback_listener();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut buf = [0u8; 64];
+        for ttl in [64u32, 255] {
+            tx.set_ttl(ttl).unwrap();
+            tx.send_to(b"x", to).unwrap();
+            let (n, from, _, hop) = l.recv(&mut buf).unwrap().expect("a datagram");
+            assert_eq!((n, from), (1, IpAddr::V4(Ipv4Addr::LOCALHOST)));
+            assert_eq!(
+                hop,
+                Some(ttl as u8),
+                "the OS reports the TTL it arrived with"
+            );
+            assert_eq!(hop_ok(hop), ttl == 255);
+        }
     }
 }

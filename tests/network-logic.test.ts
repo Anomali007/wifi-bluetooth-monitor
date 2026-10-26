@@ -37,6 +37,11 @@ describe("sweepBlockedReason", () => {
       ["network key withheld", { ...open, networkKey: null }, on],
       ["AP not mine", { ...open, isMine: false }, on],
     ];
+    cases.push([
+      "marked, but the name was not saved",
+      { ...open, sweepNote: "Mark it as mine again to allow the sweep." },
+      on,
+    ]);
     let ran = 0;
     for (const [name, n, s] of cases) {
       const reason = sweepBlockedReason(n, s);
@@ -44,7 +49,7 @@ describe("sweepBlockedReason", () => {
       expect(reason!.length, name).toBeGreaterThan(10);
       ran++;
     }
-    expect(ran).toBe(5);
+    expect(ran).toBe(6);
   });
 
   it("does not care about the IPv4 subnet: the sweep is one IPv6 packet", () => {
