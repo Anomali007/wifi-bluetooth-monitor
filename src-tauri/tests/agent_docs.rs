@@ -45,17 +45,23 @@ fn the_docs_describe_the_split_the_proposals_and_the_caps() {
         "agent_proposals",
         "24 hours",
         "**20**",
+        "**5** per tool",
+        "digest",
+        "tool-only",
+        "shell",
+        "pinned",
         "latest scan only",
         "more than one security mode",
         "persists while the finding continues",
         "{\"untrusted\":",
-        "256 KB",
+        "128 KB",
         "**50**",
         "last **64**",
         "rejected",
         "added_by = agent",
         "mcp__wbm__*",
         "destructiveHint: true",
+        "not counting the label",
         "subjectSsid",
         "COPIES the binary",
         "--force",
@@ -67,7 +73,7 @@ fn the_docs_describe_the_split_the_proposals_and_the_caps() {
         "Agent requests",
         "untrusted",
         "mcp__wbm__*",
-        "256 KB",
+        "128 KB",
     ] {
         assert!(readme.contains(must), "README.md lacks {must:?}");
     }
@@ -79,6 +85,9 @@ fn the_docs_no_longer_make_the_claims_that_stopped_being_true() {
     let readme = read("README.md");
     for stale in [
         "the only four things an agent can change",
+        "can only make alerts fire again",
+        "can only add alerts",
+        "over 256 KB",
         "reappears only if",
         "last 16 revisions",
         "links ~/bin/wbm",
@@ -116,5 +125,5 @@ fn every_proposal_tool_says_it_is_a_request_in_its_own_description() {
         );
         n += 1;
     }
-    assert_eq!(n, 5);
+    assert_eq!(n, 6);
 }

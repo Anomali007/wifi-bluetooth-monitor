@@ -18,6 +18,8 @@ use serde_json::Value;
 pub const PROPOSAL_TTL_MS: Millis = 24 * 60 * 60 * 1000;
 /// At most this many proposals wait at once; more are refused until some are decided.
 pub const MAX_PENDING_PROPOSALS: usize = 20;
+/// ...and at most this many per tool, so one tool cannot fill the inbox and bury the rest.
+pub const MAX_PENDING_PER_TOOL: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,6 +103,14 @@ pub enum NewProposal {
     TooMany,
 }
 
+fn dedupe_key(args: &Value) -> String {
+    let mut v = args.clone();
+    if let Value::Object(m) = &mut v {
+        m.remove("label");
+    }
+    serde_json::to_string(&v).unwrap_or_default()
+}
+
 /// One applied agent change, as recorded.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuditEntry {
@@ -168,17 +178,26 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         expire(&tx, now)?;
-        // `Value` objects are key-sorted, so equal arguments serialise equally.
+        // `Value` objects are key-sorted, so equal arguments serialise equally. The dedupe key
+        // leaves the label out: the same thing proposed again with a new label is the same
+        // request, not another row to approve.
         let canon = serde_json::to_string(args).unwrap_or_default();
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM agent_proposals WHERE status = 'pending' AND tool = ?1 AND args = ?2",
-                params![tool, canon],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(id) = existing {
-            return Ok(NewProposal::Existing(id));
+        let key = dedupe_key(args);
+        let mut q = tx.prepare(
+            "SELECT id, args FROM agent_proposals WHERE status = 'pending' AND tool = ?1 ORDER BY id",
+        )?;
+        let same_tool: Vec<(i64, String)> = q
+            .query_map([tool], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        drop(q);
+        if let Some((id, _)) = same_tool
+            .iter()
+            .find(|(_, a)| serde_json::from_str::<Value>(a).is_ok_and(|v| dedupe_key(&v) == key))
+        {
+            return Ok(NewProposal::Existing(*id));
+        }
+        if same_tool.len() >= MAX_PENDING_PER_TOOL {
+            return Ok(NewProposal::TooMany);
         }
         let pending: i64 = tx.query_row(
             "SELECT COUNT(*) FROM agent_proposals WHERE status = 'pending'",
@@ -279,6 +298,45 @@ impl Store {
         Ok(out)
     }
 
+    /// Audit entries for display: every direct change that has not been undone first (so a
+    /// burst of later entries can never push it out of sight), then the rest newest first.
+    pub fn list_audit_pinned_first(&self, limit: usize) -> StoreResult<Vec<AuditEntry>> {
+        let mut q = self.conn.prepare(
+            "SELECT id, at, tool, via, added_by, proposal_id, summary, undo, undone
+             FROM agent_audit
+             ORDER BY (via = 'direct' AND undone = 0) DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = q.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], audit_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// (all entries, direct entries not yet undone).
+    pub fn count_audit(&self) -> StoreResult<(usize, usize)> {
+        let all: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM agent_audit", [], |r| r.get(0))?;
+        let pinned: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM agent_audit WHERE via = 'direct' AND undone = 0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((all as usize, pinned as usize))
+    }
+
+    /// Direct (unreviewed) agent changes recorded at or after `since`: the rate-limit input.
+    pub fn count_direct_edits_since(&self, since: Millis) -> StoreResult<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM agent_audit WHERE via = 'direct' AND at >= ?1",
+            [since],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     pub fn get_audit(&self, id: i64) -> StoreResult<Option<AuditEntry>> {
         Ok(self
             .conn
@@ -326,6 +384,7 @@ fn expire(tx: &rusqlite::Transaction<'_>, now: Millis) -> StoreResult<usize> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::MAX_PENDING_PER_TOOL;
     use super::*;
     use serde_json::json;
 
@@ -356,22 +415,37 @@ mod tests {
     }
 
     #[test]
-    fn pending_is_capped_and_a_decision_frees_a_slot() {
+    fn pending_is_capped_overall_and_per_tool_and_a_decision_frees_a_slot() {
         let (_d, mut s) = open();
-        for i in 0..MAX_PENDING_PROPOSALS {
-            let r = s
-                .create_proposal("trusted_add", &json!({"ssid": format!("N{i}")}), 1_000)
-                .unwrap();
-            assert!(matches!(r, NewProposal::Created(_)), "{i}");
+        // Four tools x five each fills the inbox of twenty.
+        let tools = ["trusted_add", "mine_add", "dismiss_alert", "trusted_remove"];
+        for t in tools {
+            for i in 0..MAX_PENDING_PER_TOOL {
+                let r = s
+                    .create_proposal(t, &json!({"k": format!("N{i}")}), 1_000)
+                    .unwrap();
+                assert!(matches!(r, NewProposal::Created(_)), "{t} {i}");
+            }
+            // One tool cannot take more than its share.
+            assert_eq!(
+                s.create_proposal(t, &json!({"k": "over"}), 1_000).unwrap(),
+                NewProposal::TooMany,
+                "{t}"
+            );
         }
         assert_eq!(
-            s.create_proposal("trusted_add", &json!({"ssid": "over"}), 1_000)
+            s.list_pending_proposals(1_000).unwrap().len(),
+            MAX_PENDING_PROPOSALS
+        );
+        // Total cap: a fifth tool is refused too.
+        assert_eq!(
+            s.create_proposal("watchlist_remove", &json!({"id": 1}), 1_000)
                 .unwrap(),
             NewProposal::TooMany
         );
         // A repeat of one already waiting is still just that one.
         assert!(matches!(
-            s.create_proposal("trusted_add", &json!({"ssid": "N0"}), 1_000)
+            s.create_proposal("trusted_add", &json!({"k": "N0"}), 1_000)
                 .unwrap(),
             NewProposal::Existing(_)
         ));
@@ -380,7 +454,36 @@ mod tests {
             .decide_proposal(first, ProposalStatus::Rejected, 1_500)
             .unwrap());
         assert!(matches!(
-            s.create_proposal("trusted_add", &json!({"ssid": "over"}), 1_600)
+            s.create_proposal("trusted_add", &json!({"k": "over"}), 1_600)
+                .unwrap(),
+            NewProposal::Created(_)
+        ));
+    }
+
+    #[test]
+    fn the_label_is_not_part_of_the_dedupe_key() {
+        let (_d, mut s) = open();
+        let a = s
+            .create_proposal(
+                "mine_add",
+                &json!({"kind": "ble", "idHash": "aa", "label": "One"}),
+                1,
+            )
+            .unwrap();
+        let b = s
+            .create_proposal(
+                "mine_add",
+                &json!({"kind": "ble", "idHash": "aa", "label": "Two"}),
+                2,
+            )
+            .unwrap();
+        let (NewProposal::Created(x), NewProposal::Existing(y)) = (a, b) else {
+            panic!("{a:?} {b:?}")
+        };
+        assert_eq!(x, y, "a new label does not mint a new request");
+        // A different hash is a different request.
+        assert!(matches!(
+            s.create_proposal("mine_add", &json!({"kind": "ble", "idHash": "bb"}), 3)
                 .unwrap(),
             NewProposal::Created(_)
         ));

@@ -11,9 +11,11 @@
 //! Approval re-validates against CURRENT data, so a proposal that was fine when made can be
 //! refused when approved.
 
+use crate::agent::cli::fmt_time;
+use crate::detect::is_lookalike;
 use crate::labels::{
-    alert_kind_label, clean, mine_kind_label, quote, security_label, severity_label, strip_unsafe,
-    tracker_label,
+    alert_kind_label, clean, codepoints_if_not_ascii, mine_kind_label, quote, security_label,
+    severity_label, strip_unsafe, tracker_label,
 };
 use crate::model::{
     AlertKind, Millis, MineEntry, MineKind, Security, TrustedNetwork, WatchKind, WatchMatch,
@@ -24,6 +26,7 @@ use crate::store::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// One pending request as the Settings page shows it.
@@ -40,6 +43,10 @@ pub struct ProposalView {
     pub warnings: Vec<String>,
     /// Set when approving would be refused right now, with the reason.
     pub blocked: Option<String>,
+    /// Digest of what this request describes (hashes, modes, subject, label). Approve must
+    /// carry it back; if the situation changed since it was read, approval is refused and the
+    /// request must be read again.
+    pub digest: String,
 }
 
 /// One applied agent change as the Settings page shows it.
@@ -120,15 +127,31 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// Last six characters of a hash, so two devices that share a name can be told apart on screen.
+fn tail(hash: &str) -> String {
+    let n = hash.chars().count();
+    format!(
+        "\u{2026}{}",
+        hash.chars().skip(n.saturating_sub(6)).collect::<String>()
+    )
+}
+
 /// Everything known about trusting a name, from the latest scan only.
 struct TrustCheck {
-    aps: usize,
+    /// Distinct access points (hash, signal) in the latest scan.
+    aps: Vec<(String, i32)>,
     modes: Vec<Security>,
-    hashes: Vec<String>,
+    groups: BTreeSet<String>,
     already: bool,
     alert: Option<AlertKind>,
     /// Why approval would be refused, if it would.
     problem: Option<String>,
+}
+
+impl TrustCheck {
+    fn hashes(&self) -> Vec<String> {
+        self.aps.iter().map(|(h, _)| h.clone()).collect()
+    }
 }
 
 fn trust_check(store: &Store, ssid: &str, now: Millis) -> StoreResult<TrustCheck> {
@@ -152,10 +175,12 @@ fn trust_check(store: &Store, ssid: &str, now: Millis) -> StoreResult<TrustCheck
         }
     }
     modes.sort_by_key(|m| m.strength());
-    let mut hashes: Vec<String> = Vec::new();
-    for h in rows.iter().filter_map(|o| o.bssid_hash.clone()) {
-        if !hashes.contains(&h) {
-            hashes.push(h);
+    let mut aps: Vec<(String, i32)> = Vec::new();
+    for o in &rows {
+        if let Some(h) = &o.bssid_hash {
+            if !aps.iter().any(|(x, _)| x == h) {
+                aps.push((h.clone(), o.rssi));
+            }
         }
     }
     // One physical device (all its radios) shares a group; a row without one stands alone.
@@ -173,8 +198,10 @@ fn trust_check(store: &Store, ssid: &str, now: Millis) -> StoreResult<TrustCheck
         None
     } else if rows.is_empty() {
         Some("This name is not in the latest scan, so there is nothing current to trust.".into())
-    } else if hashes.is_empty() {
+    } else if aps.is_empty() {
         Some("The access points' identities are withheld (check Location access), so none can be recorded.".into())
+    } else if modes.contains(&Security::Unknown) {
+        Some("The security mode of this network is unknown, so there is nothing meaningful to record. Check it, then use Trust on the Networks page.".into())
     } else if modes.len() > 1 {
         Some(format!(
             "This name appears with {} security modes in the latest scan ({}). That is what an evil twin looks like. Check it, then use Trust on the Networks page.",
@@ -195,9 +222,9 @@ fn trust_check(store: &Store, ssid: &str, now: Millis) -> StoreResult<TrustCheck
         })
     };
     Ok(TrustCheck {
-        aps: hashes.len(),
+        aps,
         modes,
-        hashes,
+        groups,
         already,
         alert,
         problem,
@@ -230,16 +257,64 @@ struct Described {
     summary: String,
     warnings: Vec<String>,
     blocked: Option<String>,
+    /// Everything the sentence depends on that matters for the decision (hashes, modes,
+    /// subject, label), WITHOUT values that move on every scan (signal). Its digest is what
+    /// Approve must carry, so approving something that changed after it was read is refused.
+    state: String,
+}
+
+impl Described {
+    fn digest(&self) -> String {
+        let mut h = Sha256::new();
+        h.update(self.state.as_bytes());
+        h.update(b"\x1f");
+        h.update(self.warnings.join("\x1e").as_bytes());
+        h.update(b"\x1f");
+        h.update(self.blocked.as_deref().unwrap_or("").as_bytes());
+        hex::encode(&h.finalize()[..12])
+    }
+}
+
+/// Warnings about the look of a network name: invisible or non-ASCII characters (with their
+/// code points), and a name that resembles another trusted or nearby name without being it.
+fn name_warnings(store: &Store, ssid: &str, warnings: &mut Vec<String>) -> StoreResult<()> {
+    if let Some(cps) = codepoints_if_not_ascii(ssid) {
+        warnings.push(format!(
+            "\u{26A0} this name contains non-ASCII characters ({cps}); check it is the network you mean, not a look-alike alphabet."
+        ));
+    }
+    let similar: Vec<String> = store
+        .known_ssids()?
+        .into_iter()
+        .filter(|other| other != ssid && is_lookalike(ssid, other))
+        .collect();
+    if let Some(first) = similar.first() {
+        warnings.push(format!(
+            "\u{26A0} this name looks like {} (a trusted or nearby network) but is not the same name.",
+            quote(first)
+        ));
+    }
+    Ok(())
 }
 
 fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult<Described> {
     let mut warnings = Vec::new();
     let mut blocked = None;
+    let mut state = String::new();
     let summary = match tool {
         "trusted_add" => {
             let ssid = arg_str(args, "ssid").unwrap_or_default();
             let c = trust_check(store, &ssid, now)?;
             blocked = c.problem.clone();
+            let mut hashes = c.hashes();
+            hashes.sort();
+            state = format!(
+                "trusted_add|{ssid}|{:?}|{hashes:?}|{:?}|{:?}|{}",
+                c.modes.iter().map(|m| m.strength()).collect::<Vec<_>>(),
+                c.groups,
+                c.alert,
+                c.already
+            );
             if strip_unsafe(&ssid) != ssid {
                 warnings.push(
                     "\u{26A0} this name contains hidden characters, left out of the quotation below."
@@ -253,12 +328,19 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
                     alert_kind_label(kind)
                 ));
             }
+            name_warnings(store, &ssid, &mut warnings)?;
+            if c.modes.contains(&Security::Open) {
+                warnings.push(
+                    "\u{26A0} this network is open (not encrypted); trusting it records that as normal."
+                        .into(),
+                );
+            }
             if c.already {
                 format!(
                     "Trust network {}: already trusted, nothing would change.",
                     quote(&ssid)
                 )
-            } else if c.aps == 0 {
+            } else if c.aps.is_empty() {
                 format!(
                     "Trust network {}: not seen in the latest scan.",
                     quote(&ssid)
@@ -269,10 +351,22 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
                     .iter()
                     .map(|m| security_label(*m).to_string())
                     .collect();
+                let listed: Vec<String> = c
+                    .aps
+                    .iter()
+                    .take(6)
+                    .map(|(h, rssi)| format!("{} at {rssi} dBm", tail(h)))
+                    .collect();
+                let more = if c.aps.len() > 6 {
+                    format!(", and {} more", c.aps.len() - 6)
+                } else {
+                    String::new()
+                };
                 format!(
-                    "Trust network {}: {} seen, {}.",
+                    "Trust network {}: {} seen ({}{more}), {}.",
                     quote(&ssid),
-                    plural(c.aps, "access point", "access points"),
+                    plural(c.aps.len(), "access point", "access points"),
+                    listed.join(", "),
                     join_labels(&labels)
                 )
             }
@@ -286,6 +380,10 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
                 .find(|t| t.ssid == ssid)
             {
                 Some(t) => {
+                    state = format!(
+                        "trusted_remove|{}",
+                        serde_json::to_string(&t).unwrap_or_default()
+                    );
                     warnings.push(
                         "\u{26A0} evil-twin and downgrade alerts for this name will stop.".into(),
                     );
@@ -298,6 +396,7 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
                 }
                 None => {
                     blocked = Some("That network is no longer in the trusted list.".into());
+                    state = format!("trusted_remove|absent|{ssid}");
                     format!("Stop trusting {}: not currently trusted.", quote(&ssid))
                 }
             }
@@ -308,7 +407,59 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
                 "Mark a device as yours.".into()
             }
             Some((kind, hash)) => {
-                describe_mine_add(store, kind, &hash, now, &mut warnings, &mut blocked)?
+                let label = arg_str(args, "label")
+                    .map(|l| clean(&l, 64))
+                    .filter(|l| !l.trim().is_empty());
+                describe_mine_add(
+                    store,
+                    kind,
+                    &hash,
+                    label.as_deref(),
+                    now,
+                    &mut warnings,
+                    &mut blocked,
+                    &mut state,
+                )?
+            }
+        },
+        "mine_remove" => match mine_args(args) {
+            None => {
+                blocked = Some("This request is malformed.".into());
+                "Remove a device from Mine.".into()
+            }
+            Some((kind, hash)) => {
+                let row = store
+                    .list_mine_with_source()?
+                    .into_iter()
+                    .find(|(m, _)| m.kind == kind && m.id_hash == hash);
+                match row {
+                    Some((m, by)) => {
+                        state = format!(
+                            "mine_remove|{kind:?}|{hash}|{:?}|{:?}|{}",
+                            m.label,
+                            m.ssid,
+                            by.as_str()
+                        );
+                        warnings.push(match kind {
+                            MineKind::Lan => "\u{26A0} without the mark, a device that announces this one's hostname can take over its history, and the new-device alert for it stops being a surprise.".to_string(),
+                            _ => "\u{26A0} alerts that the mark silences will come back, and anything that relied on the mark (such as the opt-in sweep) stops.".to_string(),
+                        });
+                        format!(
+                            "Remove this {} ({}){} from Mine.",
+                            mine_kind_label(kind),
+                            tail(&hash),
+                            m.label
+                                .as_deref()
+                                .map(|l| format!(", labelled {}", quote(l)))
+                                .unwrap_or_default()
+                        )
+                    }
+                    None => {
+                        blocked = Some("That entry is no longer in Mine.".into());
+                        state = format!("mine_remove|absent|{hash}");
+                        format!("Remove a {} that is not in Mine.", mine_kind_label(kind))
+                    }
+                }
             }
         },
         "dismiss_alert" => {
@@ -317,6 +468,10 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
                 Some(a) => {
                     let subject = alert_subject_ssid(store, a.kind, &a.subject_hash);
                     let latest = store.latest_scan_at()?.unwrap_or(0);
+                    state = format!(
+                        "dismiss_alert|{id}|{:?}|{}|{}",
+                        a.kind, a.subject_hash, a.dismissed
+                    );
                     if a.last_seen >= latest {
                         warnings.push(
                             "\u{26A0} this finding is present in the latest scan. A dismissed alert stays dismissed while the finding continues."
@@ -330,13 +485,17 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
                         .map(|s| format!(" about {}", quote(&s)))
                         .unwrap_or_default();
                     format!(
-                        "Dismiss the {} alert ({} severity){about}.",
+                        "Dismiss the {} alert ({} severity, subject {}, first seen {}, last seen {}){about}.",
                         alert_kind_label(a.kind),
-                        severity_label(a.severity)
+                        severity_label(a.severity),
+                        tail(&a.subject_hash),
+                        fmt_time(a.first_seen),
+                        fmt_time(a.last_seen)
                     )
                 }
                 None => {
                     blocked = Some("That alert no longer exists.".into());
+                    state = format!("dismiss_alert|absent|{id}");
                     "Dismiss an alert that no longer exists.".into()
                 }
             }
@@ -345,6 +504,10 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
             let id = args.get("id").and_then(Value::as_i64).unwrap_or(-1);
             match store.list_watchlist()?.into_iter().find(|w| w.id == id) {
                 Some(w) => {
+                    state = format!(
+                        "watchlist_remove|{}",
+                        serde_json::to_string(&w).unwrap_or_default()
+                    );
                     warnings.push(
                         "\u{26A0} watchlist alerts for matching networks or vendors will stop."
                             .into(),
@@ -364,12 +527,14 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
                 }
                 None => {
                     blocked = Some("That rule no longer exists.".into());
+                    state = format!("watchlist_remove|absent|{id}");
                     "Remove a watchlist rule that no longer exists.".into()
                 }
             }
         }
         other => {
             blocked = Some("This kind of request is not recognised.".into());
+            state = format!("unknown|{other}");
             format!("Unrecognised request {}.", quote(other))
         }
     };
@@ -377,21 +542,28 @@ fn describe(store: &Store, tool: &str, args: &Value, now: Millis) -> StoreResult
         summary,
         warnings,
         blocked,
+        state,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn describe_mine_add(
     store: &Store,
     kind: MineKind,
     hash: &str,
+    label: Option<&str>,
     now: Millis,
     warnings: &mut Vec<String>,
     blocked: &mut Option<String>,
+    state: &mut String,
 ) -> StoreResult<String> {
     if !store.known_hashes(kind, now)?.contains(hash) {
         *blocked = Some("The monitor has not seen that device recently.".into());
     }
     let latest = store.latest_scan()?;
+    let label_clause = label
+        .map(|l| format!(", with the label {}", quote(l)))
+        .unwrap_or_default();
     let what = match kind {
         MineKind::WifiAp | MineKind::WifiGroup => {
             let o = latest.as_ref().and_then(|s| {
@@ -405,6 +577,11 @@ fn describe_mine_add(
                 MineKind::WifiAp => jb.as_deref() == Some(hash),
                 _ => jg.as_deref() == Some(hash),
             };
+            *state = format!(
+                "mine_add|{kind:?}|{hash}|{:?}|{:?}|{joined}|{label:?}",
+                o.map(|o| o.ssid.clone()),
+                o.map(|o| o.vendor.clone())
+            );
             if joined {
                 warnings.push(format!(
                     "\u{26A0} this is the Wi-Fi network this Mac is joined to. Marking it as yours is what lets the opt-in LAN sweep run on it (the sweep is {} in Settings).",
@@ -420,41 +597,63 @@ fn describe_mine_add(
                                 alert_kind_label(a)
                             ));
                         }
+                        name_warnings(store, ssid, warnings)?;
                     }
                     let name = o
                         .ssid
                         .as_deref()
                         .map_or("a hidden network".to_string(), quote);
                     format!(
-                        "{} named {} ({}, {} dBm)",
+                        "{} named {} ({}, {} dBm, {})",
                         mine_kind_label(kind),
                         name,
                         clean(o.vendor.as_deref().unwrap_or("unknown vendor"), 40),
-                        o.rssi
+                        o.rssi,
+                        tail(hash)
                     )
                 }
-                None => format!("{} that is not in the latest scan", mine_kind_label(kind)),
+                None => format!(
+                    "{} that is not in the latest scan ({})",
+                    mine_kind_label(kind),
+                    tail(hash)
+                ),
             }
         }
         MineKind::Ble => {
             let o = latest
                 .as_ref()
                 .and_then(|s| s.ble.iter().find(|o| o.peripheral_hash == hash));
+            *state = format!(
+                "mine_add|ble|{hash}|{:?}|{:?}|{label:?}",
+                o.map(|o| o.name.clone()),
+                o.map(|o| o.tracker)
+            );
             match o {
                 Some(o) => {
+                    let mut facts = Vec::new();
                     if let Some(t) = o.tracker {
                         warnings.push(format!(
                             "\u{26A0} this device has a {} tracker signature. Marking it as yours silences possible-tracker alerts for it.",
                             tracker_label(t)
                         ));
+                        facts.push(format!("{} tracker signature", tracker_label(t)));
                     }
+                    if let Some(r) = o.rssi {
+                        facts.push(format!("{r} dBm"));
+                    }
+                    facts.push(tail(hash));
                     format!(
-                        "{} {}",
+                        "{} {} ({})",
                         mine_kind_label(kind),
-                        o.name.as_deref().map_or("with no name".to_string(), quote)
+                        o.name.as_deref().map_or("with no name".to_string(), quote),
+                        facts.join(", ")
                     )
                 }
-                None => format!("{} that is not in the latest scan", mine_kind_label(kind)),
+                None => format!(
+                    "{} that is not in the latest scan ({})",
+                    mine_kind_label(kind),
+                    tail(hash)
+                ),
             }
         }
         MineKind::Lan => {
@@ -462,20 +661,30 @@ fn describe_mine_add(
                 .list_lan_devices(None)?
                 .into_iter()
                 .find(|d| d.mac_hash == hash);
+            *state = format!(
+                "mine_add|lan|{hash}|{:?}|{:?}|{label:?}",
+                d.as_ref().map(|d| d.hostname.clone()),
+                d.as_ref().map(|d| d.vendor.clone())
+            );
             match d {
                 Some(d) => format!(
-                    "{} {} ({})",
+                    "{} {} ({}, {})",
                     mine_kind_label(kind),
                     d.hostname
                         .as_deref()
                         .map_or("with no hostname".to_string(), quote),
-                    clean(d.vendor.as_deref().unwrap_or("unknown vendor"), 40)
+                    clean(d.vendor.as_deref().unwrap_or("unknown vendor"), 40),
+                    tail(hash)
                 ),
-                None => format!("{} that is not remembered", mine_kind_label(kind)),
+                None => format!(
+                    "{} that is not remembered ({})",
+                    mine_kind_label(kind),
+                    tail(hash)
+                ),
             }
         }
     };
-    Ok(format!("Mark this {what} as yours."))
+    Ok(format!("Mark this {what} as yours{label_clause}."))
 }
 
 /// Pending requests, described. Stale ones are expired first.
@@ -489,6 +698,7 @@ pub fn list_pending(store: &mut Store, now: Millis) -> Res<Vec<ProposalView>> {
             tool: p.tool,
             created_at: p.created_at,
             expires_at: p.created_at + PROPOSAL_TTL_MS,
+            digest: d.digest(),
             summary: d.summary,
             warnings: d.warnings,
             blocked: d.blocked,
@@ -500,6 +710,36 @@ pub fn list_pending(store: &mut Store, now: Millis) -> Res<Vec<ProposalView>> {
 /// How many requests wait (for the Dashboard).
 pub fn pending_count(store: &mut Store, now: Millis) -> Res<usize> {
     Ok(db(store.list_pending_proposals(now))?.len())
+}
+
+/// A page of the audit log for the UI.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditPage {
+    /// Direct changes not yet undone come first (so later entries can never bury them), then
+    /// the rest newest first.
+    pub entries: Vec<AuditView>,
+    /// All entries in the log; `total - entries.len()` are not shown.
+    pub total: usize,
+    /// How many of `entries` are pinned (direct and not undone).
+    pub pinned: usize,
+}
+
+pub fn list_audit_page(store: &Store, limit: usize) -> Res<AuditPage> {
+    let entries = db(store.list_audit_pinned_first(limit))?;
+    let (total, pinned_all) = db(store.count_audit())?;
+    Ok(AuditPage {
+        pinned: pinned_all.min(entries.len()),
+        entries: entries.into_iter().map(AuditView::from).collect(),
+        total,
+    })
+}
+
+/// The digest of a pending request as it reads right now (what the UI carries back).
+pub fn current_digest(store: &mut Store, id: i64, now: Millis) -> Res<String> {
+    db(store.expire_proposals(now))?;
+    let p = db(store.get_proposal(id))?.ok_or("That request no longer exists.")?;
+    Ok(db(describe(store, &p.tool, &p.args, now))?.digest())
 }
 
 /// Recent applied agent changes, newest first.
@@ -523,7 +763,13 @@ struct Applied {
 /// Approve or reject a pending request. Approval re-validates against current data and
 /// applies it; a refusal leaves the request pending so the reason can be read (and Reject
 /// chosen). A request is decided exactly once.
-pub fn decide(store: &mut Store, id: i64, approve: bool, now: Millis) -> Res<Decision> {
+pub fn decide(
+    store: &mut Store,
+    id: i64,
+    approve: bool,
+    digest: Option<&str>,
+    now: Millis,
+) -> Res<Decision> {
     db(store.expire_proposals(now))?;
     let p = db(store.get_proposal(id))?.ok_or("That request no longer exists.")?;
     if p.status != ProposalStatus::Pending {
@@ -538,6 +784,12 @@ pub fn decide(store: &mut Store, id: i64, approve: bool, now: Millis) -> Res<Dec
             changed: false,
             message: "Rejected. Nothing changed.".into(),
         });
+    }
+    // Approve only what was read: recompute what the request describes now and compare with
+    // the digest the person saw. A difference means the situation changed in between.
+    let current = db(describe(store, &p.tool, &p.args, now))?.digest();
+    if digest != Some(current.as_str()) {
+        return Err("This request changed since you read it (or was approved without being shown). It has been re-read; check it and approve again.".into());
     }
     let applied = apply(store, &p, now)?;
     if !db(store.decide_proposal(id, ProposalStatus::Approved, now))? {
@@ -590,7 +842,7 @@ fn apply(store: &mut Store, p: &Proposal, now: Millis) -> Res<Applied> {
                 .ok_or("no security mode seen")?;
             let entry = TrustedNetwork {
                 ssid: ssid.clone(),
-                known_bssid_hashes: c.hashes,
+                known_bssid_hashes: c.hashes(),
                 expected_security: expected,
             };
             let added = db(store.update_trusted_networks(|list| {
@@ -671,6 +923,25 @@ fn apply(store: &mut Store, p: &Proposal, now: Millis) -> Res<Applied> {
                 changed: true,
                 summary,
                 undo: json!({"op": "mineRemove", "kind": kind, "idHash": id_hash}),
+            })
+        }
+        "mine_remove" => {
+            let (kind, id_hash) = mine_args(&p.args).ok_or("malformed request")?;
+            let row = db(store.list_mine_with_source())?
+                .into_iter()
+                .find(|(m, _)| m.kind == kind && m.id_hash == id_hash);
+            let Some((entry, by)) = row else {
+                return Ok(Applied {
+                    changed: false,
+                    summary,
+                    undo: Value::Null,
+                });
+            };
+            db(store.remove_mine(kind, &id_hash))?;
+            Ok(Applied {
+                changed: true,
+                summary,
+                undo: json!({"op": "mineRestore", "entry": entry, "addedBy": by.as_str()}),
             })
         }
         "dismiss_alert" => {

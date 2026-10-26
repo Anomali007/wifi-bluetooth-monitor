@@ -30,8 +30,8 @@ mod views;
 
 pub use agent_queries::{OpenError, OpenMode, StoreCounts, BUSY_TIMEOUT};
 pub use proposals::{
-    AddedBy, AuditEntry, NewAudit, NewProposal, Proposal, ProposalStatus, MAX_PENDING_PROPOSALS,
-    PROPOSAL_TTL_MS,
+    AddedBy, AuditEntry, NewAudit, NewProposal, Proposal, ProposalStatus, MAX_PENDING_PER_TOOL,
+    MAX_PENDING_PROPOSALS, PROPOSAL_TTL_MS,
 };
 pub use settings_sync::STALE_SETTINGS;
 
@@ -1107,7 +1107,8 @@ impl Store {
                 Some((d.network_key.clone(), d.mac_hash.clone(), label))
             })
             .collect();
-        if !labels.is_empty() {
+        // No salt (an agent connection) means no way to hash hostnames: no hint.
+        if !labels.is_empty() && !self.salt.as_bytes().is_empty() {
             for d in out.iter_mut().filter(|d| !d.mine) {
                 let Some(host) = &d.hostname else { continue };
                 let hk = crate::lan::host_key(&self.salt, host);

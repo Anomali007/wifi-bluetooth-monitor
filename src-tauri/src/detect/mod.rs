@@ -315,7 +315,7 @@ fn fold_ssid(s: &str) -> String {
     let mut out = String::new();
     let mut pending_space = false;
     for c in s.chars() {
-        if matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}') || c.is_control() {
+        if crate::labels::is_unsafe_char(c) {
             continue;
         }
         if c.is_whitespace() {
@@ -372,7 +372,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-fn is_lookalike(observed: &str, trusted: &str) -> bool {
+pub fn is_lookalike(observed: &str, trusted: &str) -> bool {
     let (o, t) = (fold_ssid(observed), fold_ssid(trusted));
     if o.is_empty() || t.is_empty() {
         return false;

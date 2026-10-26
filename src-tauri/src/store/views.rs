@@ -73,6 +73,24 @@ impl Store {
             .collect())
     }
 
+    /// Distinct raw network names in the latest scan and on the trusted list (not folded, so
+    /// look-alike spellings stay separate), sorted.
+    pub fn known_ssids(&self) -> StoreResult<Vec<String>> {
+        let mut names: Vec<String> = self
+            .latest_scan()?
+            .map(|s| s.wifi.into_iter().filter_map(|o| o.ssid).collect())
+            .unwrap_or_default();
+        names.extend(
+            self.get_settings()?
+                .trusted_networks
+                .into_iter()
+                .map(|t| t.ssid),
+        );
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
     /// An active (not dismissed, recently seen) evil-twin or open-lookalike alert whose subject
     /// is this network name, found by the alert's subject hash, never by its text.
     pub fn active_ssid_alert(&self, ssid: &str, now: Millis) -> StoreResult<Option<AlertKind>> {

@@ -114,7 +114,9 @@ impl Store {
         match version {
             Some(v) if v >= SCHEMA_VERSION => Ok(Store {
                 conn,
-                // Never used: no agent code path hashes an identifier.
+                // Empty on purpose: `wbm` never reads the salt file and hashes nothing. The one store
+                // path that hashes (the possibly-the-same-device hint on LAN devices) is skipped
+                // when the salt is empty, so agents simply do not get that hint.
                 salt: Salt::from_bytes(Vec::new()),
             }),
             other => Err(OpenError::Unsupported(format!(

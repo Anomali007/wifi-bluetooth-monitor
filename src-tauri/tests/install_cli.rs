@@ -157,3 +157,16 @@ fn it_rejects_unknown_options() {
     assert_eq!(o.status.code(), Some(2));
     assert!(!d.path().join("bin").exists(), "nothing was created");
 }
+
+#[test]
+fn it_replaces_in_one_rename_with_no_moment_when_nothing_is_installed() {
+    let text = fs::read_to_string(script()).unwrap();
+    // The destination is replaced by `mv -f` over it; it is never removed first.
+    assert!(text.contains("mv -f \"$tmp\" \"$dest\""));
+    assert!(
+        !text.contains("rm -f \"$dest\""),
+        "an rm of the destination opens a gap"
+    );
+    // NEGATIVE CONTROL: the temp file IS removed (that is not the destination).
+    assert!(text.contains("rm -f \"$tmp\""));
+}

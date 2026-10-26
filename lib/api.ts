@@ -7,7 +7,7 @@
  * normal build the branch is dead code and the mock module is not bundled.
  */
 import type {
-  AgentAuditEntry,
+  AgentAuditPage,
   AgentDecision,
   AgentProposal,
   HelperStatus,
@@ -140,13 +140,16 @@ export const openLoginItems = () => call<void>("open_login_items");
 /** Changes an agent asked for that wait for a person. Stale ones are expired first. */
 export const listAgentProposals = () => call<AgentProposal[]>("list_agent_proposals");
 
-/** Approve (re-validated against current data, then applied) or reject one request. */
-export const decideAgentProposal = (id: number, approve: boolean) =>
-  call<AgentDecision>("decide_agent_proposal", { id, approve });
+/**
+ * Approve or reject one request. Approval needs the `digest` of the request as it was shown:
+ * the app recomputes it, refuses when it differs, then re-validates and applies.
+ */
+export const decideAgentProposal = (id: number, approve: boolean, digest: string | null = null) =>
+  call<AgentDecision>("decide_agent_proposal", { id, approve, digest });
 
-/** Changes agents made (directly, or approved), newest first. */
+/** Changes agents made: direct, not-undone ones pinned first, then newest first. */
 export const listAgentAudit = (limit?: number) =>
-  call<AgentAuditEntry[]>("list_agent_audit", { limit: limit ?? null });
+  call<AgentAuditPage>("list_agent_audit", { limit: limit ?? null });
 
 /** One-click undo of an audited agent change. */
 export const undoAgentChange = (id: number) => call<void>("undo_agent_change", { id });

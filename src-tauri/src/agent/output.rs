@@ -8,14 +8,15 @@
 //! - caps their length (SSID 32 bytes, hostname 63, services 16 entries of 64 bytes, ...),
 //! - for machine consumers (`--json`, MCP) wraps each one as `{"untrusted": "..."}` so the
 //!   data/instruction boundary is in the structure itself, and
-//! - caps the whole response at [`MAX_RESPONSE_BYTES`], dropping rows from the longest list
+//! - caps the whole response at [`MAX_RESPONSE_BYTES`] (128 KB: an MCP result carries the JSON
+//!   twice, as structured content and as a text copy, so the wire stays under 256 KB), dropping rows from the longest list
 //!   and saying so with `"truncated": true`.
 
 use crate::labels::clean;
 use serde_json::{json, Map, Value};
 
 /// A response larger than this is cut down (and flagged), whatever the tool.
-pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+pub const MAX_RESPONSE_BYTES: usize = 128 * 1024;
 
 /// Fields whose text comes from other people's devices (or from an agent), with their length
 /// cap in bytes. Matching is by key name anywhere in the result.
@@ -29,6 +30,7 @@ pub const TEXT_FIELDS: &[(&str, usize)] = &[
     ("detail", 600),
     ("label", 64),
     ("pattern", 64),
+    ("possiblySameAs", 64),
 ];
 
 /// List-valued fields: (key, most entries, longest entry in bytes).

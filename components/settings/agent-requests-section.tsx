@@ -11,6 +11,8 @@ import { AGENT_REQUESTS_ID, expiresIn, toolLabel } from "@/lib/agent-requests";
 import { formatDateTime } from "@/lib/format";
 import type { AgentAuditEntry, AgentProposal } from "@/lib/types";
 
+const PAGE = 30;
+
 const BTN = "rounded-md border px-3 py-1 text-sm disabled:opacity-50";
 
 /**
@@ -22,6 +24,8 @@ const BTN = "rounded-md border px-3 py-1 text-sm disabled:opacity-50";
 export default function AgentRequestsSection() {
   const [pending, setPending] = useState<AgentProposal[] | null>(null);
   const [audit, setAudit] = useState<AgentAuditEntry[]>([]);
+  const [auditTotal, setAuditTotal] = useState(0);
+  const [shown, setShown] = useState(PAGE);
   const [busy, setBusy] = useState<number | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -29,14 +33,15 @@ export default function AgentRequestsSection() {
 
   const load = useCallback(
     () =>
-      Promise.all([listAgentProposals(), listAgentAudit(30)])
+      Promise.all([listAgentProposals(), listAgentAudit(shown)])
         .then(([p, a]) => {
           setPending(p);
-          setAudit(a);
+          setAudit(a.entries);
+          setAuditTotal(a.total);
           setNow(Date.now());
         })
         .catch(() => setPending((cur) => cur ?? [])),
-    [],
+    [shown],
   );
 
   useEffect(() => {
@@ -45,12 +50,12 @@ export default function AgentRequestsSection() {
     return () => clearInterval(t);
   }, [load]);
 
-  async function decide(id: number, approve: boolean) {
-    setBusy(id);
+  async function decide(p: AgentProposal, approve: boolean) {
+    setBusy(p.id);
     setError(null);
     setNote(null);
     try {
-      const d = await decideAgentProposal(id, approve);
+      const d = await decideAgentProposal(p.id, approve, approve ? p.digest : null);
       setNote(d.message);
     } catch (e) {
       // A refusal (the data changed since the request was made) stays on the list with its reason.
@@ -123,14 +128,14 @@ export default function AgentRequestsSection() {
                 <button
                   className={`${BTN} bg-primary text-primary-foreground`}
                   disabled={busy !== null}
-                  onClick={() => void decide(p.id, true)}
+                  onClick={() => void decide(p, true)}
                 >
                   Approve
                 </button>
                 <button
                   className={BTN}
                   disabled={busy !== null}
-                  onClick={() => void decide(p.id, false)}
+                  onClick={() => void decide(p, false)}
                 >
                   Reject
                 </button>
@@ -151,6 +156,11 @@ export default function AgentRequestsSection() {
               className="flex flex-wrap items-center justify-between gap-2 text-sm"
             >
               <span className={a.undone ? "text-muted-foreground line-through" : undefined}>
+                {a.via === "direct" && !a.undone && (
+                  <span className="mr-1 rounded bg-amber-100 px-1 text-xs text-amber-900">
+                    applied without asking
+                  </span>
+                )}
                 {a.summary}{" "}
                 <span className="text-xs text-muted-foreground">
                   {formatDateTime(a.at)} · agent
@@ -171,6 +181,14 @@ export default function AgentRequestsSection() {
             </li>
           ))}
         </ul>
+      )}
+      {auditTotal > audit.length && (
+        <p className="text-sm text-muted-foreground">
+          {auditTotal - audit.length} more.{" "}
+          <button className="underline" onClick={() => setShown((n) => n + PAGE)}>
+            Show more
+          </button>
+        </p>
       )}
     </section>
   );

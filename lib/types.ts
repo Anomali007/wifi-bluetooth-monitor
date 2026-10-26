@@ -305,6 +305,9 @@ export interface AgentProposal {
   summary: string;
   warnings: string[];
   blocked: string | null;
+  /** What this request describes, hashed. Approve sends it back; if the situation changed
+   * since it was read the app refuses and the request must be read again. */
+  digest: string;
 }
 
 /** One change an agent made (applied directly, or approved by a person). */
@@ -317,6 +320,13 @@ export interface AgentAuditEntry {
   proposalId: number | null;
   summary: string;
   undone: boolean;
+}
+
+/** A page of the audit log: direct, not-undone changes first (pinned), then newest first. */
+export interface AgentAuditPage {
+  entries: AgentAuditEntry[];
+  total: number;
+  pinned: number;
 }
 
 export interface AgentDecision {

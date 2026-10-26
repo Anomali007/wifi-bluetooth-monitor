@@ -17,6 +17,7 @@ use crate::model::{
 /// SSID entries: `Exact` is equality after folding (case, whitespace, look-alike characters),
 /// never edit distance, so "King" does not match "Kind", "Ring" or "Kong". `Contains` is a
 /// substring on raw lowercase or folded text. A blank pattern never matches (an empty substring matches everything).
+#[cfg(test)]
 fn ssid_matches(entry: &WatchlistEntry, ssid: &str) -> bool {
     let pat = entry.pattern.trim();
     if pat.is_empty() {
@@ -31,6 +32,38 @@ fn ssid_matches(entry: &WatchlistEntry, ssid: &str) -> bool {
             ssid.to_lowercase().contains(&pat.to_lowercase()) || {
                 let (f, p) = (fold_ssid(ssid), fold_ssid(pat));
                 !p.is_empty() && f.contains(&p)
+            }
+        }
+    }
+}
+
+/// A rule with its pattern folded once per evaluation, not once per observation.
+struct Prepared<'a> {
+    entry: &'a WatchlistEntry,
+    lower: String,
+    folded: String,
+}
+
+impl<'a> Prepared<'a> {
+    fn new(entry: &'a WatchlistEntry) -> Self {
+        let pat = entry.pattern.trim();
+        Prepared {
+            entry,
+            lower: pat.to_lowercase(),
+            folded: fold_ssid(pat),
+        }
+    }
+
+    /// [`ssid_matches`] with the pattern already folded and the SSID folded once by the caller.
+    fn ssid_hit(&self, ssid_lower: &str, ssid_folded: &str) -> bool {
+        if self.lower.is_empty() {
+            return false;
+        }
+        match self.entry.match_mode {
+            WatchMatch::Exact => !self.folded.is_empty() && ssid_folded == self.folded,
+            WatchMatch::Contains => {
+                ssid_lower.contains(&self.lower)
+                    || (!self.folded.is_empty() && ssid_folded.contains(&self.folded))
             }
         }
     }
@@ -66,11 +99,15 @@ pub(super) fn watchlist(
     if ctx.watchlist.is_empty() {
         return;
     }
+    let rules: Vec<Prepared> = ctx.watchlist.iter().map(Prepared::new).collect();
     for scan in &history.scans {
         for o in scan.wifi.iter().filter(|o| !is_mine(ctx, o)) {
-            for entry in &ctx.watchlist {
+            // Fold this observation's name once, however many rules there are.
+            let name = named(o).map(|s| (s.to_lowercase(), fold_ssid(s)));
+            for rule in &rules {
+                let entry = rule.entry;
                 let hit = match entry.kind {
-                    WatchKind::Ssid => named(o).is_some_and(|s| ssid_matches(entry, s)),
+                    WatchKind::Ssid => name.as_ref().is_some_and(|(l, f)| rule.ssid_hit(l, f)),
                     WatchKind::Vendor => o
                         .vendor
                         .as_deref()
@@ -416,5 +453,50 @@ mod tests {
         let v = entry(2, WatchKind::Vendor, "Vendor-A", WatchMatch::Exact);
         assert!(run(&h, vec![s], vec![], true).is_empty());
         assert_eq!(run(&h, vec![v], vec![], true).len(), 1);
+    }
+
+    #[test]
+    fn prefolded_rules_match_exactly_what_the_plain_matcher_matches() {
+        let names = [
+            "Net-A",
+            "net-a",
+            "N\u{435}t-A",
+            "Net\u{200B}-A",
+            "Cafe Guest",
+            "King",
+            "Kind",
+            "",
+        ];
+        let pats = [
+            "net-a",
+            "Net-A",
+            "king",
+            " Cafe  guest ",
+            "",
+            "n\u{435}t-a",
+            "x",
+        ];
+        let mut checked = 0;
+        for mode in [WatchMatch::Exact, WatchMatch::Contains] {
+            for p in pats {
+                let entry = WatchlistEntry {
+                    id: 1,
+                    kind: WatchKind::Ssid,
+                    pattern: p.into(),
+                    match_mode: mode,
+                    added_at: 0,
+                };
+                let rule = Prepared::new(&entry);
+                for n in names {
+                    assert_eq!(
+                        rule.ssid_hit(&n.to_lowercase(), &fold_ssid(n)),
+                        ssid_matches(&entry, n),
+                        "{mode:?} {p:?} vs {n:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 7 * 8);
     }
 }

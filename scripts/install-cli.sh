@@ -61,8 +61,8 @@ tmp="$dest.tmp.$$"
 rm -f "$tmp"
 cp "$built" "$tmp"
 chmod 755 "$tmp"
-# Replace atomically; a symlink at $dest is replaced, never followed.
-rm -f "$dest"
+# Replace atomically (rename over it, no gap with nothing installed); a symlink at $dest is
+# replaced, never followed.
 mv -f "$tmp" "$dest"
 sha "$dest" > "$marker"
 

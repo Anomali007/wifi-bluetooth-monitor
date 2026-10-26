@@ -6,8 +6,10 @@
 //! - PROPOSAL tools (`trusted_add`, `trusted_remove`, `mine_add`, `dismiss_alert`,
 //!   `watchlist_remove`) are the edits that could hide an alert. They write a row to
 //!   `agent_proposals` and nothing else; a person approves it in the app. Only with `--edits`.
-//! - DIRECT edits (`watchlist_add`, `mine_remove`) can only add alerts, so they apply at once,
-//!   are recorded in the audit log, and are undoable in the app. Only with `--edits`.
+//! - DIRECT edits: `watchlist_add` (capped at 50 rules) and `mine_remove` of a row an agent
+//!   itself wrote apply at once, are recorded in the audit log, are rate-limited, and are
+//!   undoable in the app. Removing a Mine row a PERSON made is a proposal: it can lower a
+//!   protection (a spoofed look-alike could inherit the old device's history). Only with `--edits`.
 //!
 //! Starting a scan or a sweep and changing any setting have no row, no code path and no import
 //! in this module (`tests/agent_tools.rs` and `tests/agent_listen_only.rs` check both the table
@@ -19,7 +21,7 @@ use super::output;
 use super::{parse_since, status, AgentError, Ctx};
 use crate::labels::{mine_kind_label, quote};
 use crate::model::{Alert, Millis, MineKind, WatchKind, WatchMatch, WatchlistEntry};
-use crate::store::{NewAudit, NewProposal, OpenMode, Store};
+use crate::store::{AddedBy, NewAudit, NewProposal, OpenMode, Store};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -33,7 +35,7 @@ pub enum Access {
     Read,
     /// Applies one addition at once (it can only add detail or alerts). Needs `--edits`.
     Add,
-    /// Applies one removal at once that can only add alerts. Needs `--edits`.
+    /// Applies one removal at once. Needs `--edits`.
     Remove,
     /// Records a proposal; a person approves it in the app. Needs `--edits`.
     Propose,
@@ -389,7 +391,7 @@ static SPECS: [ToolSpec; 17] = [
                 json!({
                     "kind": {"type": "string", "enum": ["wifiAp", "wifiGroup", "ble", "lan"], "description": "What the hash identifies."},
                     "idHash": {"type": "string", "description": "64-character lowercase hex hash from a read tool."},
-                    "label": {"type": "string", "description": "Optional short name, up to 64 characters."}
+                    "label": {"type": "string", "description": "Optional short name, up to 64 bytes."}
                 }),
                 &["kind", "idHash"],
             )
@@ -398,11 +400,14 @@ static SPECS: [ToolSpec; 17] = [
     },
     ToolSpec {
         name: "mine_remove",
-        description: "Remove a device from Mine (same kind and idHash as mine_add). Applies at \
-            once, because it can only make alerts fire again, and is recorded in the audit log \
-            where a person can undo it. Removing something that is not there succeeds with \
-            removed false.",
-        access: Access::Remove,
+        description: "Remove a device from Mine (same kind and idHash as mine_add). Removing a \
+            Mine entry a person made or approved is a PROPOSAL, because it lowers a protection \
+            (alerts return, and a look-alike device could inherit the old one's history): this \
+            does NOT remove it, it records a request and returns proposalId with status \
+            pending, which a person approves in the app (Settings, Agent requests). Only an \
+            entry an agent itself wrote is removed at once (audited, undoable, rate-limited). \
+            Removing something that is not there succeeds with removed false.",
+        access: Access::Propose,
         schema: || {
             schema(
                 json!({
@@ -466,15 +471,16 @@ static SPECS: [ToolSpec; 17] = [
         name: "watchlist_add",
         description: "Add a watchlist rule: alert when a Wi-Fi name (kind ssid) or hardware \
             vendor (kind vendor) matching `pattern` is nearby. match is exact or contains \
-            (default contains). Applies at once, because a rule can only add alerts, and is \
-            recorded in the audit log where a person can undo it. The same rule twice is not \
-            an error (added false).",
+            (default contains). Applies at once, because a rule only adds alerts; at most 50 rules \
+            exist, direct agent edits are limited to 10 per hour, and each is recorded in the \
+            audit log where a person can undo it. The same rule twice is not an error (added \
+            false).",
         access: Access::Add,
         schema: || {
             schema(
                 json!({
                     "kind": {"type": "string", "enum": ["ssid", "vendor"]},
-                    "pattern": {"type": "string", "description": "1 to 64 characters."},
+                    "pattern": {"type": "string", "description": "1 to 64 bytes."},
                     "match": {"type": "string", "enum": ["exact", "contains"], "description": "Default contains."}
                 }),
                 &["kind", "pattern"],
@@ -562,9 +568,10 @@ fn propose(ctx: &Ctx, store: &mut Store, tool: &str, args: Value) -> ToolResult 
                 (Settings, Agent requests). Nothing has changed."
         })),
         NewProposal::TooMany => Err(AgentError::Failed(format!(
-            "{} requests are already waiting for approval; ask the user to review them in the \
-             app (Settings, Agent requests) before proposing more",
-            crate::store::MAX_PENDING_PROPOSALS
+            "too many requests are already waiting for approval (at most {} in all, {} per tool); \
+             ask the user to review them in the app (Settings, Agent requests) before proposing more",
+            crate::store::MAX_PENDING_PROPOSALS,
+            crate::store::MAX_PENDING_PER_TOOL
         ))),
     }
 }
@@ -731,9 +738,9 @@ fn is_hash(s: &str) -> bool {
 
 fn clean_text(what: &str, s: &str, max: usize) -> Result<String, AgentError> {
     let t = s.trim();
-    if t.is_empty() || t.chars().count() > max || crate::labels::strip_unsafe(t) != t {
+    if t.is_empty() || t.len() > max || crate::labels::strip_unsafe(t) != t {
         return Err(AgentError::Usage(format!(
-            "{what} must be 1 to {max} printable characters (no control or invisible characters)"
+            "{what} must be 1 to {max} bytes of printable text (no control or invisible characters)"
         )));
     }
     Ok(t.to_string())
@@ -788,6 +795,21 @@ fn tool_mine_add(ctx: &Ctx, a: &Args) -> ToolResult {
     propose(ctx, &mut store, "mine_add", args)
 }
 
+/// Most rules the watchlist may hold; beyond it `watchlist_add` refuses.
+const MAX_WATCHLIST_RULES: usize = 50;
+/// Most direct (unreviewed) agent edits per rolling hour.
+const MAX_DIRECT_EDITS_PER_HOUR: usize = 10;
+
+fn check_direct_rate(store: &Store, now: Millis) -> Result<(), AgentError> {
+    if store.count_direct_edits_since(now - 3_600_000)? >= MAX_DIRECT_EDITS_PER_HOUR {
+        return Err(AgentError::Failed(format!(
+            "too many direct edits in the last hour (limit {MAX_DIRECT_EDITS_PER_HOUR}); a person \
+             can review them under Settings, Agent requests"
+        )));
+    }
+    Ok(())
+}
+
 fn tool_mine_remove(ctx: &Ctx, a: &Args) -> ToolResult {
     let (kind, id_hash) = mine_args(a)?;
     let mut store = open_edit(ctx)?;
@@ -798,9 +820,20 @@ fn tool_mine_remove(ctx: &Ctx, a: &Args) -> ToolResult {
     let Some((entry, by)) = row else {
         return Ok(json!({"removed": false}));
     };
+    if by != AddedBy::Agent {
+        // A person's mark: dropping it lowers a protection, so a person decides.
+        return propose(
+            ctx,
+            &mut store,
+            "mine_remove",
+            json!({"kind": kind, "idHash": id_hash}),
+        );
+    }
+    let now = (ctx.now)();
+    check_direct_rate(&store, now)?;
     store.remove_mine(kind, &id_hash)?;
     let summary = format!(
-        "Removed a {} from Mine{}.",
+        "Removed a {} that an agent had marked from Mine{}.",
         mine_kind_label(kind),
         entry
             .label
@@ -809,7 +842,7 @@ fn tool_mine_remove(ctx: &Ctx, a: &Args) -> ToolResult {
             .unwrap_or_default()
     );
     store.record_audit(&NewAudit {
-        at: (ctx.now)(),
+        at: now,
         tool: "mine_remove",
         via: "direct",
         proposal_id: None,
@@ -875,6 +908,12 @@ fn tool_watchlist_add(ctx: &Ctx, a: &Args) -> ToolResult {
         return Ok(json!({"added": false, "watch": w}));
     }
     let now: Millis = (ctx.now)();
+    if store.list_watchlist()?.len() >= MAX_WATCHLIST_RULES {
+        return Err(AgentError::Failed(format!(
+            "the watchlist already has {MAX_WATCHLIST_RULES} rules; a person can remove some in Settings"
+        )));
+    }
+    check_direct_rate(&store, now)?;
     let w = store.add_watchlist(kind, &pattern, mode, now)?;
     let summary = format!(
         "Added a watchlist rule: {} {} {}.",

@@ -24,7 +24,7 @@ use crate::model::{
     Settings, WatchKind, WatchMatch, WatchlistEntry, EVENT_ALERT, EVENT_SCAN,
 };
 use crate::pipeline;
-use crate::proposals::{self, AuditView, Decision, ProposalView};
+use crate::proposals::{self, AuditPage, Decision, ProposalView};
 use crate::store::Store;
 use crate::{ble, wifi};
 
@@ -389,9 +389,16 @@ pub async fn decide_agent_proposal(
     state: State<'_, AppState>,
     id: i64,
     approve: bool,
+    digest: Option<String>,
 ) -> Result<Decision, String> {
     let mut store = state.store.lock().map_err(lock_err)?;
-    proposals::decide(&mut store, id, approve, pipeline::now_ms())
+    proposals::decide(
+        &mut store,
+        id,
+        approve,
+        digest.as_deref(),
+        pipeline::now_ms(),
+    )
 }
 
 /// Changes agents made (applied directly, or approved), newest first.
@@ -399,9 +406,9 @@ pub async fn decide_agent_proposal(
 pub async fn list_agent_audit(
     state: State<'_, AppState>,
     limit: Option<usize>,
-) -> Result<Vec<AuditView>, String> {
+) -> Result<AuditPage, String> {
     let store = state.store.lock().map_err(lock_err)?;
-    proposals::list_audit(&store, limit.unwrap_or(50).min(200))
+    proposals::list_audit_page(&store, limit.unwrap_or(30).min(500))
 }
 
 /// One-click undo of an audited agent change.

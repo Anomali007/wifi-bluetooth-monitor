@@ -12,6 +12,7 @@
 import type { CommandName } from "./api";
 import type {
   AgentAuditEntry,
+  AgentAuditPage,
   AgentDecision,
   AgentProposal,
   Alert,
@@ -412,6 +413,7 @@ let proposals: AgentProposal[] = [
     expiresAt: Date.now() - 20 * 60_000 + DAY_MS,
     summary: "Trust network \u201CNet-A\u201D: 2 access points seen, WPA2 and WPA3.",
     warnings: ["\u26A0 an evil-twin alert for this name is active."],
+    digest: "d1",
     blocked:
       "This name appears with 2 security modes in the latest scan (WPA2 and WPA3). That is what an evil twin looks like. Check it, then use Trust on the Networks page.",
   },
@@ -426,6 +428,7 @@ let proposals: AgentProposal[] = [
       "\u26A0 this is the Wi-Fi network this Mac is joined to. Marking it as yours is what lets the opt-in LAN sweep run on it (the sweep is off in Settings).",
     ],
     blocked: null,
+    digest: "d2",
   },
 ];
 let agentAudit: AgentAuditEntry[] = [
@@ -633,6 +636,11 @@ export async function mockInvoke<T>(
       const p = proposals.find((x) => x.id === id);
       if (!p) return Promise.reject("That request no longer exists.");
       if (args?.approve) {
+        // Approve only what was read: the digest must match, like the Rust side.
+        if (args?.digest !== p.digest)
+          return Promise.reject(
+            "This request changed since you read it (or was approved without being shown). It has been re-read; check it and approve again.",
+          );
         // Approval re-validates: a blocked request is refused and stays listed.
         if (p.blocked) return Promise.reject(p.blocked);
         agentAudit = [
@@ -655,8 +663,16 @@ export async function mockInvoke<T>(
         : { status: "rejected", changed: false, message: "Rejected. Nothing changed." };
       return d as T;
     }
-    case "list_agent_audit":
-      return agentAudit.slice(0, Number(args?.limit ?? 50)).map((a) => ({ ...a })) as T;
+    case "list_agent_audit": {
+      const pinned = (a: AgentAuditEntry) => a.via === "direct" && !a.undone;
+      const ordered = [...agentAudit.filter(pinned), ...agentAudit.filter((a) => !pinned(a))];
+      const page: AgentAuditPage = {
+        entries: ordered.slice(0, Number(args?.limit ?? 30)).map((a) => ({ ...a })),
+        total: agentAudit.length,
+        pinned: agentAudit.filter(pinned).length,
+      };
+      return page as T;
+    }
     case "undo_agent_change": {
       const a = agentAudit.find((x) => x.id === Number(args?.id));
       if (!a) return Promise.reject("That entry no longer exists.");

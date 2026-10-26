@@ -453,6 +453,7 @@ const ALLOWED_STORE_METHODS: &[&str] = &[
     "ssid_subject_names",
     // the proposal inbox and the audit log
     "create_proposal",
+    "count_direct_edits_since",
     "record_audit",
     // the two direct edits (they can only add alerts)
     "add_watchlist",

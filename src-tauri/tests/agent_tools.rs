@@ -88,7 +88,10 @@ fn app(f: &common::Fixture) -> Store {
 
 /// A person clicks Approve (or Reject) in the app: the Rust function the Tauri command calls.
 fn decide(f: &common::Fixture, id: i64, approve: bool) -> Result<proposals::Decision, String> {
-    proposals::decide(&mut app(f), id, approve, app_lib::pipeline::now_ms())
+    let now = app_lib::pipeline::now_ms();
+    // What the UI does: read the request (its digest), then approve exactly that.
+    let digest = proposals::current_digest(&mut app(f), id, now).ok();
+    proposals::decide(&mut app(f), id, approve, digest.as_deref(), now)
 }
 
 /// Propose through the tool and return the proposal id, asserting nothing was applied.
@@ -408,7 +411,7 @@ fn mine_add_refuses_raw_identifiers_and_unseen_hashes() {
 }
 
 #[test]
-fn mine_add_is_a_proposal_and_mine_remove_applies_directly_for_every_kind() {
+fn mine_add_and_mine_remove_of_a_persons_row_are_proposals_for_every_kind() {
     let f = fixture();
     let nets = ok(&f, "networks", json!({}));
     let ap = nets["networks"][0]["bssidHash"]
@@ -459,11 +462,27 @@ fn mine_add_is_a_proposal_and_mine_remove_applies_directly_for_every_kind() {
     // The read tools now say so.
     assert_eq!(ok(&f, "networks", json!({}))["networks"][0]["mine"], true);
     assert_eq!(ok(&f, "lan_devices", json!({}))["devices"][0]["mine"], true);
+    // Removing a row a PERSON approved is a proposal too: it lowers a protection.
+    let mut removals = Vec::new();
     for (kind, hash) in kinds {
-        assert_eq!(
-            ok(&f, "mine_remove", json!({"kind": kind, "idHash": hash}))["removed"],
-            true
-        );
+        removals.push(propose(
+            &f,
+            "mine_remove",
+            json!({"kind": kind, "idHash": hash}),
+        ));
+    }
+    assert_eq!(
+        ok(&f, "mine_list", json!({}))["mine"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4,
+        "nothing is removed until a person approves"
+    );
+    for id in removals {
+        assert!(decide(&f, id, true).unwrap().changed);
+    }
+    for (kind, hash) in kinds {
         assert_eq!(
             ok(&f, "mine_remove", json!({"kind": kind, "idHash": hash}))["removed"],
             false
@@ -473,12 +492,11 @@ fn mine_add_is_a_proposal_and_mine_remove_applies_directly_for_every_kind() {
         .as_array()
         .unwrap()
         .is_empty());
-    // Four approved additions and four direct removals, all attributed to the agent.
+    // Four approved additions and four approved removals, all attributed to the agent.
     let audit = app(&f).list_audit(50).unwrap();
     assert_eq!(audit.len(), 8);
     assert!(audit.iter().all(|a| a.added_by == "agent"));
-    assert_eq!(audit.iter().filter(|a| a.via == "proposal").count(), 4);
-    assert_eq!(audit.iter().filter(|a| a.via == "direct").count(), 4);
+    assert_eq!(audit.iter().filter(|a| a.via == "proposal").count(), 8);
 }
 
 #[test]
@@ -768,12 +786,12 @@ fn access_classes_match_the_edit_allowlist() {
     );
     for s in tools::specs() {
         match s.name {
-            // The edits that could hide an alert are proposals.
-            "dismiss_alert" | "mine_add" | "trusted_add" | "trusted_remove"
+            // The edits that could hide an alert or lower a protection are proposals
+            // (mine_remove applies directly only to a row an agent itself wrote).
+            "dismiss_alert" | "mine_add" | "mine_remove" | "trusted_add" | "trusted_remove"
             | "watchlist_remove" => assert_eq!(s.access, Access::Propose, "{}", s.name),
-            // The edits that can only add alerts apply directly.
+            // Adding a rule only adds alerts (and is capped and rate-limited).
             "watchlist_add" => assert_eq!(s.access, Access::Add),
-            "mine_remove" => assert_eq!(s.access, Access::Remove),
             _ => assert_eq!(s.access, Access::Read),
         }
     }

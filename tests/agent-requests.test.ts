@@ -72,28 +72,36 @@ describe("mock backend: proposals, decisions, audit, undo", () => {
 
   it("approving a blocked request is refused and it stays listed", async () => {
     const blocked = (await listAgentProposals()).find((p) => p.blocked)!;
-    await expect(decideAgentProposal(blocked.id, true)).rejects.toMatch(/security modes/);
+    await expect(decideAgentProposal(blocked.id, true, blocked.digest)).rejects.toMatch(
+      /security modes/,
+    );
     expect((await listAgentProposals()).some((p) => p.id === blocked.id)).toBe(true);
   });
 
   it("rejecting clears it without an audit entry; approving applies, audits and can be undone", async () => {
-    const before = (await listAgentAudit()).length;
+    const before = (await listAgentAudit()).total;
     const blocked = (await listAgentProposals()).find((p) => p.blocked)!;
     const r = await decideAgentProposal(blocked.id, false);
     expect(r).toMatchObject({ status: "rejected", changed: false });
-    expect((await listAgentAudit()).length).toBe(before);
+    expect((await listAgentAudit()).total).toBe(before);
 
     const ok = (await listAgentProposals())[0];
-    const d = await decideAgentProposal(ok.id, true);
+    // Approving without the digest the person was shown, or with a stale one, is refused.
+    await expect(decideAgentProposal(ok.id, true)).rejects.toMatch(/changed since you read it/);
+    await expect(decideAgentProposal(ok.id, true, "stale")).rejects.toMatch(/changed since/);
+    const d = await decideAgentProposal(ok.id, true, ok.digest);
     expect(d).toMatchObject({ status: "approved", changed: true });
-    const audit = await listAgentAudit();
+    const audit = (await listAgentAudit(50)).entries;
     expect(audit.length).toBe(before + 1);
-    expect(audit[0]).toMatchObject({ addedBy: "agent", via: "proposal", undone: false });
-    await expect(decideAgentProposal(ok.id, true)).rejects.toMatch(/no longer exists/);
+    // The direct seed entry is pinned above the approved one.
+    expect(audit[0].via).toBe("direct");
+    const approved = audit.find((a) => a.proposalId === ok.id)!;
+    expect(approved).toMatchObject({ addedBy: "agent", via: "proposal", undone: false });
+    await expect(decideAgentProposal(ok.id, true, ok.digest)).rejects.toMatch(/no longer exists/);
 
-    await undoAgentChange(audit[0].id);
-    expect((await listAgentAudit())[0].undone).toBe(true);
-    await expect(undoAgentChange(audit[0].id)).rejects.toMatch(/already undone/);
+    await undoAgentChange(approved.id);
+    expect((await listAgentAudit(50)).entries.find((a) => a.id === approved.id)?.undone).toBe(true);
+    await expect(undoAgentChange(approved.id)).rejects.toMatch(/already undone/);
   });
 });
 
@@ -119,6 +127,16 @@ describe("mock backend: settings revision", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe("audit paging", () => {
+  it("pins direct, not-undone changes first and reports the total", async () => {
+    const page = await listAgentAudit(1);
+    expect(page.entries.length).toBe(1);
+    expect(page.total).toBeGreaterThan(1);
+    expect(page.pinned).toBeGreaterThanOrEqual(1);
+    expect(page.entries[0]).toMatchObject({ via: "direct", undone: false });
   });
 });
 
@@ -149,5 +167,8 @@ describe("the UI is wired", () => {
     expect(section).not.toMatch(/dangerouslySetInnerHTML|innerHTML/);
     // The webview decides; the page only ever calls the typed wrappers.
     expect(section).not.toMatch(/invoke\(/);
+    // Approve sends the digest of the request as it was shown.
+    expect(section).toContain("p.digest");
+    expect(section).toContain("Show more");
   });
 });

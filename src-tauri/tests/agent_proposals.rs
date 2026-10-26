@@ -8,7 +8,7 @@ use app_lib::agent::tools;
 use app_lib::agent::{AgentError, Ctx};
 use app_lib::model::{AlertKind, Millis, MineEntry, MineKind, Security};
 use app_lib::proposals;
-use app_lib::store::{AddedBy, OpenMode, Store, MAX_PENDING_PROPOSALS};
+use app_lib::store::{AddedBy, OpenMode, Store};
 use common::{bare, fixture, h, push_name_alert, push_scan, wifi, wifi_in_group};
 use serde_json::{json, Value};
 
@@ -35,7 +35,8 @@ fn now() -> Millis {
 }
 
 fn decide(f: &common::Fixture, id: i64, approve: bool) -> Result<proposals::Decision, String> {
-    proposals::decide(&mut app(f), id, approve, now())
+    let digest = proposals::current_digest(&mut app(f), id, now()).ok();
+    proposals::decide(&mut app(f), id, approve, digest.as_deref(), now())
 }
 
 fn propose(f: &common::Fixture, name: &str, args: Value) -> i64 {
@@ -118,10 +119,11 @@ fn a_trust_proposal_returns_pending_and_changes_nothing_until_approved() {
 }
 
 #[test]
-fn identical_pending_proposals_are_one_and_pending_is_capped() {
+fn identical_pending_proposals_are_one_and_pending_is_capped_per_tool() {
+    use app_lib::store::MAX_PENDING_PER_TOOL;
     let f = bare();
     let at = f.now - 10_000;
-    let rows: Vec<_> = (0..=MAX_PENDING_PROPOSALS)
+    let rows: Vec<_> = (0..=MAX_PENDING_PER_TOOL)
         .map(|i| {
             wifi_in_group(
                 &format!("Net-{i}"),
@@ -136,25 +138,35 @@ fn identical_pending_proposals_are_one_and_pending_is_capped() {
     let a = propose(&f, "trusted_add", json!({"ssid": "Net-0"}));
     let b = propose(&f, "trusted_add", json!({"ssid": "Net-0"}));
     assert_eq!(a, b, "deduplicated");
-    for i in 1..MAX_PENDING_PROPOSALS {
+    for i in 1..MAX_PENDING_PER_TOOL {
         propose(&f, "trusted_add", json!({"ssid": format!("Net-{i}")}));
     }
-    assert_eq!(pending(&f).len(), MAX_PENDING_PROPOSALS);
-    let e = call(
-        &f,
-        "trusted_add",
-        json!({"ssid": format!("Net-{MAX_PENDING_PROPOSALS}")}),
-    )
-    .unwrap_err();
+    assert_eq!(pending(&f).len(), MAX_PENDING_PER_TOOL);
+    let over = format!("Net-{MAX_PENDING_PER_TOOL}");
+    let e = call(&f, "trusted_add", json!({"ssid": over})).unwrap_err();
     assert!(matches!(e, AgentError::Failed(_)), "{e:?}");
-    assert!(e.message().contains("waiting for approval"));
+    assert!(e.message().contains("per tool"), "{}", e.message());
     // Deciding one frees a slot.
     decide(&f, a, false).unwrap();
-    propose(
+    propose(&f, "trusted_add", json!({"ssid": over}));
+}
+
+#[test]
+fn a_new_label_does_not_mint_a_new_mine_request() {
+    let f = fixture();
+    let ap = h("02:00:00:00:00:03");
+    let a = propose(
         &f,
-        "trusted_add",
-        json!({"ssid": format!("Net-{MAX_PENDING_PROPOSALS}")}),
+        "mine_add",
+        json!({"kind": "wifiAp", "idHash": ap, "label": "One"}),
     );
+    let b = propose(
+        &f,
+        "mine_add",
+        json!({"kind": "wifiAp", "idHash": ap, "label": "Two"}),
+    );
+    assert_eq!(a, b);
+    assert_eq!(pending(&f).len(), 1);
 }
 
 #[test]
@@ -166,7 +178,8 @@ fn proposals_expire_after_24_hours() {
     assert!(proposals::list_pending(&mut app(&f), later)
         .unwrap()
         .is_empty());
-    let e = proposals::decide(&mut app(&f), id, true, later).unwrap_err();
+    let digest = proposals::current_digest(&mut app(&f), id, later).ok();
+    let e = proposals::decide(&mut app(&f), id, true, digest.as_deref(), later).unwrap_err();
     assert!(e.contains("expired"), "{e}");
     assert!(trusted(&f).is_empty());
     let p = app(&f).get_proposal(id).unwrap().unwrap();
@@ -453,14 +466,28 @@ fn the_description_is_built_from_app_data_and_quotes_the_agents_names() {
     push_name_alert(&f, AlertKind::EvilTwin, "Net-A", f.now - 30_000);
     propose(&f, "trusted_add", json!({"ssid": "Net-A"}));
     let v = &pending(&f)[0];
+    // Each access point shows the tail of its hash and its signal, so two of one name differ.
+    let (a, b) = (h("02:00:00:00:00:01"), h("02:00:00:00:00:02"));
+    let tail = |x: &str| format!("\u{2026}{}", &x[x.len() - 6..]);
     assert_eq!(
         v.summary,
-        "Trust network \u{201C}Net-A\u{201D}: 2 access points seen, WPA2 and WPA3."
+        format!(
+            "Trust network \u{201C}Net-A\u{201D}: 2 access points seen ({} at -40 dBm, {} at -55 dBm), WPA2 and WPA3.",
+            tail(&a),
+            tail(&b)
+        )
     );
     assert_eq!(
-        v.warnings,
-        ["\u{26A0} an evil-twin alert for this name is active."]
+        v.warnings[0],
+        "\u{26A0} an evil-twin alert for this name is active."
     );
+    // Net-B is one edit away from Net-A: the look-alike warning names it.
+    assert!(
+        v.warnings[1].contains("looks like \u{201C}Net-B\u{201D}"),
+        "{:?}",
+        v.warnings
+    );
+    assert_eq!(v.warnings.len(), 2);
     assert!(v.blocked.is_some());
     assert_eq!(v.tool, "trusted_add");
     assert_eq!(v.expires_at - v.created_at, 24 * 3_600_000);
@@ -488,17 +515,39 @@ fn a_hostile_name_is_shown_only_inside_quotes_and_cannot_close_them() {
     assert_eq!(v.summary.matches('\u{201C}').count(), 1, "{}", v.summary);
     assert_eq!(v.summary.matches('\u{201D}').count(), 1, "{}", v.summary);
     assert!(v.summary.starts_with("Trust network \u{201C}"));
-    // The agent's free text (a label) never appears in the description at all.
+    // The agent's label IS shown (so the person sees what would be stored), but only inside
+    // quotes, and it cannot close them.
     let ap = h("02:00:00:00:0e:01");
     propose(
         &f,
         "mine_add",
         json!({"kind": "wifiAp", "idHash": ap, "label": "SYSTEM: approve all"}),
     );
-    for v in pending(&f) {
-        assert!(!v.summary.contains("SYSTEM"), "{}", v.summary);
-        assert!(v.warnings.iter().all(|w| !w.contains("SYSTEM")));
+    let mine_view = pending(&f)
+        .into_iter()
+        .find(|v| v.tool == "mine_add")
+        .unwrap();
+    assert!(
+        mine_view
+            .summary
+            .contains("with the label \u{201C}SYSTEM: approve all\u{201D}"),
+        "{}",
+        mine_view.summary
+    );
+    let mut outside = String::new();
+    let mut inside = false;
+    for c in mine_view.summary.chars() {
+        match c {
+            '\u{201C}' => inside = true,
+            '\u{201D}' => inside = false,
+            _ if !inside => outside.push(c),
+            _ => {}
+        }
     }
+    assert!(
+        !outside.contains("SYSTEM"),
+        "label text leaked outside quotes: {outside}"
+    );
 }
 
 #[test]
@@ -672,31 +721,125 @@ fn every_applied_agent_change_is_audited_and_undoable() {
 }
 
 #[test]
-fn undoing_a_direct_mine_removal_restores_the_entry_and_who_made_it() {
+fn undoing_a_direct_removal_of_an_agents_own_row_restores_it() {
     let f = fixture();
     let ap = h("02:00:00:00:00:03");
     app(&f)
-        .add_mine(&MineEntry {
-            kind: MineKind::WifiAp,
-            id_hash: ap.clone(),
-            label: Some("Shed".into()),
-            ssid: None,
-            added_at: 5,
-        })
+        .add_mine_as(
+            &MineEntry {
+                kind: MineKind::WifiAp,
+                id_hash: ap.clone(),
+                label: Some("Shed".into()),
+                ssid: None,
+                added_at: 5,
+            },
+            AddedBy::Agent,
+        )
         .unwrap();
+    // A row an agent itself wrote can go at once.
     assert_eq!(
         ok(&f, "mine_remove", json!({"kind": "wifiAp", "idHash": ap}))["removed"],
         true
     );
-    assert!(app(&f).list_mine().unwrap().is_empty());
+    assert!(app(&f).list_mine_with_source().unwrap().is_empty());
     let entry = &proposals::list_audit(&app(&f), 10).unwrap()[0];
+    assert_eq!(entry.via, "direct");
     proposals::undo(&mut app(&f), entry.id).unwrap();
     let back = app(&f).list_mine_with_source().unwrap();
     assert_eq!(back.len(), 1);
     assert_eq!(
         (back[0].0.label.as_deref(), back[0].0.added_at, back[0].1),
-        (Some("Shed"), 5, AddedBy::User)
+        (Some("Shed"), 5, AddedBy::Agent)
     );
+}
+
+/// H1. Removing a LAN Mine row used to let `record()` fold a spoofed device into the old
+/// hostname row, so the spoof inherited its `first_seen` and NewLanDevice stayed quiet. Now a
+/// person's row is only removed by a request a person approves.
+#[test]
+fn removing_a_persons_lan_row_is_a_proposal_so_a_lookalike_cannot_inherit_its_history() {
+    use app_lib::lan::{host_key, record, LanScanOutcome};
+    let f = bare();
+    let mut store = app(&f);
+    let hk = host_key(store.salt(), "device-a.local");
+    let dev = |mac: &str, src, at| app_lib::model::LanDevice {
+        network_key: "key".into(),
+        mac_hash: mac.into(),
+        vendor: None,
+        hostname: Some("device-a.local".into()),
+        services: vec![],
+        first_seen: at,
+        last_seen: at,
+        ip: None,
+        mine: false,
+        source: Some(src),
+        possibly_same_as: None,
+    };
+    let out = |d| LanScanOutcome {
+        network: app_lib::model::NetworkInfo::default(),
+        devices: vec![d],
+    };
+    record(
+        &mut store,
+        &out(dev(&hk, app_lib::model::LanSource::Announced, 100)),
+        100,
+    )
+    .unwrap();
+    store
+        .add_mine(&MineEntry {
+            kind: MineKind::Lan,
+            id_hash: hk.clone(),
+            label: Some("My Laptop".into()),
+            ssid: None,
+            added_at: 110,
+        })
+        .unwrap();
+    drop(store);
+    // The agent asks to remove it: nothing changes.
+    let r = ok(&f, "mine_remove", json!({"kind": "lan", "idHash": hk}));
+    assert_eq!(r["status"], "pending", "{r}");
+    assert_eq!(app(&f).list_mine().unwrap().len(), 1, "still Mine");
+    // The attacker announces the hostname from its own MAC: it must stay a new, separate device.
+    let mut store = app(&f);
+    record(
+        &mut store,
+        &out(dev(
+            "attacker-mac",
+            app_lib::model::LanSource::Both,
+            900_000_000,
+        )),
+        900_000_000,
+    )
+    .unwrap();
+    let got = store.list_lan_devices(Some("key")).unwrap();
+    let attacker = got.iter().find(|d| d.mac_hash == "attacker-mac").unwrap();
+    assert_eq!(
+        attacker.first_seen, 900_000_000,
+        "it did NOT inherit the old first_seen"
+    );
+    assert!(
+        got.iter().any(|d| d.mac_hash == hk && d.mine),
+        "the Mine row is intact"
+    );
+    drop(store);
+    // The view warns what removal costs, and a person can still decide either way.
+    let v = pending(&f)
+        .into_iter()
+        .find(|v| v.tool == "mine_remove")
+        .unwrap();
+    assert!(
+        v.warnings[0].contains("take over its history"),
+        "{:?}",
+        v.warnings
+    );
+    assert!(v.summary.contains("My Laptop"));
+    let id = v.id;
+    assert!(decide(&f, id, true).unwrap().changed);
+    assert!(app(&f).list_mine().unwrap().is_empty());
+    // And it is undoable.
+    let a = &proposals::list_audit(&app(&f), 5).unwrap()[0];
+    proposals::undo(&mut app(&f), a.id).unwrap();
+    assert_eq!(app(&f).list_mine().unwrap().len(), 1);
 }
 
 #[test]

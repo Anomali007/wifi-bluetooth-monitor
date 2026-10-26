@@ -22,7 +22,7 @@ Both call one tool table (`src-tauri/src/agent/tools.rs`), so they cannot offer 
 | You run | Tools served | What an agent can change |
 | --- | --- | --- |
 | `wbm mcp` | the **10 read tools** | nothing |
-| `wbm mcp --edits` | all **17** | it can *request* the five protective changes, and apply two safe ones directly |
+| `wbm mcp --edits` | all **17** | it can *request* the six protective changes, and apply two low-risk ones directly (capped and rate-limited) |
 
 The CLI works the same way: edit subcommands (`wbm trusted add`, `wbm watchlist add`, ...) are refused with exit code 2 unless you pass `--edits` (`wbm --edits trusted add Net-A`).
 
@@ -63,8 +63,8 @@ wbm --db /tmp/wbm-demo/store.sqlite3 networks
 | `mine_list` | read | what is marked as yours, and who marked it (`addedBy`) |
 | `trusted_list` | read | trusted networks |
 | `watchlist_list` | read | watchlist rules |
-| `watchlist_add` | edit, **direct** | adds a rule; can only add alerts; audited, undoable |
-| `mine_remove` | edit, **direct** | removes a Mine entry; can only make alerts fire again; audited, undoable |
+| `watchlist_add` | edit, **direct** | adds a rule (at most 50 rules; direct edits limited to 10 per hour); audited, undoable |
+| `mine_remove` | edit, **proposal** | request to remove a Mine entry a person made or approved (removing it lowers a protection: a look-alike device could inherit its history). Only an entry an agent itself wrote is removed at once (audited, undoable, rate-limited) |
 | `trusted_add` | edit, **proposal** | request to trust a network |
 | `trusted_remove` | edit, **proposal** | request to stop trusting a network |
 | `mine_add` | edit, **proposal** | request to mark a device as yours |
@@ -73,7 +73,7 @@ wbm --db /tmp/wbm-demo/store.sqlite3 networks
 
 Read tools never write (they use a SQLite read-only connection, so SQLite itself refuses a write) and never scan; they return what the app last stored.
 
-MCP annotations: read tools are `readOnlyHint: true`. Every **proposal** tool is `readOnlyHint: false, destructiveHint: true` (it asks to drop a protection). The direct edits are `readOnlyHint: false`; `mine_remove` is `destructiveHint: true`, `watchlist_add` is not.
+MCP annotations: read tools are `readOnlyHint: true`. Every **proposal** tool is `readOnlyHint: false, destructiveHint: true` (it asks to drop a protection). `watchlist_add`, the one direct edit, is `readOnlyHint: false, destructiveHint: false`.
 
 ### Never exposed, through the CLI or MCP
 
@@ -85,28 +85,33 @@ MCP annotations: read tools are `readOnlyHint: true`. Every **proposal** tool is
 
 `wbm` opens no network socket, starts no process, sends no signal (its one `kill(pid, 0)` is an existence check) and writes no file other than the SQLite store. These are checked by tests that scan the source (`tests/agent_listen_only.rs`, `tests/lan_listen_only.rs`), including a closed list of the `Store` methods `agent/` may call, and `tests/agent_tools.rs` asserts the tool list is exactly the table above.
 
+## What this design protects, and what it does not
+
+It protects against an **MCP-only (tool-only) agent**: one that can call these tools and nothing else, however much hostile text it reads. It does **not** protect against an agent that also has a shell or file access as your user: such an agent can open `store.sqlite3` directly and edit any table, including the ones the tools never touch. **Do not give an agent a shell (or file write access) and this database together.** Use the read-only registration, or keep the agent's other tools away from `~/Library/Application Support/com.anomali007.wifibtmonitor/`.
+
 ## Requests you approve
 
-The five edits that could hide an alert (`trusted_add`, `trusted_remove`, `mine_add`, `dismiss_alert`, `watchlist_remove`) do not change anything. They write a row to a table, `agent_proposals` (id, tool, arguments, created at, status, decided at), and return:
+The six edits that could hide an alert or lower a protection (`trusted_add`, `trusted_remove`, `mine_add`, `mine_remove` of a row a person made, `dismiss_alert`, `watchlist_remove`) do not change anything. They write a row to a table, `agent_proposals` (id, tool, arguments, created at, status, decided at), and return:
 
 ```json
 { "proposalId": 7, "status": "pending", "message": "Request recorded. Nothing has changed yet: a person must approve it in the app (Settings, Agent requests). It expires in 24 hours." }
 ```
 
 - A proposal is `pending` until you decide; then `approved` or `rejected`. After **24 hours** it becomes `expired` and cannot be approved.
-- An identical pending proposal (same tool and arguments) is the same proposal: asking twice gives the same `proposalId`.
-- At most **20** proposals wait at once; more are refused (exit code 1 / `failed`) until some are decided.
-- **In the app**, Settings has an **Agent requests** section (DOM id `agent-requests`) and the Dashboard shows a small count that links to it. Each request is one sentence the app writes from its own data, for example: *Trust network "Net-A": 2 access points seen, WPA2 and WPA3.* followed by warnings such as *an evil-twin alert for this name is active*. The only agent-supplied text is a name, shown inside quotation marks, stripped of invisible characters; an agent's free text (a label, a reason) is never shown as a description.
+- An identical pending proposal (same tool and arguments, **not counting the label**) is the same proposal: asking twice gives the same `proposalId`, so a new label cannot mint another request.
+- At most **20** proposals wait at once and at most **5** per tool; more are refused (exit code 1 / `failed`) until some are decided.
+- **In the app**, Settings has an **Agent requests** section (DOM id `agent-requests`) and the Dashboard shows a small count that links to it. Each request is one sentence the app writes from its own data, for example: *Trust network "Net-A": 2 access points seen (…1a2b3c at -40 dBm, …4d5e6f at -55 dBm), WPA2 and WPA3.* Every access point or device shows the last six characters of its hash, so two with the same name can be told apart; a tracker alert shows its subject tail and first and last seen; an unnamed Bluetooth device shows its tracker kind, signal and tail. Warnings follow, such as *an evil-twin alert for this name is active*, *this name contains non-ASCII characters (U+0435 ...)*, *this name looks like "Net-A" (a trusted or nearby network) but is not the same name*, or *this network is open*. The only agent-supplied text is a name or a `mine_add` label, shown inside quotation marks and stripped of invisible characters; an agent's other free text is never shown.
+- **Approve carries a digest.** Each pending request comes with a `digest` of what it describes (hashes, modes, subject, label; not the signal strength, which changes every scan). Approving recomputes it and refuses if it differs, so a request cannot be approved after the situation under it changed (an access point swapped in the latest scan, an alert re-raised). The app re-reads the list and shows the new sentence; you approve again.
 - **Approve** re-validates against *current* data, then applies. If the data has changed since the request was made, approval is refused with the reason and the request stays listed (Reject clears it).
 - **Reject** changes nothing.
 
 ### What approving `trusted_add` records
 
-The agent can only name the network. When you approve, the app:
+The agent can only name the network. When you approve (and the digest still matches), the app:
 
 - records the BSSID hashes from the **latest scan only** (an evil twin seen an hour ago is not remembered as a known access point);
 - sets the expected security to the strongest security **in the latest scan** (the old `security` argument is gone; it could switch off the downgrade alert);
-- **refuses** the request when the name appears in the latest scan with more than one security mode, or from more than one device (radio group), or when an `evilTwin` or `openLookalike` alert for that name is active. Check such a network yourself and use **Trust** on the Networks page.
+- **refuses** the request when the name's security is unknown, when it appears in the latest scan with more than one security mode, or from more than one device (radio group), or when an `evilTwin` or `openLookalike` alert for that name is active. Check such a network yourself and use **Trust** on the Networks page.
 
 ### Mine and the opt-in sweep
 
@@ -114,7 +119,7 @@ Marking the joined access point as yours is what lets the opt-in LAN sweep run. 
 
 ## Audit log and undo
 
-Every change an agent made is recorded with `added_by = agent` and a timestamp, whether the tool applied it directly (`watchlist_add`, `mine_remove`) or you approved it. The **Agent requests** section lists them (newest first) with a one-click **Undo**. Entries you approve still count as yours for alerts and for the sweep, since you clicked; the log keeps the origin. Undo refuses when you have changed the same thing since, so it never overwrites your own edit.
+Every change an agent made is recorded with `added_by = agent` and a timestamp, whether the tool applied it directly (`watchlist_add`, `mine_remove`) or you approved it. The **Agent requests** section lists them with a one-click **Undo**. Direct changes that have not been undone are pinned to the top, so a burst of later entries cannot push one out of sight; the rest are newest first, with "N more" and a button to show more. Entries you approve still count as yours for alerts and for the sweep, since you clicked; the log keeps the origin. Undo refuses when you have changed the same thing since, so it never overwrites your own edit.
 
 ## Dismissal persists while the finding continues
 
@@ -122,7 +127,7 @@ Every change an agent made is recorded with `added_by = agent` and a timestamp, 
 
 ## Untrusted text
 
-Over MCP and with `--json`, these fields are wrapped as `{"untrusted": "<text>"}` wherever they appear: `ssid`, `subjectSsid`, `name` (Bluetooth), `hostname`, `vendor`, `title`, `detail`, `label`, `pattern`, and every entry of `services`. Before wrapping, control characters, bidirectional overrides and zero-width characters are removed, and length is capped: SSID 32 bytes, hostname 63, Bluetooth name 64, vendor 64, label and pattern 64, alert title 200 and detail 600, at most 16 services of 64 bytes each. Hashes, numbers and enums are never wrapped. The human CLI table prints the same cleaned text unwrapped.
+Over MCP and with `--json`, these fields are wrapped as `{"untrusted": "<text>"}` wherever they appear: `ssid`, `subjectSsid`, `name` (Bluetooth), `hostname`, `vendor`, `title`, `detail`, `label`, `pattern`, `possiblySameAs`, and every entry of `services`. Before wrapping, characters that can hide or reorder text are removed (general categories Cc, Cf, Zl, Zp, Co, noncharacters, plus tag characters, variation selectors, Hangul fillers, Braille blank, combining grapheme joiner, Mongolian selectors), and length is capped: SSID 32 bytes, hostname 63, Bluetooth name 64, vendor 64, label, pattern and possiblySameAs 64, alert title 200 and detail 600, at most 16 services of 64 bytes each. Hashes, numbers and enums are never wrapped. The human CLI table prints the same cleaned text unwrapped.
 
 ```json
 { "ssid": { "untrusted": "Net-A" }, "rssi": -40, "security": "wpa2Personal" }
@@ -130,7 +135,7 @@ Over MCP and with `--json`, these fields are wrapped as `{"untrusted": "<text>"}
 
 Alert **prose** embeds names, so do not parse it: use the alert's `kind` and `subjectSsid` fields (`subjectSsid` is the network name an `evilTwin` or `openLookalike` alert is about, `null` for other kinds).
 
-**Response size**: any response over 256 KB is cut by dropping rows from its longest list (newest scans kept), and says `"truncated": true`. Lists apply `limit` in SQL; `total` is the true number of matches.
+**Response size**: any response over 128 KB is cut by dropping rows from its longest list (newest scans kept), and says `"truncated": true`. The limit is 128 KB because an MCP result carries the JSON twice (structured content and a text copy), which keeps what goes over the wire under 256 KB. Lists apply `limit` in SQL; `total` is the true number of matches.
 
 ## Freshness: is the app running?
 
@@ -241,11 +246,11 @@ With `full: true` each scan also has `wifi` (observations shaped like `networks`
 
 ### `mine_add`  (proposal)
 
-Arguments: `kind` (`wifiAp`, `wifiGroup`, `ble`, `lan`), `idHash`, optional `label` (up to 64 printable characters). Result: the pending-proposal object above. Errors (nothing recorded): `usage` for anything that is not a 64-hex hash or has a bad label; `notFound` for a hash not in the monitor's recent data. When approved, marked items stop raising followed-across-places, watchlist, new-device and new-LAN-device alerts, and marked access points count as familiar for `trustedNetworkChanged`; only propose what the user has confirmed is theirs.
+Arguments: `kind` (`wifiAp`, `wifiGroup`, `ble`, `lan`), `idHash`, optional `label` (up to 64 bytes of printable text; the approval sentence shows it in quotes). Result: the pending-proposal object above. Errors (nothing recorded): `usage` for anything that is not a 64-hex hash or has a bad label; `notFound` for a hash not in the monitor's recent data. When approved, marked items stop raising followed-across-places, watchlist, new-device and new-LAN-device alerts, and marked access points count as familiar for `trustedNetworkChanged`; only propose what the user has confirmed is theirs.
 
-### `mine_remove`  (direct)
+### `mine_remove`  (proposal, or direct for an agent's own row)
 
-Arguments: `kind`, `idHash`. Result `{ "removed": true }`, or `false` if it was not there. Recorded in the audit log; undoable.
+Arguments: `kind`, `idHash`. For an entry a person made or approved: the pending-proposal object (nothing is removed until you approve). Removing it matters because a Mine row protects a device from impersonation: without it, a device that announces the same hostname can take over the old row's history and suppress its new-device alert. For an entry an agent itself wrote (`addedBy: agent`): `{ "removed": true }` at once, recorded in the audit log and undoable. `{ "removed": false }` if it was not there.
 
 ### `trusted_list`  (read)
 
@@ -269,7 +274,7 @@ Argument: `id`. `notFound` for an unknown id; `usage` if it is already dismissed
 
 ### `watchlist_add`  (direct)
 
-Arguments: `kind` (`ssid` or `vendor`), `pattern` (1 to 64 printable characters, no invisible ones), `match` (`exact` or `contains`, default `contains`). Result `{ "added": true, "watch": { ...entry } }`; an identical rule (case-insensitive) gives `added: false`. Recorded in the audit log; undoable.
+Arguments: `kind` (`ssid` or `vendor`), `pattern` (1 to 64 bytes of printable text, no invisible characters), `match` (`exact` or `contains`, default `contains`). Result `{ "added": true, "watch": { ...entry } }`; an identical rule (case-insensitive) gives `added: false`. Recorded in the audit log; undoable.
 
 ### `watchlist_remove`  (proposal)
 

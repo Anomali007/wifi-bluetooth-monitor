@@ -12,8 +12,9 @@
 //! Boundaries, enforced by `tests/agent_tools.rs` and `tests/lan_listen_only.rs`:
 //! - Reads come from the SQLite file. Edits need `--edits`. Edits that could hide an alert
 //!   (trusting or untrusting a network, marking a device mine, dismissing an alert, removing a
-//!   watchlist rule) are only PROPOSALS a person approves in the app; the two direct edits
-//!   (adding a watchlist rule, removing a Mine entry) can only add alerts and are audited.
+//!   watchlist rule, removing a Mine entry a person made) are only PROPOSALS a person approves
+//!   in the app; the direct edits (adding a watchlist rule, removing a Mine entry an agent itself
+//!   wrote) are capped, rate-limited, audited and undoable.
 //!   Nothing here starts a scan or a sweep, and nothing here writes any setting.
 //! - No socket, no child process.
 

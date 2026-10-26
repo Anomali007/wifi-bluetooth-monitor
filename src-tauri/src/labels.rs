@@ -7,21 +7,60 @@
 
 use crate::model::{AlertKind, MineKind, Security, Severity, TrackerKind};
 
-/// Is this a control, bidirectional-override or zero-width/invisible formatting character?
-fn is_unsafe_char(c: char) -> bool {
+/// Is this character invisible, a layout control, or otherwise able to make a name read as
+/// something it is not? By general category: Cc (controls), Cf (format: zero-width, bidi,
+/// tag characters), Zl/Zp (line and paragraph separators), Co (private use), Cn that are
+/// noncharacters; plus the blank-looking letters and marks that are not in those categories
+/// (Hangul fillers, Braille blank, combining grapheme joiner, variation selectors, Mongolian
+/// free variation selectors, Khmer inherent vowels).
+pub fn is_unsafe_char(c: char) -> bool {
+    let u = c as u32;
     c.is_control()
         || matches!(
-            c,
-            '\u{00AD}'
-                | '\u{061C}'
-                | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{206F}'
-                | '\u{FEFF}'
-                | '\u{FFF9}'..='\u{FFFB}'
+            u,
+            // Cf
+            0x00AD
+                | 0x0600..=0x0605
+                | 0x061C
+                | 0x06DD
+                | 0x070F
+                | 0x08E2
+                | 0x180E
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x2064
+                | 0x2066..=0x206F
+                | 0xFEFF
+                | 0xFFF9..=0xFFFB
+                | 0x110BD
+                | 0x110CD
+                | 0x13430..=0x1343F
+                | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A
+                // the whole Tags block, assigned or not
+                | 0xE0000..=0xE007F
+                // Zl, Zp
+                | 0x2028
+                | 0x2029
+                // Co (private use) and noncharacters (Cn)
+                | 0xE000..=0xF8FF
+                | 0xF0000..=0xFFFFD
+                | 0x100000..=0x10FFFD
+                | 0xFDD0..=0xFDEF
+                // blank-looking letters and marks
+                | 0x034F
+                | 0x115F
+                | 0x1160
+                | 0x3164
+                | 0xFFA0
+                | 0x2800
+                | 0x17B4
+                | 0x17B5
+                | 0x180B..=0x180F
+                | 0xFE00..=0xFE0F
+                | 0xE0100..=0xE01EF
         )
+        || (u & 0xFFFE) == 0xFFFE
 }
 
 /// Remove control, bidi-override and zero-width characters.
@@ -44,6 +83,21 @@ pub fn truncate_bytes(s: &str, max: usize) -> String {
 /// Safe, bounded text for showing a broadcast or agent-supplied name.
 pub fn clean(s: &str, max_bytes: usize) -> String {
     truncate_bytes(&strip_unsafe(s), max_bytes)
+}
+
+/// `U+0430 U+0441 ...` for the non-ASCII characters of a name (at most 12), or `None` when the
+/// name is plain ASCII. Shown next to a name so a look-alike alphabet cannot pass for Latin.
+pub fn codepoints_if_not_ascii(s: &str) -> Option<String> {
+    if s.is_ascii() {
+        return None;
+    }
+    let cps: Vec<String> = s
+        .chars()
+        .filter(|c| !c.is_ascii())
+        .take(12)
+        .map(|c| format!("U+{:04X}", c as u32))
+        .collect();
+    Some(cps.join(" "))
 }
 
 /// A name shown as quoted data inside a sentence: `“Net-A”`. Quotes inside are neutralised so
@@ -119,6 +173,48 @@ mod tests {
     fn invisible_and_directional_characters_are_removed() {
         let nasty = "Net\u{200B}-A\u{202E}evil\u{0007}\u{FEFF}\u{2066}x";
         assert_eq!(strip_unsafe(nasty), "Net-Aevilx");
+    }
+
+    #[test]
+    fn every_known_invisible_class_is_removed() {
+        for (what, c) in [
+            ("tag A", '\u{E0041}'),
+            ("tag cancel", '\u{E007F}'),
+            ("hangul filler", '\u{3164}'),
+            ("hangul choseong filler", '\u{115F}'),
+            ("hangul jungseong filler", '\u{1160}'),
+            ("halfwidth hangul filler", '\u{FFA0}'),
+            ("braille blank", '\u{2800}'),
+            ("cgj", '\u{034F}'),
+            ("vs16", '\u{FE0F}'),
+            ("vs1", '\u{FE00}'),
+            ("vs17", '\u{E0100}'),
+            ("mongolian vs", '\u{180B}'),
+            ("mongolian vowel sep", '\u{180E}'),
+            ("line sep", '\u{2028}'),
+            ("para sep", '\u{2029}'),
+            ("private use", '\u{E000}'),
+            ("noncharacter", '\u{FFFF}'),
+            ("khmer inherent", '\u{17B4}'),
+            ("soft hyphen", '\u{00AD}'),
+        ] {
+            let s = format!("Net-A{c}");
+            assert_eq!(strip_unsafe(&s), "Net-A", "{what} survived");
+        }
+        // CONTROL: ordinary and non-Latin visible text is kept.
+        assert_eq!(
+            strip_unsafe("Caf\u{E9} \u{4E2D}\u{6587}-5G"),
+            "Caf\u{E9} \u{4E2D}\u{6587}-5G"
+        );
+    }
+
+    #[test]
+    fn non_ascii_names_come_with_their_code_points() {
+        assert_eq!(codepoints_if_not_ascii("Net-A"), None);
+        assert_eq!(
+            codepoints_if_not_ascii("N\u{435}t-A").as_deref(),
+            Some("U+0435")
+        );
     }
 
     #[test]
