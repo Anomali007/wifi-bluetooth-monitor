@@ -537,11 +537,7 @@ fn scan_reaches_the_sweep_only_through_the_gate() {
     assert!(decision < guard && guard < call);
     // The sweep is started only through `run_gated_sweep`, which needs the gate's token and
     // re-checks the network while it runs; scan calls it once, inside the guard.
-    assert_eq!(
-        code.matches("run_gated_sweep(").count(),
-        1,
-        "one call site"
-    );
+    assert_eq!(code.matches("run_gated_sweep(").count(), 1, "one call site");
     let gated_call = code.find("run_gated_sweep(&mut").expect("call site");
     assert!(guard < gated_call);
     let sig = Regex::new(r"fn run_gated_sweep<[^>]*>\(\s*sink: &mut S,\s*token: gate::GateToken,")
@@ -588,7 +584,9 @@ fn mdns_listener_exposes_no_send_surface() {
             "fn heard(",
             "fn len(",
             "fn is_empty(",
-            "fn announced_sources("
+            "fn announced_sources(",
+            "fn set_link(",
+            "fn admits("
         ]
         .iter()
         .any(|ok| m.contains(ok))),

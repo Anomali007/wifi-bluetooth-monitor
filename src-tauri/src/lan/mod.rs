@@ -503,6 +503,12 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
     let mdns = mdns::ensure_listener();
     let link = net::read_link(&inputs.salt);
     let key = key_of(&link);
+    // Only sources on the joined Wi-Fi link are cached from here on.
+    mdns.set_link(mdns::LinkFilter {
+        subnet: link.subnet,
+        if_index: link.if_index,
+        own_v6: link.own_v6.clone(),
+    });
 
     // The only route to a transmit: the gate (setting ON + AP Mine + known interface) and cadence.
     let decision = gate::may_sweep(
