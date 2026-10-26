@@ -66,9 +66,10 @@ pub struct LanInputs {
 /// State kept between cycles (sweep cadence). Lives in `AppState`.
 #[derive(Debug, Clone, Default)]
 pub struct LanState {
-    pub last_sweep_at: Option<Millis>,
-    /// Network key the last sweep ran on, so a sweep of one network never throttles another.
-    pub last_sweep_network: Option<String>,
+    /// When each network (by key) was last swept, so a sweep of one network never throttles
+    /// another AND alternating between networks cannot reset either one's cadence. Bounded
+    /// to [`MAX_SWEEP_NETWORKS`] entries (oldest dropped).
+    pub last_sweeps: BTreeMap<String, Millis>,
     /// Set after a scan that could not read any neighbor table (sysctl empty AND the Apple
     /// tools unavailable): why, for the Network page. `None` when neighbors were readable.
     pub neighbor_note: Option<String>,
@@ -76,12 +77,29 @@ pub struct LanState {
     pub helper_cache: helper::Cache,
 }
 
+/// Networks whose last-sweep time is remembered.
+const MAX_SWEEP_NETWORKS: usize = 32;
+
 impl LanState {
     /// When the network `key` was last swept.
     fn last_sweep_for(&self, key: Option<&str>) -> Option<Millis> {
-        match (&self.last_sweep_network, key) {
-            (Some(n), Some(k)) if n == k => self.last_sweep_at,
-            _ => None,
+        key.and_then(|k| self.last_sweeps.get(k)).copied()
+    }
+
+    /// Remember that `key` was swept at `at`, dropping the oldest entries past the bound.
+    fn record_sweep(&mut self, key: Option<&str>, at: Millis) {
+        let Some(k) = key else { return };
+        self.last_sweeps.insert(k.to_string(), at);
+        while self.last_sweeps.len() > MAX_SWEEP_NETWORKS {
+            let Some(oldest) = self
+                .last_sweeps
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.last_sweeps.remove(&oldest);
         }
     }
 }
@@ -475,8 +493,7 @@ pub fn scan(inputs: &LanInputs, state: &mut LanState) -> Result<LanScanOutcome, 
                 failed: stats.failed,
                 v4_skipped: stats.v4_skip.is_some(),
             };
-            state.last_sweep_at = Some(now);
-            state.last_sweep_network = key.clone();
+            state.record_sweep(key.as_deref(), now);
             std::thread::sleep(NEIGHBOR_SETTLE);
         }
     }
@@ -745,22 +762,51 @@ mod tests {
 
     #[test]
     fn mode_and_last_sweep_follow_the_network() {
-        let mut st = LanState {
-            last_sweep_at: Some(5_000),
-            last_sweep_network: Some("ap-1".into()),
-            neighbor_note: None,
-            helper_cache: Default::default(),
-        };
+        let mut st = LanState::default();
+        st.record_sweep(Some("ap-1"), 5_000);
         let inp = inputs(true, vec![mine_ap("ap-1")]);
         let n = build_info(&link(), &inp, &st);
         assert_eq!(n.mode, LanMode::Sweep);
         assert_eq!(n.last_sweep_at, Some(5_000));
         // A sweep of another network does not count for this one.
-        st.last_sweep_network = Some("someone-else".into());
+        st.last_sweeps.clear();
+        st.record_sweep(Some("someone-else"), 5_000);
         let n = build_info(&link(), &inp, &st);
         assert_eq!(n.mode, LanMode::Passive);
         assert_eq!(n.last_sweep_at, None);
         assert_eq!(st.last_sweep_for(Some("ap-1")), None);
+    }
+
+    #[test]
+    fn alternating_networks_cannot_reset_a_networks_sweep_cadence() {
+        // L3: sweep A, then B, then ask about A again moments later.
+        let mut st = LanState::default();
+        let now = 1_000_000;
+        st.record_sweep(Some("net-a"), now);
+        st.record_sweep(Some("net-b"), now + 1_000);
+        assert_eq!(st.last_sweep_for(Some("net-a")), Some(now), "A is remembered");
+        assert_eq!(st.last_sweep_for(Some("net-b")), Some(now + 1_000));
+        let gate_in = |last| gate::cadence_ok(false, last, now + 2_000);
+        assert_eq!(
+            gate_in(st.last_sweep_for(Some("net-a"))),
+            Err(SweepRefusal::TooSoon),
+            "back on A within the interval is still too soon"
+        );
+        // NEGATIVE CONTROL: a network never swept is not throttled.
+        assert!(gate_in(st.last_sweep_for(Some("net-c"))).is_ok());
+        assert_eq!(st.last_sweep_for(None), None);
+    }
+
+    #[test]
+    fn the_sweep_memory_is_bounded() {
+        let mut st = LanState::default();
+        for i in 0..(MAX_SWEEP_NETWORKS + 20) {
+            st.record_sweep(Some(&format!("net-{i:03}")), 1_000 + i as Millis);
+        }
+        assert_eq!(st.last_sweeps.len(), MAX_SWEEP_NETWORKS);
+        // The newest survive, the oldest are gone.
+        assert!(st.last_sweep_for(Some("net-051")).is_some());
+        assert!(st.last_sweep_for(Some("net-000")).is_none());
     }
 
     #[test]
