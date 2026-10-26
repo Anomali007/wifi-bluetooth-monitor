@@ -33,9 +33,30 @@ Everything in this list exists in the code and has tests; see [Limitations](#lim
 - **Notifications**: one system notification per newly created alert (repeat sightings of the same condition do not notify again). Notification text names the kind of finding ("possible tracker", ...) and never contains a network name, device name, or identifier.
 - **UI pages**: Dashboard (permission banner, scan problems, device table, signal chart, Scan now), Alerts (with dismiss), History (sightings over the retention window, with vendor, filter by Wi-Fi or Bluetooth), Network (devices on the joined network, Sweep now), Settings (trusted networks, Mine, Places, Watchlist, network devices and the sweep switch, intervals, retention, alert toggles, notifications).
 
+## Agent tools
+
+`wbm` is a command-line tool and an [MCP](https://modelcontextprotocol.io) server over the same stored data, so an AI agent (or you, in a terminal) can ask "what alerts fired today?" or "what is on this network?" without opening the app. It reads the app's SQLite file and can make four kinds of edit; it cannot scan, sweep or change any other setting.
+
+```sh
+scripts/install-cli.sh                  # release build, links ~/bin/wbm
+wbm status                              # is the app running, permissions, current network, counts
+wbm alerts --since 24h --json           # stable, documented JSON field names
+claude mcp add wbm -- ~/bin/wbm mcp     # register the MCP server with Claude Code (you run this)
+```
+
+- **Read:** status, alerts, networks, Bluetooth devices, LAN devices, places, history, Mine, trusted networks, watchlist.
+- **Edit:** add or remove trusted networks, Mine entries and watchlist rules; dismiss alerts. Each has an inverse.
+- **Never exposed:** starting a scan or a network sweep, and changing any other setting (the sweep switch, the background item, intervals, toggles, retention). Anything that can make the Mac transmit stays a human action in the app. Tests assert that the tool list has no such tool and that calling one fails; `wbm` opens no socket and starts no process.
+- **Status without the app:** the app writes a small snapshot (last scan, permission states, helper status, current network, counts) after every scan, and `wbm status` returns it with its age and says plainly when it is stale or the app is not running.
+- **Edits while the app runs:** the database is in WAL mode and edits are short transactions; the app re-reads settings, Mine and the watchlist every scan, and saving the settings page can no longer overwrite a network an agent just trusted.
+
+**Privacy: whatever an agent reads (network names, device names, hostnames, vendors, alert text) is sent to that agent's model provider.** The app uploads nothing; connecting an agent is your decision. Names in the results come from other people's equipment, so an agent must treat them as data, not instructions.
+
+Tool list, JSON shapes, exit codes and examples: [docs/agents.md](docs/agents.md).
+
 ## Install and build
 
-Requirements: macOS 13 or newer, [Rust](https://rustup.rs) (1.85+), Node.js 22+, and pnpm 10. Xcode command line tools are needed for the native build.
+Requirements: macOS 13 or newer, [Rust](https://rustup.rs) (1.88+), Node.js 22+, and pnpm 10. Xcode command line tools are needed for the native build.
 
 ```sh
 git clone https://github.com/Anomali007/wifi-bluetooth-monitor.git
@@ -64,7 +85,7 @@ The app uses the hardened runtime. `src-tauri/Entitlements.plist` carries the Bl
 pnpm test                          # vitest: formatting, API mock routing, mock-data invariants
 pnpm test:interaction              # headless-Chrome click-through of the mock build (see script header)
 npx tsc --noEmit && pnpm lint
-cd src-tauri && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+cd src-tauri && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check   # also builds and tests the `wbm` agent CLI
 scripts/check-public-safety.sh     # no real-looking MACs, placeholder salts, stray prints or images
 scripts/live-counts.sh             # counts only (scans, networks, devices, trackers, alerts) from the local store
 ```
@@ -100,7 +121,7 @@ Without Location the Wi-Fi scan still runs but the networks have no names; the d
 
 ## Privacy
 
-- **Local only.** Scan history lives in an SQLite database in the app's data folder (`~/Library/Application Support/com.anomali007.wifibtmonitor/`). Nothing is uploaded, and there is no export feature. Besides scans, the database holds place fingerprints (hashes only, no coordinates), your Mine and Watchlist entries, and LAN devices (hashed hardware address, or a salted hostname hash for a device only heard announcing; vendor; mDNS hostname and service types; how it was learned; never the IP).
+- **Local only.** Scan history lives in an SQLite database in the app's data folder (`~/Library/Application Support/com.anomali007.wifibtmonitor/`). The app uploads nothing, and has no export feature. The optional `wbm` agent tools read that database on request; anything an agent you connect reads goes to that agent's model provider (see [Agent tools](#agent-tools)). Besides scans, the database holds place fingerprints (hashes only, no coordinates), your Mine and Watchlist entries, and LAN devices (hashed hardware address, or a salted hostname hash for a device only heard announcing; vendor; mDNS hostname and service types; how it was learned; never the IP).
 - **Salted hashes.** Access-point addresses and Bluetooth identifiers are hashed (SHA-256) with a random per-install salt before they leave the scanning code. Raw addresses and identifiers are never stored or logged (names are, see Limitations).
 - **The salt** is 32 random bytes in `salt.key` next to the database, mode `0600`, kept separate from the database so a copied database cannot be brute-forced back to addresses.
 - **Retention.** Scan history is deleted automatically after 24 hours by default; place and network-device data after 14 days by default (both configurable in Settings). Items marked as yours are kept until you unmark them.

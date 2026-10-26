@@ -15,7 +15,9 @@
 //! - [`lan`]      local-network discovery (ARP, receive-only mDNS, opt-in sweep)
 //! - [`pipeline`] one scan cycle without Tauri: assemble -> store -> detect -> upsert
 //! - [`commands`] the Tauri command surface and the background scan loop
+//! - [`agent`]    the `wbm` CLI and MCP server (read + a few safe edits over the same store)
 
+pub mod agent;
 pub mod ble;
 pub mod commands;
 pub mod detect;

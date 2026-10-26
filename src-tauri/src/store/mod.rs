@@ -21,8 +21,12 @@ use crate::model::{
     Place, PlaceSighting, Salt, ScanResult, ScanSnapshot, Settings, SightingKind, WatchKind,
     WatchMatch, WatchlistEntry, WifiObservation,
 };
+mod agent_queries;
 mod lan_queries;
 mod places_queries;
+mod settings_sync;
+
+pub use agent_queries::{OpenError, OpenMode, StoreCounts, BUSY_TIMEOUT};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
@@ -183,6 +187,7 @@ impl Store {
         let salt = load_or_create_salt(path)?;
         let db_path: PathBuf = path.join(DB_FILE);
         let conn = Connection::open(&db_path)?;
+        agent_queries::configure(&conn)?;
         set_mode_0600(&db_path)?;
         let mut store = Store { conn, salt };
         store.migrate()?;
@@ -569,14 +574,12 @@ impl Store {
         }
     }
 
+    /// Save settings. A client that loaded the current revision overwrites; one that is behind
+    /// (the stored settings were written since it loaded them, for instance by an agent adding
+    /// a trusted network) is merged field by field instead, so neither side's change is lost.
+    /// See `settings_sync`.
     pub fn set_settings(&mut self, settings: &Settings) -> StoreResult<()> {
-        let json = to_json(settings)?;
-        self.conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('settings', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [json],
-        )?;
-        Ok(())
+        self.save_settings(settings)
     }
 
     // -- Places ------------------------------------------------------------
@@ -1637,11 +1640,19 @@ mod tests {
             place_retention_days: 30,
             lan_active_sweep: true,
             lan_neighbor_helper: true,
+            revision: 0,
         };
         s.set_settings(&custom).unwrap();
-        assert_eq!(s.get_settings().unwrap(), custom);
-        s.set_settings(&Settings::default()).unwrap();
-        assert_eq!(s.get_settings().unwrap(), Settings::default());
+        // Every save bumps `revision`; compare everything else.
+        let same = |a: Settings, b: &Settings| Settings { revision: 0, ..a } == *b;
+        assert!(same(s.get_settings().unwrap(), &custom));
+        // A client that has loaded the current settings overwrites them.
+        let reset = Settings {
+            revision: s.get_settings().unwrap().revision,
+            ..Settings::default()
+        };
+        s.set_settings(&reset).unwrap();
+        assert!(same(s.get_settings().unwrap(), &Settings::default()));
     }
 
     #[test]

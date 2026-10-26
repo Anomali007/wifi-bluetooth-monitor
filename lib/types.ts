@@ -179,6 +179,12 @@ export interface Settings {
   lanActiveSweep: boolean;
   /** Opt-in background item that runs Apple's arp and ndp every minute (the app spawns nothing). default false */
   lanNeighborHelper: boolean;
+  /**
+   * Write counter of the stored settings. Opaque: send back what you loaded. When it is behind
+   * (an agent tool edited the trusted networks meanwhile), the backend merges instead of
+   * overwriting, so a stale draft cannot erase that edit.
+   */
+  revision: number;
 }
 
 /** State of the background item (mirror of lan::helper::HelperStatus). */
@@ -290,4 +296,5 @@ export const DEFAULT_SETTINGS: Settings = {
   placeRetentionDays: 14,
   lanActiveSweep: false,
   lanNeighborHelper: false,
+  revision: 0,
 };

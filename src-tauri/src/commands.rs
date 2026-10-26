@@ -106,10 +106,12 @@ pub async fn run_cycle(app: &AppHandle) -> Result<ScanResult, String> {
 
     let new_alerts = {
         let mut store = state.store.lock().map_err(lock_err)?;
-        pipeline::ingest_with(
+        pipeline::ingest_and_publish(
             &mut store,
             &result,
             lan_outcome.as_ref(),
+            lan::helper::status(),
+            std::process::id(),
             pipeline::now_ms(),
         )
         .map_err(|e| e.to_string())?

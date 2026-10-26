@@ -6,9 +6,20 @@ authors = ["Mali Franzese"]
 license = "MIT"
 repository = "https://github.com/Anomali007/wifi-bluetooth-monitor"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
+default-run = "wifi-bluetooth-monitor"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "wifi-bluetooth-monitor"
+path = "src/main.rs"
+
+# Agent tools: a CLI and an MCP server over the same store. Reads and edits the SQLite file
+# only; opens no socket and spawns no process (tests/lan_listen_only.rs checks the source).
+[[bin]]
+name = "wbm"
+path = "src/bin/wbm.rs"
 
 [lib]
 name = "app_lib"
@@ -25,7 +36,7 @@ tauri = { version = "2.12", features = [] }
 tauri-plugin-log = "2.10"
 tauri-plugin-notification = "2.7"
 # Scan loop needs: spawn, sleep/interval, channels. Tauri brings its own runtime; these are for library code.
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "sync", "io-std", "io-util"] }
 futures = "0.3" # btleplug event streams
 sha2 = "0.11" # identifier hashing (model::hash_identifier)
 hex = "0.4"
@@ -36,6 +47,10 @@ rusqlite = { version = "0.40", features = ["bundled"] } # local store
 # here by the Foundation pass so no work package has to touch Cargo.toml / Cargo.lock.
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
+
+# MCP server for `wbm mcp` (the official Rust SDK). Protocol and stdio framing only: no HTTP,
+# OAuth or child-process features, so no network client is compiled in.
+rmcp = { version = "3.7", default-features = false, features = ["server", "transport-async-rw"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
