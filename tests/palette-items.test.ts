@@ -106,3 +106,28 @@ describe("data results", () => {
     expect(search("", all).map((s) => s.group).sort()).toEqual(["actions", "pages"]);
   });
 });
+
+describe("broadcast names cannot capture Enter", () => {
+  // Anyone nearby can name a network or device anything, including a word the user is typing.
+  const hostile = dataItems({
+    wifi: [
+      { ssid: "scan", vendor: null, rowKey: "w-9-0" },
+      { ssid: "alerts", vendor: null, rowKey: "w-9-1" },
+    ],
+    ble: [{ name: "settings", rowKey: "b-9" }],
+    lan: [],
+    places: [],
+    alerts: [],
+  });
+  const pool = [...PAGES, ...ACTIONS, ...SETTING_ITEMS, ...hostile];
+  const first = (q: string) => search(q, pool)[0]?.items[0];
+
+  it("an SSID named after an action or page does not take the first result", () => {
+    expect(first("scan")?.action).toBe("scan-now");
+    expect(first("alerts")?.group).toBe("pages");
+    expect(first("settings")?.group).toBe("pages");
+  });
+  it("data still ranks first when no app item matches at prefix or better (negative control)", () => {
+    expect(search("Net-A", [...PAGES, ...ACTIONS, ...SETTING_ITEMS, ...data])[0]?.group).toBe("wifi");
+  });
+});

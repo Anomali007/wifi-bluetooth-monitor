@@ -23,7 +23,12 @@ export default function SettingsPage() {
   const ready = draft !== null;
   useEffect(() => {
     if (!ready) return;
-    const id = decodeURIComponent(window.location.hash.slice(1));
+    let id = "";
+    try {
+      id = decodeURIComponent(window.location.hash.slice(1));
+    } catch {
+      return; // malformed escape in a pasted link: ignore it rather than blank the page
+    }
     return id ? reveal(id) : undefined;
   }, [ready]);
 

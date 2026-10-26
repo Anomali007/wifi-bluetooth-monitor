@@ -21,6 +21,8 @@ export const GROUP_LABEL: Record<GroupId, string> = {
 
 /** Fixed order, used to break ties between groups. */
 const GROUP_ORDER: GroupId[] = ["pages", "actions", "settings", "wifi", "bluetooth", "lan", "places", "alerts"];
+const APP_GROUPS: ReadonlySet<GroupId> = new Set(["pages", "actions", "settings"]);
+const PIN_SCORE = 800; // the prefix tier in lib/search.ts
 
 export const GROUP_LIMIT: Record<GroupId, number> = {
   pages: 5,
@@ -171,7 +173,15 @@ export function search(query: string, items: readonly PaletteItem[]): Section[] 
     if (g.items.length < GROUP_LIMIT[item.group]) g.items.push(item);
     byGroup.set(item.group, g);
   }
+  // Data labels are broadcast by anyone nearby, so an SSID named "scan" must not outrank the
+  // "Scan now" action and capture Enter: app groups with a prefix-or-better hit go first.
+  const pinned = (group: GroupId, best: number) => (APP_GROUPS.has(group) && best >= PIN_SCORE ? 1 : 0);
   return [...byGroup.entries()]
-    .sort((a, b) => b[1].best - a[1].best || GROUP_ORDER.indexOf(a[0]) - GROUP_ORDER.indexOf(b[0]))
+    .sort(
+      (a, b) =>
+        pinned(b[0], b[1].best) - pinned(a[0], a[1].best) ||
+        b[1].best - a[1].best ||
+        GROUP_ORDER.indexOf(a[0]) - GROUP_ORDER.indexOf(b[0]),
+    )
     .map(([group, g]) => ({ group, title: GROUP_LABEL[group], items: g.items }));
 }
